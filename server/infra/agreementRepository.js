@@ -1,0 +1,183 @@
+// infra/agreementRepository.js
+// Repositório de acordos/eventos sobre SQLite (better-sqlite3, síncrono).
+// Interface usada pelos services: get, has, upsert, list, recordEvent, listEvents, findRecent,
+// countByState, transaction.
+
+// [chave JS, coluna SQL, tipo]
+const COLUMNS = [
+  ['nodeId', 'node_id', 'text'],
+  ['attachId', 'attach_id', 'text'],
+  ['fileName', 'file_name', 'text'],
+  ['workflowId', 'workflow_id', 'text'],
+  ['subworkflowId', 'subworkflow_id', 'text'],
+  ['taskId', 'task_id', 'int'],
+  ['emails', 'emails', 'json'],
+  ['state', 'state', 'text'],
+  ['finalKind', 'final_kind', 'text'],
+  ['adobeStatus', 'adobe_status', 'text'],
+  ['pdfDelivered', 'pdf_delivered', 'bool'],
+  ['pdfDeliveredAt', 'pdf_delivered_at', 'text'],
+  ['sendonDone', 'sendon_done', 'bool'],
+  ['sendonAt', 'sendon_at', 'text'],
+  ['disposition', 'disposition', 'text'],
+  ['attempts', 'attempts', 'int'],
+  ['lastError', 'last_error', 'text'],
+  ['lastErrorStage', 'last_error_stage', 'text'],
+  ['lastErrorAt', 'last_error_at', 'text'],
+  ['nextAttemptAt', 'next_attempt_at', 'text'],
+  ['attentionReason', 'attention_reason', 'text'],
+  ['lastPolledAt', 'last_polled_at', 'text'],
+  ['startSendOnError', 'start_sendon_error', 'text'],
+  ['finalAt', 'final_at', 'text'],
+  ['createdAt', 'created_at', 'text'],
+  ['updatedAt', 'updated_at', 'text']
+];
+const KEYS = new Set(COLUMNS.map(([k]) => k));
+
+function toSql(value, type) {
+  if (value === undefined || value === null) {
+    if (type === 'json') return '[]';
+    return type === 'bool' ? 0 : null;
+  }
+  if (type === 'bool') return value ? 1 : 0;
+  if (type === 'int') return Number.isFinite(Number(value)) ? Number(value) : null;
+  if (type === 'json') return JSON.stringify(value);
+  return String(value);
+}
+
+function fromSql(value, type) {
+  if (type === 'bool') return !!value;
+  if (type === 'json') {
+    try { return JSON.parse(value || '[]'); } catch { return []; }
+  }
+  return value === undefined ? null : value;
+}
+
+function createAgreementRepository(db, { now = () => new Date(), maxEvents = 50 } = {}) {
+  const nowIso = () => now().toISOString();
+
+  const rowToRecord = (row) => {
+    const rec = { id: row.id };
+    for (const [key, col, type] of COLUMNS) rec[key] = fromSql(row[col], type);
+    return rec;
+  };
+
+  const colNames = COLUMNS.map(([, c]) => c);
+  const stmts = {
+    get: db.prepare('SELECT * FROM agreements WHERE id = ?'),
+    exists: db.prepare('SELECT 1 FROM agreements WHERE id = ?'),
+    upsert: db.prepare(
+      `INSERT INTO agreements (id, ${colNames.join(', ')})
+       VALUES (@id, ${colNames.map((c) => '@' + c).join(', ')})
+       ON CONFLICT(id) DO UPDATE SET ${colNames.map((c) => `${c} = excluded.${c}`).join(', ')}`
+    ),
+    list: db.prepare('SELECT * FROM agreements ORDER BY created_at, id'),
+    listByState: db.prepare('SELECT * FROM agreements WHERE state = ? ORDER BY created_at, id'),
+    recent: db.prepare('SELECT * FROM agreements WHERE node_id = ? AND created_at > ?'),
+    countByState: db.prepare('SELECT state, COUNT(*) AS n FROM agreements GROUP BY state'),
+    insertEvent: db.prepare(
+      `INSERT OR IGNORE INTO agreement_events
+         (agreement_id, notification_id, event, canonical, kind, source, payload_summary, received_at)
+       VALUES (@agreement_id, @notification_id, @event, @canonical, @kind, @source, @payload_summary, @received_at)`
+    ),
+    pruneEvents: db.prepare(
+      `DELETE FROM agreement_events WHERE agreement_id = ? AND id NOT IN
+         (SELECT id FROM agreement_events WHERE agreement_id = ? ORDER BY id DESC LIMIT ?)`
+    ),
+    events: db.prepare('SELECT * FROM agreement_events WHERE agreement_id = ? ORDER BY id DESC LIMIT ?')
+  };
+
+  const get = (id) => {
+    const row = stmts.get.get(String(id));
+    return row ? rowToRecord(row) : null;
+  };
+
+  const upsertTx = db.transaction((id, patch) => {
+    id = String(id);
+    const existing = get(id);
+    const merged = existing || {
+      id, emails: [], state: 'pending', pdfDelivered: false, sendonDone: false, attempts: 0
+    };
+    for (const [k, v] of Object.entries(patch || {})) {
+      if (KEYS.has(k) && v !== undefined) merged[k] = v;
+    }
+    const ts = nowIso();
+    merged.updatedAt = ts;
+    merged.createdAt = existing ? existing.createdAt : (patch?.createdAt || ts);
+    const params = { id };
+    for (const [key, col, type] of COLUMNS) params[col] = toSql(merged[key], type);
+    stmts.upsert.run(params);
+    return get(id);
+  });
+
+  const recordEventTx = db.transaction((id, ev, patch) => {
+    id = String(id);
+    if (!stmts.exists.get(id)) return null;
+    const res = stmts.insertEvent.run({
+      agreement_id: id,
+      notification_id: ev.notificationId || null,
+      event: ev.event || null,
+      canonical: ev.canonical || null,
+      kind: ev.kind || null,
+      source: ev.source || 'webhook',
+      payload_summary: ev.summary ? JSON.stringify(ev.summary) : null,
+      received_at: ev.receivedAt || nowIso()
+    });
+    if (res.changes === 0) return { duplicate: true, record: get(id) };
+    stmts.pruneEvents.run(id, id, maxEvents);
+    const record = patch && Object.keys(patch).length ? upsertTx(id, patch) : get(id);
+    return { duplicate: false, record };
+  });
+
+  return {
+    get,
+    has: (id) => !!stmts.exists.get(String(id)),
+    upsert: (id, patch) => upsertTx(id, patch),
+
+    // filter: função(record) ou { state }
+    list(filter) {
+      const rows = filter && typeof filter === 'object' && filter.state
+        ? stmts.listByState.all(filter.state)
+        : stmts.list.all();
+      const records = rows.map(rowToRecord);
+      return typeof filter === 'function' ? records.filter(filter) : records;
+    },
+
+    /*
+      Registra o evento (dedupe por notification_id) e, se não for duplicado, aplica o patch
+      de estado na mesma transação. Retorna null se o acordo não existe.
+    */
+    recordEvent: (id, ev, patch) => recordEventTx(id, ev, patch),
+
+    listEvents(id, limit = maxEvents) {
+      return stmts.events.all(String(id), limit).map((r) => ({
+        id: r.id,
+        notificationId: r.notification_id,
+        event: r.event,
+        canonical: r.canonical,
+        kind: r.kind,
+        source: r.source,
+        summary: r.payload_summary ? JSON.parse(r.payload_summary) : null,
+        receivedAt: r.received_at
+      }));
+    },
+
+    // Mesmo documento + mesmos destinatários criados dentro da janela (anti-duplicidade do /start)
+    findRecent(nodeId, emails, thresholdMs) {
+      const cutoff = new Date(now().getTime() - thresholdMs).toISOString();
+      const key = [...emails].sort().join('|');
+      return stmts.recent.all(String(nodeId), cutoff).map(rowToRecord).find((r) =>
+        Array.isArray(r.emails) && [...r.emails].sort().join('|') === key) || null;
+    },
+
+    countByState() {
+      const out = {};
+      for (const { state, n } of stmts.countByState.all()) out[state] = n;
+      return out;
+    },
+
+    transaction: (fn) => db.transaction(fn)()
+  };
+}
+
+module.exports = { createAgreementRepository };
