@@ -21,6 +21,9 @@ function describeError(e) {
   return [e.message || String(e), status ? `HTTP ${status}` : '', data].filter(Boolean).join(' | ');
 }
 
+// Valor vindo de fora numa única linha de log (evita forjar linhas com \r\n)
+const oneLine = (v) => String(v ?? '').replace(/[\r\n]+/g, ' ').slice(0, 300);
+
 /*
   Escrita atômica: arquivo temporário no mesmo diretório + rename.
 */
@@ -36,4 +39,4 @@ function atomicWriteFileSync(file, data, { mode } = {}) {
   }
 }
 
-module.exports = { sleep, describeError, atomicWriteFileSync };
+module.exports = { sleep, describeError, oneLine, atomicWriteFileSync };
