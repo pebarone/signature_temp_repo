@@ -5,7 +5,9 @@ const qs = require('qs');
 /*
   Cliente do OpenText Content Server. Credenciais/base vêm da config; http é injetável.
 */
-function createOtcsClient({ base, user, pass, http = require('axios'), now = () => Date.now() }) {
+function createOtcsClient({
+  base, user, pass, http = require('axios'), now = () => Date.now(), timeoutMs = 60 * 1000
+}) {
   let ticket = '';
   let expiresAt = 0;
   let inflight = null;
@@ -14,7 +16,7 @@ function createOtcsClient({ base, user, pass, http = require('axios'), now = () 
     const rsp = await http.post(
       `${base}/v1/auth`,
       { username: user, password: pass },
-      { headers: { 'Content-Type': 'application/json' } }
+      { headers: { 'Content-Type': 'application/json' }, timeout: timeoutMs }
     );
     ticket = rsp.data.ticket || rsp.data.otdsToken;
     expiresAt = now() + (rsp.data.validFor || 1800) * 1000;
@@ -31,7 +33,8 @@ function createOtcsClient({ base, user, pass, http = require('axios'), now = () 
     const tck = await ensureTicket();
     const rsp = await http.get(`${base}/v1/nodes/${nodeId}/versions/${version}/content`, {
       responseType: 'arraybuffer',
-      headers: { OTCSTicket: tck }
+      headers: { OTCSTicket: tck },
+      timeout: timeoutMs
     });
     return rsp.data; // Buffer com o PDF
   }
@@ -42,7 +45,7 @@ function createOtcsClient({ base, user, pass, http = require('axios'), now = () 
     // 1. Verifica se já existe um documento com mesmo nome na pasta
     const existing = await http.get(
       `${base}/v1/nodes/${folderId}/nodes?where_name=${encodeURIComponent(fileName)}`,
-      { headers: { OTCSTicket: tck } }
+      { headers: { OTCSTicket: tck }, timeout: timeoutMs }
     );
     const existingDoc = existing.data?.data?.find((n) => n.name === fileName && n.type === 144);
 
@@ -52,7 +55,9 @@ function createOtcsClient({ base, user, pass, http = require('axios'), now = () 
     if (existingDoc) {
       // 2. Adiciona como nova versão
       const rsp = await http.post(`${base}/v1/nodes/${existingDoc.id}/versions`, fd, {
-        headers: { ...fd.getHeaders(), OTCSTicket: tck }
+        headers: { ...fd.getHeaders(), OTCSTicket: tck },
+        timeout: timeoutMs,
+        maxBodyLength: Infinity
       });
       return rsp.data;
     }
@@ -63,7 +68,9 @@ function createOtcsClient({ base, user, pass, http = require('axios'), now = () 
     fd.append('name', fileName);
     fd.append('resource', JSON.stringify({ name: fileName }));
     const rsp = await http.post(`${base}/v1/nodes`, fd, {
-      headers: { ...fd.getHeaders(), OTCSTicket: tck }
+      headers: { ...fd.getHeaders(), OTCSTicket: tck },
+      timeout: timeoutMs,
+      maxBodyLength: Infinity
     });
     return rsp.data;
   }
@@ -78,7 +85,8 @@ function createOtcsClient({ base, user, pass, http = require('axios'), now = () 
       : { action: 'sendon', ...(comment && { comment }) };
 
     const rsp = await http.put(url, qs.stringify(dataObj), {
-      headers: { OTCSTicket: tck, 'Content-Type': 'application/x-www-form-urlencoded' }
+      headers: { OTCSTicket: tck, 'Content-Type': 'application/x-www-form-urlencoded' },
+      timeout: timeoutMs
     });
     return rsp.data;
   }

@@ -54,6 +54,13 @@ function createPoller({ repo, adobe, processor, config, logger, now = () => new 
   function start() {
     if (!poll.enabled) {
       logger.info('Polling de reconciliación desactivado (POLL_ENABLED=false)');
+      // Mesmo desligado, retoma pendências persistidas (retries vencidos) uma vez após o restart
+      if (!first) {
+        first = setTimeout(() => {
+          processor.runQueue().catch((e) => logger.error(`[poll] runQueue falló: ${describeError(e)}`));
+        }, poll.initialDelayMs ?? 30000);
+        first.unref();
+      }
       return false;
     }
     if (interval) return true;

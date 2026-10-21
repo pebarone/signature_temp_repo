@@ -45,15 +45,17 @@ function createSignatureService({ repo, adobe, otcs, logger, config, now = () =>
         fileName,
         workflowId: String(workflowId || ''),
         subworkflowId: String(subworkflowId || workflowId || ''),
+        taskId: taskId ? Number(taskId) : null,
         emails,
         state: 'pending',
         createdAt: now().toISOString()
       });
       logger.info(`Signature requested: ${ag.id}`);
 
-      // SendOn da tarefa de envio em background (não bloqueia o cliente)
+      // SendOn da tarefa de envio em background (não bloqueia o cliente). `sendOn` nunca rejeita.
+      let sendOn = Promise.resolve();
       if (workflowId) {
-        otcs.sendOnWorkflow({
+        sendOn = otcs.sendOnWorkflow({
           workflowId,
           subworkflowId: subworkflowId || workflowId,
           taskId: taskId || 2,
@@ -67,7 +69,7 @@ function createSignatureService({ repo, adobe, otcs, logger, config, now = () =>
         });
       }
 
-      return { id: ag.id };
+      return { id: ag.id, sendOn };
     } catch (e) {
       if (e instanceof ServiceError) throw e;
       const raw = e.response?.data;

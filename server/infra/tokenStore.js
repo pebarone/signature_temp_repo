@@ -76,6 +76,31 @@ function createTokenStore({ config, logger, http = require('axios'), now = () =>
     }
   }
 
+  // URL de consentimento OAuth (scopes separados por "+", formato aceito pelo Adobe)
+  function buildLoginUrl() {
+    return `${config.adobeAuthBase}/public/oauth/v2?` +
+      'response_type=code' +
+      `&client_id=${encodeURIComponent(config.clientId)}` +
+      `&redirect_uri=${encodeURIComponent(config.redirectUri)}` +
+      `&scope=${(config.adobeScopes || []).join('+')}`;
+  }
+
+  // Troca o code do callback por access/refresh token e persiste
+  async function exchangeCode(code) {
+    const r = await http.post(
+      `${config.adobeApiBase}/oauth/v2/token`,
+      new URLSearchParams({
+        grant_type: 'authorization_code',
+        code,
+        client_id: config.clientId,
+        client_secret: config.clientSecret,
+        redirect_uri: config.redirectUri
+      }),
+      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
+    );
+    setToken(r.data.access_token, r.data.expires_in, r.data.refresh_token);
+  }
+
   async function ensureToken() {
     if (tok.access_token && now() < tok.expires_at - 30000) return tok.access_token;
     if (!tok.refresh_token) {
@@ -87,7 +112,7 @@ function createTokenStore({ config, logger, http = require('axios'), now = () =>
   }
 
   load();
-  return { setToken, ensureToken };
+  return { setToken, ensureToken, buildLoginUrl, exchangeCode };
 }
 
 module.exports = { createTokenStore };

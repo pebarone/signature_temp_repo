@@ -28,6 +28,7 @@ function createReconciliationService({
 
   function markAttention(id, reason) {
     const rec = repo.get(id);
+    clearTimeout_(id); // needs_attention não reprocessa sozinho (só reconcile manual ou novo evento final)
     const changed = !(rec.state === state.STATES.NEEDS_ATTENTION && rec.attentionReason === reason);
     repo.upsert(id, state.attentionPatch(reason));
     if (changed) logger.error(`[${id}] needs_attention: ${reason}`);
@@ -51,7 +52,8 @@ function createReconciliationService({
     clearTimeout_(id);
     const t = setTimer(() => {
       timers.delete(id);
-      reconcile(id, { force: false });
+      // force: o timer pode disparar ~1 ms antes de nextAttemptAt (Date.now vs timers do Node)
+      reconcile(id, { force: true });
     }, delayMs);
     if (t && t.unref) t.unref();
     timers.set(id, t);
@@ -205,6 +207,10 @@ function createReconciliationService({
       }
     }, patch);
 
+    if (!recorded) {
+      logger.warn(`[${id}] acuerdo eliminado durante el procesamiento del evento ${parsed.eventName}`);
+      return { known: false, reason: 'unknown_agreement' };
+    }
     if (recorded.duplicate) {
       logger.info(`[${id}] evento duplicado ignorado (${parsed.notificationId})`);
       return { known: true, duplicate: true, kind, canonical };
@@ -226,6 +232,7 @@ function createReconciliationService({
   */
   function applyAdobeStatus(id, status) {
     const rec = repo.get(id);
+    if (!rec) return KINDS.UNKNOWN;
     const kind = classifyAgreementStatus(status);
     const ts = nowIso();
     const patch = { adobeStatus: status, lastPolledAt: ts };

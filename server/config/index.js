@@ -16,7 +16,8 @@ const noSlash = (v) => String(v).replace(/\/+$/, '');
 /*
   === Config a partir de um objeto env (testável) ===
   Storage: DATA_DIR > Render/NODE_ENV=production (/tmp, efêmero) > ./data local.
-  Kubernetes/OpenShift sem DATA_DIR => storage efêmero (problem); fatal se REQUIRE_PERSISTENT_STORAGE=true.
+  Kubernetes/OpenShift sem DATA_DIR => storage efêmero (problem); fatal se REQUIRE_PERSISTENT_STORAGE=true
+  (que também recusa o /tmp efêmero do Render/production).
 */
 function computeConfig(env = process.env, { projectRoot = PROJECT_ROOT } = {}) {
   const isRender = bool(env.RENDER, false);
@@ -38,10 +39,14 @@ function computeConfig(env = process.env, { projectRoot = PROJECT_ROOT } = {}) {
   }
 
   const noDataDir = source !== 'DATA_DIR';
-  const problem = isKubernetes && noDataDir
-    ? 'Kubernetes/OpenShift detectado sin DATA_DIR: el estado (base SQLite, tokens, logs) se perderá al reiniciar el pod. ' +
-      'Monte un PVC y defina DATA_DIR (ej. /data).'
-    : null;
+  const ephemeral = source === 'tmp' || (isKubernetes && noDataDir);
+  let problem = null;
+  if (isKubernetes && noDataDir) {
+    problem = 'Kubernetes/OpenShift detectado sin DATA_DIR: el estado (base SQLite, tokens, logs) se perderá al reiniciar el pod. ' +
+      'Monte un PVC y defina DATA_DIR (ej. /data).';
+  } else if (ephemeral && requirePersistent) {
+    problem = `REQUIRE_PERSISTENT_STORAGE=true pero el storage es efímero (${dataDir}). Defina DATA_DIR con un volumen persistente.`;
+  }
 
   const stateDir = path.join(dataDir, 'state');
   const publicUrl = str(env.PUBLIC_URL);
@@ -50,7 +55,7 @@ function computeConfig(env = process.env, { projectRoot = PROJECT_ROOT } = {}) {
     platform: { isRender, isProduction, isKubernetes },
     storage: {
       source,
-      ephemeral: source === 'tmp' || (isKubernetes && noDataDir),
+      ephemeral,
       problem,
       fatal: !!problem && requirePersistent
     },
@@ -74,6 +79,10 @@ function computeConfig(env = process.env, { projectRoot = PROJECT_ROOT } = {}) {
     publicUrl,
     redirectUri: `${publicUrl}/admin/callback`,
     clientId: env.CLIENT_ID,
+    adobeScopes: [
+      'agreement_send:account', 'agreement_write:account', 'agreement_read:account',
+      'account_read:account', 'account_write:account', 'user_login:account'
+    ],
     clientSecret: env.CLIENT_SECRET,
     signatureSecret: env.SIGNATURE_SECRET,
     logUser: env.LOG_USER,
@@ -91,8 +100,12 @@ function computeConfig(env = process.env, { projectRoot = PROJECT_ROOT } = {}) {
     otcs: {
       base: noSlash(str(env.OTCS_BASE)),
       user: env.OTCS_USER,
-      pass: env.OTCS_PASS
+      pass: env.OTCS_PASS,
+      timeoutMs: Math.max(1000, int(env.OTCS_TIMEOUT_MS, 60 * 1000))
     },
+
+    // Self-ping (Render): intervalo em ms; 0 desativa
+    keepaliveMs: int(env.KEEPALIVE_INTERVAL_MS, 10 * 60 * 1000),
 
     poll: {
       enabled: bool(env.POLL_ENABLED, true),
