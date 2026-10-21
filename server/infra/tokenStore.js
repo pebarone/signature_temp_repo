@@ -22,11 +22,14 @@ function createTokenStore({ config, logger, http = require('axios'), now = () =>
     }
   }
 
+  // Devolve false se não gravou: o token segue válido em memória, mas se perde no restart
   function save() {
     try {
       atomicWriteFileSync(file, JSON.stringify(tok, null, 2), { mode: 0o600 });
+      return true;
     } catch (err) {
       logger?.error(`Failed to save tokens file: ${err.message}`);
+      return false;
     }
   }
 
@@ -54,7 +57,7 @@ function createTokenStore({ config, logger, http = require('axios'), now = () =>
     tok.access_token = accessToken;
     tok.expires_at = now() + expiresInSec * 1000;
     if (refreshToken) tok.refresh_token = refreshToken;
-    save();
+    return save();
   }
 
   async function refresh() {
@@ -87,7 +90,11 @@ function createTokenStore({ config, logger, http = require('axios'), now = () =>
       (state ? `&state=${encodeURIComponent(state)}` : '');
   }
 
-  // Troca o code do callback por access/refresh token e persiste
+  /*
+    Troca o code do callback por access/refresh token e persiste.
+    Falha de gravação propaga (o callback responde erro): o refresh token só em memória some no restart.
+    No refresh a falha de gravação só é logada, para não derrubar as chamadas em curso.
+  */
   async function exchangeCode(code) {
     const r = await http.post(
       `${config.adobeApiBase}/oauth/v2/token`,
@@ -100,7 +107,9 @@ function createTokenStore({ config, logger, http = require('axios'), now = () =>
       }),
       { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, timeout }
     );
-    setToken(r.data.access_token, r.data.expires_in, r.data.refresh_token);
+    if (!setToken(r.data.access_token, r.data.expires_in, r.data.refresh_token)) {
+      throw new Error('Tokens obtenidos pero no persistidos (ver log de error); revisar permisos del volumen');
+    }
   }
 
   async function ensureToken() {

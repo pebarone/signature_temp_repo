@@ -52,26 +52,31 @@ function createPoller({ repo, adobe, processor, config, logger, now = () => new 
     return ticking;
   }
 
+  // Só a fila persistida (retries com backoff), sem consultar o Adobe; sem sobreposição
+  let draining = null;
+  function drainQueue() {
+    if (!draining) draining = processor.runQueue().finally(() => { draining = null; });
+    return draining;
+  }
+
   function start() {
-    if (!poll.enabled) {
-      logger.info('Polling de reconciliación desactivado (POLL_ENABLED=false)');
-      // Mesmo desligado, retoma pendências persistidas (retries vencidos) uma vez após o restart
-      if (!first) {
-        first = setTimeout(() => {
-          processor.runQueue().catch((e) => logger.error(`[poll] runQueue falló: ${describeError(e)}`));
-        }, poll.initialDelayMs ?? 30000);
-        first.unref();
-      }
-      return false;
-    }
-    if (interval) return true;
-    const safe = () => tick().catch((e) => logger.error(`[poll] tick falló: ${describeError(e)}`));
+    const enabled = Boolean(poll.enabled);
+    if (interval) return enabled;
+    /*
+      Desligado, o polling de status não roda, mas a fila de retries continua sendo revisada a cada
+      POLL_INTERVAL_MS: os timers de retry vivem em memória e se perdem num restart durante o backoff.
+    */
+    const safe = enabled
+      ? () => tick().catch((e) => logger.error(`[poll] tick falló: ${describeError(e)}`))
+      : () => drainQueue().catch((e) => logger.error(`[poll] runQueue falló: ${describeError(e)}`));
     interval = setInterval(safe, poll.intervalMs);
     interval.unref();
     first = setTimeout(safe, poll.initialDelayMs ?? 30000);
     first.unref();
-    logger.info(`Polling de reconciliación activo: cada ${poll.intervalMs} ms`);
-    return true;
+    logger.info(enabled
+      ? `Polling de reconciliación activo: cada ${poll.intervalMs} ms`
+      : `Polling de reconciliación desactivado (POLL_ENABLED=false); cola de reintentos revisada cada ${poll.intervalMs} ms`);
+    return enabled;
   }
 
   function stop() {

@@ -87,7 +87,7 @@ para a combinação Node/OS/arquitetura da imagem base. Quando não existe (ex.:
 ou arquitetura incomum), o `npm` recompila na hora e a imagem de build precisa de **python3, make e g++**.
 Opções:
 
-- usar uma imagem base glibc (Debian/UBI) com Node 18+ — normalmente o prebuild é baixado e nada mais é necessário;
+- usar uma imagem base glibc (Debian/UBI) com Node 20+ (o `better-sqlite3` 12.x exige Node 20 ou mais novo) — normalmente o prebuild é baixado e nada mais é necessário;
 - ou instalar `python3 make g++` no estágio de build (multi-stage) e copiar só `node_modules` para a imagem final;
 - se o build não tem acesso à internet para baixar o prebuild (registry/proxy restrito), prever o mirror ou
   compilar a partir do código-fonte (caso acima).

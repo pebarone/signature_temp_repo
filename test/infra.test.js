@@ -169,6 +169,21 @@ test('tokenStore: login URL e troca de code', async () => {
   assert.equal(JSON.parse(fs.readFileSync(config.tokensFile, 'utf8')).refresh_token, 'r');
 });
 
+test('tokenStore: falha ao gravar tokens.json propaga no exchangeCode, mas o refresh segue em memória', async () => {
+  // o "diretório" de state é um arquivo: qualquer gravação falha (simula volume sem permissão)
+  const blocker = path.join(tmpDir(), 'not-a-dir');
+  fs.writeFileSync(blocker, '');
+  const config = tokenConfig(tmpDir(), { tokensFile: path.join(blocker, 'tokens.json') });
+  const http = { post: async () => ({ data: { access_token: 'a', refresh_token: 'r', expires_in: 3600 } }) };
+  const logger = makeLogger();
+
+  const store = createTokenStore({ config, logger, http });
+  await assert.rejects(() => store.exchangeCode('the-code'), /no persistidos/);
+
+  const refreshing = createTokenStore({ config: { ...config, adobeRefreshToken: 'seed' }, logger, http });
+  assert.equal(await refreshing.ensureToken(), 'a');
+});
+
 test('tokenStore: refresh e exchangeCode usam timeout (ADOBE_TIMEOUT_MS, padrão 60000)', async () => {
   assert.equal(tokenConfig(tmpDir()).adobeTimeoutMs, 60000);
   assert.equal(computeConfig({ DATA_DIR: tmpDir(), ADOBE_TIMEOUT_MS: '15000' }).adobeTimeoutMs, 15000);

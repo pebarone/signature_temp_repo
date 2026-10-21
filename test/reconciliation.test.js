@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const { parseWebhookPayload } = require('../server/domain/eventPolicy');
 const { backoffDelay } = require('../server/domain/agreementState');
 const {
-  buildWorld, seedAgreement, webhookPayload, makeClock, makeAdobe, makeOtcs, tmpDir, httpError, basicHeader
+  buildWorld, seedAgreement, webhookPayload, makeClock, makeAdobe, makeOtcs, tmpDir, httpError, basicHeader, waitFor
 } = require('./support/fakes');
 const path = require('path');
 
@@ -494,6 +494,29 @@ test('poller reprocessa pendências vencidas (PDF entregue sem disposição) e r
   assert.equal(world.repo.get('AG-1').state, 'completed');
   assert.equal(world.otcs.dispositionCalls().length, 1);
   assert.equal(world.otcs.uploads.length, 1);
+  await world.close();
+});
+
+test('POLL_ENABLED=false: a fila de retries continua sendo revisada após o restart (backoff ainda não vencido no start)', async () => {
+  const world = await buildWorld({ env: { POLL_ENABLED: 'false', POLL_INTERVAL_MS: '1000', POLL_INITIAL_DELAY_MS: '0' } });
+  seedAgreement(world);
+  world.otcs.dispositionFailures = 1;
+  await fire(world, 'AGREEMENT_WORKFLOW_COMPLETED');
+  assert.equal(world.repo.get('AG-1').state, 'pdf_delivered');
+  world.reconciliation.stop(); // "restart": o timer de retry em memória se perde
+
+  let passes = 0;
+  const runQueue = world.reconciliation.runQueue;
+  world.reconciliation.runQueue = async () => { passes++; return runQueue(); };
+
+  assert.equal(world.poller.start(), false);
+  await waitFor(() => passes >= 1); // primeira passada roda, mas o backoff ainda não venceu
+  assert.equal(world.otcs.dispositionCalls().length, 0);
+
+  world.clock.advance(61 * 1000);
+  await waitFor(() => world.repo.get('AG-1').state === 'completed');
+  assert.equal(world.otcs.dispositionCalls().length, 1);
+  assert.equal(world.calls.filter((c) => c[0] === 'adobe.getAgreement').length, 1, 'só a verificação do final OK; sem polling de status');
   await world.close();
 });
 
