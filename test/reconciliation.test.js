@@ -8,7 +8,9 @@ const {
 const path = require('path');
 
 // Entrega um evento de webhook ao serviço e aguarda o processamento assíncrono
+// O Adobe "confirma" SIGNED por padrão (a verificação do final OK consulta o Adobe); testes podem sobrescrever
 async function fire(world, event, id = 'AG-1', opts = {}) {
+  world.adobe.agreements[id] ||= { id, status: 'SIGNED' };
   const result = world.reconciliation.handleEvent(parseWebhookPayload(webhookPayload(event, id, opts)));
   if (result.processing) await result.processing;
   return result;
@@ -99,6 +101,7 @@ test('PDF final é enviado ao OTCS ANTES da disposição', async () => {
   await fire(world, 'AGREEMENT_WORKFLOW_COMPLETED');
 
   assert.deepEqual(world.calls, [
+    ['adobe.getAgreement', 'AG-1'], // confirmação do SIGNED no Adobe antes de entregar
     ['adobe.download', 'AG-1'],
     ['otcs.upload', '2002', 'contrato.pdf'],
     ['otcs.sendon', 'Firmado', 3]
@@ -560,6 +563,7 @@ test('restart no meio: evento final persistido mas processamento não concluído
 
   const w2 = await buildWorld({ dbFile, clock });
   assert.equal(w2.repo.get('AG-1').finalKind, 'final_ok');
+  w2.adobe.agreements['AG-1'] = { id: 'AG-1', status: 'SIGNED' };
   assert.deepEqual(await w2.reconciliation.runQueue(), ['AG-1']);
   assert.equal(w2.repo.get('AG-1').state, 'completed');
   assert.equal(w2.otcs.uploads.length, 1);
@@ -733,5 +737,126 @@ test('repo.listPending/listPollable: filtram no SQL (final x sem final, sem conc
 
   assert.deepEqual(world.repo.listPollable().map((r) => r.id), ['A-POLL']);
   assert.deepEqual(world.repo.listPending().map((r) => r.id), ['A-PEND']);
+  await world.close();
+});
+
+/* ---------- Adobe como fonte da verdade (final OK vindo de webhook) ---------- */
+
+const getAgreementCalls = (world) => callNames(world).filter((c) => c === 'adobe.getAgreement').length;
+
+test('final OK por webhook confirma SIGNED no Adobe antes do PDF e grava adobeStatus', async () => {
+  const world = await buildWorld();
+  seedAgreement(world);
+  world.adobe.agreements['AG-1'] = { id: 'AG-1', status: 'SIGNED' };
+  await fire(world, 'AGREEMENT_WORKFLOW_COMPLETED');
+  assert.deepEqual(callNames(world), ['adobe.getAgreement', 'adobe.download', 'otcs.upload', 'otcs.sendon']);
+  const rec = world.repo.get('AG-1');
+  assert.equal(rec.state, 'completed');
+  assert.equal(rec.adobeStatus, 'SIGNED');
+  await world.close();
+});
+
+test('final OK forjado (Adobe diz que não está SIGNED): needs_attention, sem PDF nem disposição', async () => {
+  for (const [event, opts] of [
+    ['AGREEMENT_WORKFLOW_COMPLETED', {}],
+    ['AGREEMENT_ACTION_COMPLETED', { status: 'SIGNED' }] // o status do payload não é confiável
+  ]) {
+    const world = await buildWorld();
+    seedAgreement(world);
+    world.adobe.agreements['AG-1'] = { id: 'AG-1', status: 'OUT_FOR_SIGNATURE' };
+    const result = await fire(world, event, 'AG-1', opts);
+    assert.equal(result.known, true);
+
+    const rec = world.repo.get('AG-1');
+    assert.equal(rec.state, 'needs_attention');
+    assert.equal(rec.attentionReason, 'evento final no confirmado por Adobe: OUT_FOR_SIGNATURE');
+    assert.equal(rec.adobeStatus, null, 'status do payload/Adobe não confirmado não vira "verificado"');
+    assert.equal(rec.sendonDone, false);
+    assert.equal(world.otcs.uploads.length, 0);
+    assert.equal(world.otcs.sendons.length, 0);
+    assert.equal(callNames(world).includes('adobe.download'), false);
+    assert.ok(world.logger.has('error', /evento final no confirmado por Adobe: OUT_FOR_SIGNATURE/));
+    await world.close();
+  }
+});
+
+test('falha ao consultar o Adobe na verificação: registerFailure stage "verify" (retry com backoff) e depois conclui', async () => {
+  const world = await buildWorld();
+  seedAgreement(world);
+  const getAgreement = world.adobe.getAgreement;
+  world.adobe.getAgreement = async () => { throw httpError(503, 'adobe down'); };
+  await fire(world, 'AGREEMENT_WORKFLOW_COMPLETED');
+  world.adobe.getAgreement = getAgreement;
+  const rec = world.repo.get('AG-1');
+  assert.equal(rec.state, 'signed');
+  assert.equal(rec.attempts, 1);
+  assert.equal(rec.lastErrorStage, 'verify');
+  assert.equal(rec.nextAttemptAt, new Date(world.clock.ms() + 60 * 1000).toISOString());
+  assert.equal(world.timers.length, 1);
+  assert.equal(world.timers[0].ms, 60 * 1000);
+  assert.match(rec.lastError, /adobe down/);
+  assert.equal(world.otcs.uploads.length, 0);
+  assert.equal(callNames(world).includes('adobe.download'), false);
+
+  world.adobe.agreements['AG-1'] = { id: 'AG-1', status: 'SIGNED' };
+  world.clock.advance(60 * 1000);
+  const res = await world.reconciliation.reconcile('AG-1', { force: false });
+  assert.equal(res.status, 'completed');
+  assert.equal(world.repo.get('AG-1').adobeStatus, 'SIGNED');
+  await world.close();
+});
+
+test('adobeStatus já SIGNED (veio do polling) dispensa a consulta extra', async () => {
+  const world = await buildWorld();
+  seedAgreement(world);
+  world.adobe.agreements['AG-1'] = { id: 'AG-1', status: 'SIGNED' };
+  await world.poller.tick();
+  assert.equal(world.repo.get('AG-1').state, 'completed');
+  assert.equal(getAgreementCalls(world), 1, 'só a consulta do próprio polling');
+  await world.close();
+});
+
+test('status do payload do webhook não é gravado em adobeStatus (fica só no resumo do evento)', async () => {
+  const world = await buildWorld();
+  seedAgreement(world);
+  world.adobe.agreements['AG-1'] = { id: 'AG-1', status: 'OUT_FOR_SIGNATURE' };
+
+  // evento informativo forjado dizendo SIGNED não pode "pré-verificar" o acordo
+  await fire(world, 'AGREEMENT_CREATED', 'AG-1', { status: 'SIGNED' });
+  let rec = world.repo.get('AG-1');
+  assert.equal(rec.adobeStatus, null);
+  assert.equal(world.repo.listEvents('AG-1')[0].summary.status, 'SIGNED');
+
+  await fire(world, 'AGREEMENT_WORKFLOW_COMPLETED', 'AG-1', { status: 'SIGNED', notificationId: 'forged-final' });
+  rec = world.repo.get('AG-1');
+  assert.equal(rec.state, 'needs_attention', 'Adobe é consultado e não confirma');
+  assert.equal(getAgreementCalls(world), 1);
+  assert.equal(rec.adobeStatus, null);
+  await world.close();
+});
+
+test('só o final OK é verificado: rejeição/expiração por webhook seguem sem consultar o Adobe', async () => {
+  const world = await buildWorld({ env: { DISPOSITION_EXPIRED: 'Expirado' } });
+  seedAgreement(world, 'AG-R');
+  seedAgreement(world, 'AG-E');
+  await fire(world, 'AGREEMENT_REJECTED', 'AG-R');
+  await fire(world, 'AGREEMENT_EXPIRED', 'AG-E');
+  assert.equal(getAgreementCalls(world), 0);
+  assert.equal(world.repo.get('AG-R').state, 'rejected');
+  assert.equal(world.repo.get('AG-E').state, 'expired');
+  await world.close();
+});
+
+test('reconcile manual de um final OK não confirmado volta a consultar o Adobe e conclui quando SIGNED', async () => {
+  const world = await buildWorld();
+  seedAgreement(world);
+  world.adobe.agreements['AG-1'] = { id: 'AG-1', status: 'OUT_FOR_SIGNATURE' };
+  await fire(world, 'AGREEMENT_WORKFLOW_COMPLETED');
+  assert.equal(world.repo.get('AG-1').state, 'needs_attention');
+
+  world.adobe.agreements['AG-1'] = { id: 'AG-1', status: 'SIGNED' };
+  const res = await world.reconciliation.reconcile('AG-1', { force: true, refresh: true, manual: true });
+  assert.equal(res.status, 'completed');
+  assert.equal(world.repo.get('AG-1').adobeStatus, 'SIGNED');
   await world.close();
 });

@@ -97,10 +97,13 @@ POLL_MAX_PER_TICK=50
 POLL_MAX_AGE_DAYS=90
 RETRY_BASE_MS=60000                   # exponential backoff: 1 min ... 1 h
 RETRY_MAX_MS=3600000
+RETRY_MAX_ATTEMPTS=10                 # attempts before needs_attention (0 = unlimited); OTCS 4xx (except 401/408/429) goes there at once
 ADOBE_DOWNLOAD_ATTEMPTS=8             # retries of 403 on combinedDocument right after signing
 LOG_RETENTION_DAYS=15                 # 0 disables the purge
 OTCS_TIMEOUT_MS=60000
-KEEPALIVE_INTERVAL_MS=600000          # self-ping of /health when NODE_ENV=production (0 disables)
+ADOBE_TIMEOUT_MS=60000                # timeout of every Adobe call (REST and OAuth token refresh/exchange)
+WEBHOOK_REQUIRE_CLIENT_ID=false       # true => POST /webhook without X-AdobeSign-ClientId == CLIENT_ID gets 401
+KEEPALIVE_INTERVAL_MS=600000          # self-ping of /health, only on Render (RENDER=true) with PUBLIC_URL (0 disables)
 PORT=3000
 ```
 
@@ -132,7 +135,7 @@ python3, make and g++ to compile.
 
 ## 🔀 Webhook
 
-- **Endpoint:** `/webhook` — `HEAD`/`GET` echo `X-AdobeSign-ClientId` (verification handshake); `POST` receives the events
+- **Endpoint:** `/webhook` — `HEAD`/`GET` echo the configured `CLIENT_ID` in `X-AdobeSign-ClientId` (verification handshake; the request header is echoed only if `CLIENT_ID` is unset); `POST` receives the events
 - **Content-Type:** `application/json`
 
 The `POST` persists the event (deduplicated by `webhookNotificationId`) and answers `200` with
@@ -148,14 +151,20 @@ agreements that never received a final event. Event policy (Adobe Sign v6 names)
 | `AGREEMENT_DOCUMENTS_DELETED` | `needs_attention` |
 | informational / unavailable / unknown events | history only |
 
+Adobe is the source of truth: before delivering the PDF for a final OK that came from a webhook, the agreement is
+fetched and must be `SIGNED` (otherwise `needs_attention`). A signer rejection seen by polling (`CANCELLED`) is told
+apart from a recall through `GET /agreements/{id}/events` (`REJECTED`/`ACTION_REJECTED` => rejected).
+
 Legacy names (`AGREEMENT_COMPLETED`, `AGREEMENT_SIGNED`, `DOCUMENT_SIGNED`, `PARTICIPANT_*`) are accepted as aliases.
 
 ### Admin endpoints (Basic Auth `LOG_USER`/`LOG_PASS`)
 
 - `GET /admin/agreements[?state=needs_attention][&events=5]` — state of every agreement
-- `POST /admin/reconcile/:id` — force a reconciliation (asks Adobe if no final result is known yet)
+- `POST /admin/reconcile/:id` — force a reconciliation (asks Adobe if no final result is known yet); also takes a
+  `needs_attention` agreement back and resets its attempts
 - `GET /logs`, `GET /logs/stream` — today's `audit-YYYY-MM-DD.log` (download / live SSE)
-- `GET /admin/login`, `GET /admin/callback` — Adobe OAuth (no auth, as before); `GET /health` — liveness
+- `GET /admin/login` (Basic Auth) — Adobe OAuth consent with a random one-time `state` (10 min); `GET /admin/callback` —
+  Adobe's redirect (no Basic Auth, requires a valid `state`); `GET /health` — liveness
 
 ---
 

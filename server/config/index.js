@@ -79,6 +79,8 @@ function computeConfig(env = process.env, { projectRoot = PROJECT_ROOT } = {}) {
     publicUrl,
     redirectUri: `${publicUrl}/admin/callback`,
     clientId: env.CLIENT_ID,
+    // true => POST /webhook sem X-AdobeSign-ClientId igual ao CLIENT_ID responde 401 (não persiste)
+    webhookRequireClientId: bool(env.WEBHOOK_REQUIRE_CLIENT_ID, false),
     adobeScopes: [
       'agreement_send:account', 'agreement_write:account', 'agreement_read:account',
       'account_read:account', 'account_write:account', 'user_login:account'

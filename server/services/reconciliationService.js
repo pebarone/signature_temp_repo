@@ -102,6 +102,23 @@ function createReconciliationService({
     }
     if (!opts.force && !state.isDue(rec, now().getTime())) return { status: 'deferred', record: rec };
 
+    // 0) Adobe é a fonte da verdade: final OK vindo de webhook só segue após confirmar SIGNED no Adobe.
+    // adobeStatus=SIGNED só é gravado por consulta ao Adobe (polling/aqui), então já vale como verificado.
+    // (Rejeição/expiração forjadas têm impacto menor e não são verificadas.)
+    if (rec.finalKind === KINDS.FINAL_OK && rec.adobeStatus !== 'SIGNED') {
+      let status;
+      try {
+        status = String((await adobe.getAgreement(id))?.status || '').trim().toUpperCase();
+      } catch (e) {
+        return registerFailure(id, 'verify', e);
+      }
+      if (status !== 'SIGNED') {
+        logger.error(`[${id}] evento final no confirmado por Adobe: ${status || 'sin estado'}`);
+        return markAttention(id, `evento final no confirmado por Adobe: ${status || 'sin estado'}`);
+      }
+      rec = repo.upsert(id, { adobeStatus: 'SIGNED' });
+    }
+
     // 1) PDF final -> nova versão no attachId
     if (plan.pdf && !rec.pdfDelivered) {
       if (!rec.attachId) return markAttention(id, 'acuerdo sin attachId: no hay carpeta destino para el PDF');
@@ -204,11 +221,10 @@ function createReconciliationService({
     const ts = nowIso();
     let patch = null;
     if (isFinalKind(kind)) {
-      patch = state.finalPatch(rec, kind, { nowIso: ts, adobeStatus: parsed.status });
+      // O status do payload NÃO vai para adobeStatus (webhook não é confiável; fica só no resumo do evento)
+      patch = state.finalPatch(rec, kind, { nowIso: ts });
     } else if (kind === KINDS.NEEDS_ATTENTION) {
       patch = rec.sendonDone ? null : state.attentionPatch(`evento ${canonical}`);
-    } else if (parsed.status) {
-      patch = { adobeStatus: parsed.status };
     }
 
     const recorded = repo.recordEvent(id, {

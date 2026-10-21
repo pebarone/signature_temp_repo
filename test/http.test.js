@@ -12,15 +12,16 @@ const json = (body) => ({ method: 'POST', headers: { 'content-type': 'applicatio
 const post = (world, p, body, headers = {}) =>
   fetch(`${world.baseUrl}${p}`, { ...json(body), headers: { 'content-type': 'application/json', ...headers } });
 const ADMIN = { authorization: basicHeader('admin', 'pa:ss') }; // senha com ":" de propósito
+const signed = (world, id = 'AG-1') => { world.adobe.agreements[id] = { id, status: 'SIGNED' }; };
 
 /* ---------- webhook ---------- */
 
-test('webhook HEAD/GET: eco do X-AdobeSign-ClientId', async () => {
+test('webhook HEAD/GET: eco do CLIENT_ID configurado (nunca o valor arbitrário da requisição)', async () => {
   const world = await buildWorld({ listen: true });
 
   let r = await fetch(`${world.baseUrl}/webhook`, { method: 'HEAD', headers: { 'X-AdobeSign-ClientId': 'abc123' } });
   assert.equal(r.status, 200);
-  assert.equal(r.headers.get('x-adobesign-clientid'), 'abc123');
+  assert.equal(r.headers.get('x-adobesign-clientid'), 'test-client-id');
 
   r = await fetch(`${world.baseUrl}/webhook`, { method: 'HEAD' });
   assert.equal(r.status, 200);
@@ -28,18 +29,81 @@ test('webhook HEAD/GET: eco do X-AdobeSign-ClientId', async () => {
 
   r = await fetch(`${world.baseUrl}/webhook`, { headers: { 'X-AdobeSign-ClientId': 'abc123' } });
   assert.equal(r.status, 200);
-  assert.equal(r.headers.get('x-adobesign-clientid'), 'abc123');
+  assert.equal(r.headers.get('x-adobesign-clientid'), 'test-client-id');
   assert.deepEqual(await r.json(), { status: 'pong' });
 
   r = await fetch(`${world.baseUrl}/webhook?challenge=xyz`, { headers: { 'X-AdobeSign-ClientId': 'abc123' } });
   assert.equal(await r.text(), 'xyz');
+  assert.equal(r.headers.get('x-adobesign-clientid'), 'test-client-id');
+  await world.close();
+});
+
+test('webhook HEAD/GET: sem CLIENT_ID configurado cai no header da requisição', async () => {
+  const world = await buildWorld({ listen: true, env: { CLIENT_ID: '' } });
+  let r = await fetch(`${world.baseUrl}/webhook`, { method: 'HEAD', headers: { 'X-AdobeSign-ClientId': 'abc123' } });
   assert.equal(r.headers.get('x-adobesign-clientid'), 'abc123');
+  r = await fetch(`${world.baseUrl}/webhook`, { method: 'HEAD' });
+  assert.equal(r.headers.get('x-adobesign-clientid'), null);
+  await world.close();
+});
+
+test('webhook POST: header ClientId diferente do CLIENT_ID só gera warn (padrão) e o evento é aceito', async () => {
+  const world = await buildWorld({ listen: true });
+  seedAgreement(world);
+  let r = await post(world, '/webhook', webhookPayload('AGREEMENT_CREATED', 'AG-1', { notificationId: 'ok-1' }), {
+    'X-AdobeSign-ClientId': 'test-client-id'
+  });
+  assert.equal(r.status, 200);
+  assert.equal(world.logger.has('warn', /ClientId diferente/), false);
+
+  r = await post(world, '/webhook', webhookPayload('AGREEMENT_CREATED', 'AG-1', { notificationId: 'bad-1' }), {
+    'X-AdobeSign-ClientId': 'forged'
+  });
+  assert.equal(r.status, 200);
+  assert.equal(r.headers.get('x-adobesign-clientid'), 'test-client-id');
+  assert.ok(world.logger.has('warn', /ClientId diferente/));
+  assert.ok(!world.logger.lines.warn.some((l) => l.includes('forged')), 'não loga o valor recebido');
+  assert.equal(world.repo.listEvents('AG-1').length, 2);
+  await world.close();
+});
+
+test('WEBHOOK_REQUIRE_CLIENT_ID=true: POST com header ausente/diferente => 401 e nada é persistido', async () => {
+  const world = await buildWorld({ listen: true, env: { WEBHOOK_REQUIRE_CLIENT_ID: 'true' } });
+  seedAgreement(world);
+  signed(world);
+  const payload = (n) => webhookPayload('AGREEMENT_WORKFLOW_COMPLETED', 'AG-1', { notificationId: n });
+
+  let r = await post(world, '/webhook', payload('n-1'), { 'X-AdobeSign-ClientId': 'forged' });
+  assert.equal(r.status, 401);
+  r = await post(world, '/webhook', payload('n-2'));
+  assert.equal(r.status, 401, 'header ausente também conta como divergência');
+  assert.equal(world.repo.listEvents('AG-1').length, 0);
+  assert.equal(world.repo.get('AG-1').finalKind, null);
+  assert.equal(world.calls.length, 0);
+
+  // o handshake (HEAD/GET) continua respondendo
+  r = await fetch(`${world.baseUrl}/webhook`, { method: 'HEAD' });
+  assert.equal(r.status, 200);
+
+  r = await post(world, '/webhook', payload('n-3'), { 'X-AdobeSign-ClientId': 'test-client-id' });
+  assert.equal(r.status, 200);
+  await waitFor(() => world.repo.get('AG-1').state === 'completed');
+  await world.close();
+});
+
+test('WEBHOOK_REQUIRE_CLIENT_ID=true sem CLIENT_ID configurado falha fechado (401)', async () => {
+  const world = await buildWorld({ listen: true, env: { WEBHOOK_REQUIRE_CLIENT_ID: 'true', CLIENT_ID: '' } });
+  seedAgreement(world);
+  const r = await post(world, '/webhook', webhookPayload('AGREEMENT_CREATED', 'AG-1'), { 'X-AdobeSign-ClientId': 'anything' });
+  assert.equal(r.status, 401);
+  assert.equal(world.repo.listEvents('AG-1').length, 0);
   await world.close();
 });
 
 test('webhook POST: persiste o evento e responde 200 com X-AdobeSign-ClientId antes do processamento', async () => {
   const world = await buildWorld({ listen: true });
   seedAgreement(world);
+  signed(world);
   let release;
   world.otcs.uploadGate = new Promise((resolve) => { release = resolve; }); // trava o upload no OTCS
 
@@ -48,7 +112,7 @@ test('webhook POST: persiste o evento e responde 200 com X-AdobeSign-ClientId an
     'X-AdobeSign-ClientId': 'abc123'
   });
   assert.equal(r.status, 200);
-  assert.equal(r.headers.get('x-adobesign-clientid'), 'abc123');
+  assert.equal(r.headers.get('x-adobesign-clientid'), 'test-client-id');
   assert.equal(await r.text(), 'OK');
   assert.ok(Date.now() - t0 < 1500, 'resposta rápida');
 
@@ -63,13 +127,14 @@ test('webhook POST: persiste o evento e responde 200 com X-AdobeSign-ClientId an
   // libera o OTCS: o processamento assíncrono conclui
   release();
   await waitFor(() => world.repo.get('AG-1').state === 'completed');
-  assert.deepEqual(world.calls.map((c) => c[0]), ['adobe.download', 'otcs.upload', 'otcs.sendon']);
+  assert.deepEqual(world.calls.map((c) => c[0]), ['adobe.getAgreement', 'adobe.download', 'otcs.upload', 'otcs.sendon']);
   await world.close();
 });
 
 test('webhook POST: dedupe por webhookNotificationId', async () => {
   const world = await buildWorld({ listen: true });
   seedAgreement(world);
+  signed(world);
   const payload = webhookPayload('AGREEMENT_WORKFLOW_COMPLETED', 'AG-1', { notificationId: 'same-id' });
   assert.equal((await post(world, '/webhook', payload)).status, 200);
   await waitFor(() => world.repo.get('AG-1').state === 'completed');
@@ -86,6 +151,7 @@ test('webhook POST: eventos legados, informativos e vermelhos respondem 200', as
   const world = await buildWorld({ listen: true });
   seedAgreement(world, 'AG-L');
   seedAgreement(world, 'AG-I');
+  signed(world, 'AG-L');
   for (const [i, e] of ['AGREEMENT_CREATED', 'AGREEMENT_VAULTED', 'AGREEMENT_NOT_A_REAL_EVENT'].entries()) {
     const r = await post(world, '/webhook', webhookPayload(e, 'AG-I', { notificationId: `i-${i}` }));
     assert.equal(r.status, 200);
@@ -380,6 +446,7 @@ test('admin: sem LOG_USER/LOG_PASS configurados tudo é negado', async () => {
 test('admin: POST /admin/reconcile/:id exige Basic Auth, 404 para desconhecido e força a reconciliação', async () => {
   const world = await buildWorld({ listen: true });
   seedAgreement(world);
+  signed(world);
   world.otcs.uploadFailures = 1;
   await post(world, '/webhook', webhookPayload('AGREEMENT_WORKFLOW_COMPLETED', 'AG-1'));
   await waitFor(() => world.repo.get('AG-1').attempts === 1);
