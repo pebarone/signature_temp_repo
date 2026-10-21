@@ -1,0 +1,16 @@
+# EXEMPLO — ajustar nome, namespace e storageClassName ao cluster antes de aplicar.
+# O orquestrador guarda SQLite, tokens.json e logs em DATA_DIR; sem volume persistente o estado
+# se perde a cada restart do pod. RWO => um único pod (ver README: replicas 1 + strategy Recreate).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: signature-orchestrator-data
+  labels:
+    app: signature-orchestrator
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+  # storageClassName: <classe-do-cluster>   # omitir para usar a classe padrão

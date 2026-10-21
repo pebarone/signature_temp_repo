@@ -12,3 +12,6 @@ server/logs
 
 # scripts locais
 server/http/runngrok.bat
+
+# estado local (SQLite, tokens, logs) — ver server/config
+data/
