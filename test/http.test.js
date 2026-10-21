@@ -3,9 +3,10 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const path = require('path');
 const { createLogger } = require('../server/infra/logger');
-const { sign } = require('../server/http/middleware/hmac');
+const { sign, signStart } = require('../server/http/middleware/hmac');
 const {
-  buildWorld, seedAgreement, webhookPayload, waitFor, startBody, basicHeader, makeClock, tmpDir
+  buildWorld, seedAgreement, webhookPayload, waitFor, startBody, startBodyV1, seedStartFlow, basicHeader, makeClock, tmpDir,
+  httpError
 } = require('./support/fakes');
 
 const json = (body) => ({ method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
@@ -16,25 +17,32 @@ const signed = (world, id = 'AG-1') => { world.adobe.agreements[id] = { id, stat
 
 /* ---------- webhook ---------- */
 
-test('webhook HEAD/GET: eco do CLIENT_ID configurado (nunca o valor arbitrário da requisição)', async () => {
+test('webhook HEAD/GET: eco do X-AdobeSign-ClientId recebido; sem header (ou inválido) usa o CLIENT_ID configurado', async () => {
   const world = await buildWorld({ listen: true });
 
+  // o webhook criado pela UI do Adobe envia o ClientId do aplicativo que o criou: a resposta tem de ecoar o MESMO valor
   let r = await fetch(`${world.baseUrl}/webhook`, { method: 'HEAD', headers: { 'X-AdobeSign-ClientId': 'abc123' } });
   assert.equal(r.status, 200);
-  assert.equal(r.headers.get('x-adobesign-clientid'), 'test-client-id');
+  assert.equal(r.headers.get('x-adobesign-clientid'), 'abc123');
 
   r = await fetch(`${world.baseUrl}/webhook`, { method: 'HEAD' });
   assert.equal(r.status, 200);
   assert.equal(r.headers.get('x-adobesign-clientid'), 'test-client-id', 'sem header: usa o CLIENT_ID configurado');
 
-  r = await fetch(`${world.baseUrl}/webhook`, { headers: { 'X-AdobeSign-ClientId': 'abc123' } });
+  r = await fetch(`${world.baseUrl}/webhook`, { headers: { 'X-AdobeSign-ClientId': 'abc.123_-X' } });
   assert.equal(r.status, 200);
-  assert.equal(r.headers.get('x-adobesign-clientid'), 'test-client-id');
+  assert.equal(r.headers.get('x-adobesign-clientid'), 'abc.123_-X');
   assert.deepEqual(await r.json(), { status: 'pong' });
 
   r = await fetch(`${world.baseUrl}/webhook?challenge=xyz`, { headers: { 'X-AdobeSign-ClientId': 'abc123' } });
   assert.equal(await r.text(), 'xyz');
-  assert.equal(r.headers.get('x-adobesign-clientid'), 'test-client-id');
+  assert.equal(r.headers.get('x-adobesign-clientid'), 'abc123');
+
+  // valor com caracteres fora de [A-Za-z0-9._-] ou longo demais nunca é ecoado
+  for (const bad of ['a b<script>', 'x'.repeat(201)]) {
+    r = await fetch(`${world.baseUrl}/webhook`, { method: 'HEAD', headers: { 'X-AdobeSign-ClientId': bad } });
+    assert.equal(r.headers.get('x-adobesign-clientid'), 'test-client-id');
+  }
   await world.close();
 });
 
@@ -60,7 +68,7 @@ test('webhook POST: header ClientId diferente do CLIENT_ID só gera warn (padrã
     'X-AdobeSign-ClientId': 'forged'
   });
   assert.equal(r.status, 200);
-  assert.equal(r.headers.get('x-adobesign-clientid'), 'test-client-id');
+  assert.equal(r.headers.get('x-adobesign-clientid'), 'forged', 'o eco é do valor recebido');
   assert.ok(world.logger.has('warn', /ClientId diferente/));
   assert.ok(!world.logger.lines.warn.some((l) => l.includes('forged')), 'não loga o valor recebido');
   assert.equal(world.repo.listEvents('AG-1').length, 2);
@@ -91,6 +99,34 @@ test('WEBHOOK_REQUIRE_CLIENT_ID=true: POST com header ausente/diferente => 401 e
   await world.close();
 });
 
+test('WEBHOOK_CLIENT_IDS: ClientId de outro aplicativo (o que criou o webhook) é aceito, ecoado e não gera warn', async () => {
+  const world = await buildWorld({
+    listen: true, env: { WEBHOOK_CLIENT_IDS: 'ui-app-id, other-app', WEBHOOK_REQUIRE_CLIENT_ID: 'true' }
+  });
+  assert.deepEqual(world.config.webhookClientIds, ['ui-app-id', 'other-app']);
+  seedAgreement(world);
+  signed(world);
+
+  let r = await post(world, '/webhook', webhookPayload('AGREEMENT_CREATED', 'AG-1', { notificationId: 'ui-1' }), {
+    'X-AdobeSign-ClientId': 'ui-app-id'
+  });
+  assert.equal(r.status, 200);
+  assert.equal(r.headers.get('x-adobesign-clientid'), 'ui-app-id');
+  r = await post(world, '/webhook', webhookPayload('AGREEMENT_CREATED', 'AG-1', { notificationId: 'ui-2' }), {
+    'X-AdobeSign-ClientId': 'test-client-id' // o CLIENT_ID da integração continua aceito
+  });
+  assert.equal(r.status, 200);
+  assert.equal(world.logger.has('warn', /ClientId diferente/), false);
+  assert.equal(world.repo.listEvents('AG-1').length, 2);
+
+  r = await post(world, '/webhook', webhookPayload('AGREEMENT_CREATED', 'AG-1', { notificationId: 'ui-3' }), {
+    'X-AdobeSign-ClientId': 'not-listed'
+  });
+  assert.equal(r.status, 401, 'fora do conjunto aceito e WEBHOOK_REQUIRE_CLIENT_ID=true');
+  assert.equal(world.repo.listEvents('AG-1').length, 2);
+  await world.close();
+});
+
 test('WEBHOOK_REQUIRE_CLIENT_ID=true sem CLIENT_ID configurado falha fechado (401)', async () => {
   const world = await buildWorld({ listen: true, env: { WEBHOOK_REQUIRE_CLIENT_ID: 'true', CLIENT_ID: '' } });
   seedAgreement(world);
@@ -100,21 +136,21 @@ test('WEBHOOK_REQUIRE_CLIENT_ID=true sem CLIENT_ID configurado falha fechado (40
   await world.close();
 });
 
-test('webhook POST: persiste o evento e responde 200 com X-AdobeSign-ClientId antes do processamento', async () => {
+test('webhook POST: persiste o evento e responde 200 com X-AdobeSign-ClientId antes do processamento', { timeout: 10000 }, async (t) => {
   const world = await buildWorld({ listen: true });
   seedAgreement(world);
   signed(world);
   let release;
   world.otcs.uploadGate = new Promise((resolve) => { release = resolve; }); // trava o upload no OTCS
+  t.after(async () => { release(); await world.close(); });
 
-  const t0 = Date.now();
   const r = await post(world, '/webhook', webhookPayload('AGREEMENT_WORKFLOW_COMPLETED', 'AG-1', { notificationId: 'http-1' }), {
     'X-AdobeSign-ClientId': 'abc123'
   });
   assert.equal(r.status, 200);
-  assert.equal(r.headers.get('x-adobesign-clientid'), 'test-client-id');
+  assert.equal(r.headers.get('x-adobesign-clientid'), 'abc123');
   assert.equal(await r.text(), 'OK');
-  assert.ok(Date.now() - t0 < 1500, 'resposta rápida');
+  // O gate ainda fechado prova que o HTTP não aguardou o OTCS, sem depender da velocidade da máquina.
 
   // evento já está persistido, mas o upload ainda não terminou
   const events = world.repo.listEvents('AG-1');
@@ -122,13 +158,12 @@ test('webhook POST: persiste o evento e responde 200 com X-AdobeSign-ClientId an
   assert.equal(events[0].notificationId, 'http-1');
   assert.equal(events[0].kind, 'final_ok');
   assert.equal(world.repo.get('AG-1').sendonDone, false);
-  assert.equal(world.otcs.uploads.length, 0);
+  assert.equal(world.otcs.versions.length, 0);
 
   // libera o OTCS: o processamento assíncrono conclui
   release();
   await waitFor(() => world.repo.get('AG-1').state === 'completed');
-  assert.deepEqual(world.calls.map((c) => c[0]), ['adobe.getAgreement', 'adobe.download', 'otcs.upload', 'otcs.sendon']);
-  await world.close();
+  assert.deepEqual(world.calls.map((c) => c[0]), ['adobe.getAgreement', 'adobe.download', 'otcs.addVersion', 'otcs.sendon']);
 });
 
 test('webhook POST: dedupe por webhookNotificationId', async () => {
@@ -142,7 +177,7 @@ test('webhook POST: dedupe por webhookNotificationId', async () => {
   assert.equal((await post(world, '/webhook', payload)).status, 200);
 
   assert.equal(world.repo.listEvents('AG-1').length, 1);
-  assert.equal(world.otcs.uploads.length, 1);
+  assert.equal(world.otcs.versions.length, 1);
   assert.equal(world.otcs.dispositionCalls().length, 1);
   await world.close();
 });
@@ -165,13 +200,32 @@ test('webhook POST: eventos legados, informativos e vermelhos respondem 200', as
   await world.close();
 });
 
-test('webhook POST: acordo desconhecido responde 200 (log warn) e não grava nada', async () => {
-  const world = await buildWorld({ listen: true });
+test('webhook POST: acordo desconhecido responde 200 (log warn) e não grava nada (adoção desligada)', async () => {
+  const world = await buildWorld({ listen: true, env: { ADOPT_UNKNOWN_AGREEMENTS: 'false' } });
   const r = await post(world, '/webhook', webhookPayload('AGREEMENT_WORKFLOW_COMPLETED', 'DESCONHECIDO'));
   assert.equal(r.status, 200);
   assert.ok(world.logger.has('warn', /desconocido DESCONHECIDO/));
   assert.equal(world.repo.list().length, 0);
   assert.equal(world.calls.length, 0);
+  await world.close();
+});
+
+test('webhook POST: acordo desconhecido e que não existe/ não é nosso responde 200 e não grava nada (adoção ligada)', async () => {
+  const world = await buildWorld({ listen: true });
+  // sem externalId nosso: é de outra integração da mesma conta
+  world.adobe.agreements.OUTRO = { id: 'OUTRO', status: 'SIGNED', externalId: { id: 'crm|123' } };
+  for (const id of ['DESCONHECIDO', 'OUTRO']) {
+    const r = await post(world, '/webhook', webhookPayload('AGREEMENT_WORKFLOW_COMPLETED', id, { notificationId: `n-${id}` }));
+    assert.equal(r.status, 200);
+  }
+  await waitFor(() => world.logger.has('warn', /sin externalId propio/) && world.logger.has('warn', /no se pudo adoptar/));
+  assert.equal(world.repo.list().length, 0);
+  assert.equal(world.otcs.sendons.length, 0);
+
+  // acordo de outra integração: lembrado por alguns minutos, sem nova consulta ao Adobe a cada evento
+  const before = world.calls.filter((c) => c[0] === 'adobe.getAgreement').length;
+  await post(world, '/webhook', webhookPayload('AGREEMENT_CREATED', 'OUTRO', { notificationId: 'n-OUTRO-2' }));
+  assert.equal(world.calls.filter((c) => c[0] === 'adobe.getAgreement').length, before);
   await world.close();
 });
 
@@ -196,19 +250,23 @@ test('webhook POST: JSON inválido => 400; falha ao persistir => 500 (Adobe reen
 
 test('/auth + /start: fluxo compatível com o template.html', async () => {
   const world = await buildWorld({ listen: true });
+  world.otcs.addWorkflow('3003', { subprocessId: '3004', stage: 'start' });
 
-  const denied = await fetch(`${world.baseUrl}/auth`);
-  assert.equal(denied.status, 401);
-
-  const auth = await fetch(`${world.baseUrl}/auth`, { headers: ADMIN });
-  assert.equal(auth.status, 200);
-  const { timestamp, signature } = await auth.json();
-
-  const r = await post(world, '/start', {
+  const fields = {
     userEmail1: 'one@example.com', userEmail2: 'two@example.com',
     nodeId: '1001', attachId: '2002', docName: 'contrato.pdf',
-    workflowId: '3003', subworkflowId: '3004', taskId: '2', timestamp, signature
-  });
+    workflowId: '3003', subworkflowId: '3004'
+  };
+  const denied = await post(world, '/auth', fields);
+  assert.equal(denied.status, 401);
+
+  const auth = await post(world, '/auth', fields, ADMIN);
+  assert.equal(auth.status, 200);
+  const { v, timestamp, nonce, signature } = await auth.json();
+  assert.equal(v, 2);
+  assert.match(nonce, /^[a-f0-9]{32}$/);
+
+  const r = await post(world, '/start', { ...fields, taskId: '2', timestamp, nonce, signature });
   assert.equal(r.status, 200);
   const data = await r.json();
   assert.equal(data.message, 'Signature requested. ID: AG-1');
@@ -223,16 +281,23 @@ test('/auth + /start: fluxo compatível com o template.html', async () => {
   assert.deepEqual(rec.emails, ['one@example.com', 'two@example.com']);
   assert.deepEqual(world.adobe.created[0].emails, ['one@example.com', 'two@example.com']);
   assert.deepEqual(world.otcs.downloads, ['1001']);
+  assert.equal(
+    world.adobe.created[0].externalId, 'otcs|wf=3003|sub=3004|node=1001|attach=2002', 'rastreável pelo externalId'
+  );
 
-  // SendOn automático da tarefa de envio (sem disposição) em background
+  // SendOn automático da tarefa de início (localizada pelo nome; sem disposição) em background
   await waitFor(() => world.otcs.sendons.length === 1);
-  assert.equal(world.otcs.sendons[0].taskId, '2');
+  assert.equal(world.otcs.sendons[0].taskId, 2);
   assert.equal(world.otcs.sendons[0].disposition, undefined);
-  assert.equal(world.otcs.sendons[0].workflowId, '3003');
+  assert.equal(world.otcs.sendons[0].workflowId, 3003);
+  assert.equal(world.otcs.sendons[0].subworkflowId, 3004);
+  await waitFor(() => world.repo.get('AG-1').startSendonDone);
+  assert.ok(world.repo.get('AG-1').startSendonAt);
+  assert.equal(world.otcs.task(3003, 3).status, 'current', 'a tarefa de firma ficou ativa');
   await world.close();
 });
 
-test('/start: aceita HMAC válido (destinatários separados por ; ou ,)', async () => {
+test('/start: aceita HMAC v2 válido (destinatários separados por ; ou ,)', async () => {
   const world = await buildWorld({ listen: true });
   const r = await post(world, '/start', startBody(world, { userEmail1: 'a@x.com; b@x.com', userEmail2: 'c@x.com,d@x.com' }));
   assert.equal(r.status, 200);
@@ -255,22 +320,26 @@ test('/start: rejeita assinatura ausente, malformada, inválida, expirada e time
   assert.deepEqual(await r.json(), { error: 'Invalid signature.' });
 
   // assinatura de outro segredo
-  r = await post(world, '/start', { ...good, signature: sign('outro-segredo', good.timestamp) });
+  r = await post(world, '/start', startBody(world, { signature: signStart('outro-segredo', good) }));
   assert.equal(r.status, 403);
 
   // timestamp velho (anti-replay), mesmo com HMAC correto
-  const old = String(world.clock.ms() - 3 * 60 * 1000);
-  r = await post(world, '/start', { ...good, timestamp: old, signature: sign(world.config.signatureSecret, old) });
+  r = await post(world, '/start', startBody(world, { timestamp: String(world.clock.ms() - 3 * 60 * 1000) }));
   assert.equal(r.status, 403);
   assert.deepEqual(await r.json(), { error: 'Timestamp expired.' });
 
   // timestamp trocado após assinar
-  r = await post(world, '/start', { ...good, timestamp: String(world.clock.ms() + 1000) });
+  r = await post(world, '/start', { ...startBody(world), timestamp: String(world.clock.ms() + 1000) });
   assert.equal(r.status, 403);
+  assert.deepEqual(await r.json(), { error: 'Invalid signature.' });
 
   // timestamp não numérico
-  r = await post(world, '/start', { ...good, timestamp: 'abc', signature: sign(world.config.signatureSecret, 'abc') });
+  r = await post(world, '/start', startBody(world, { timestamp: 'abc' }));
   assert.equal(r.status, 403);
+
+  // nonce mal formado
+  r = await post(world, '/start', startBody(world, { nonce: 'curto' }));
+  assert.equal(r.status, 400);
 
   assert.equal(world.adobe.created.length, 0, 'nada foi criado no Adobe');
   assert.equal(world.otcs.downloads.length, 0);
@@ -398,14 +467,28 @@ test('/start: a chave em andamento é liberada em caso de erro (nova tentativa �
   await world.close();
 });
 
-test('/start: falha do SendOn automático não derruba a resposta e fica registrada', async () => {
+test('/start: falha do SendOn automático não derruba a resposta, fica registrada e é retentada (etapa start)', async () => {
   const world = await buildWorld({ listen: true });
+  world.otcs.addWorkflow('3003', { subprocessId: '3004', stage: 'start' });
   world.otcs.sendOnFailsAlways = true;
   const r = await post(world, '/start', startBody(world));
   assert.equal(r.status, 200);
   await waitFor(() => world.repo.get('AG-1').startSendOnError);
   assert.match(world.repo.get('AG-1').startSendOnError, /sendon failed/);
-  assert.ok(world.logger.has('error', /Falha no SendOn automático/));
+  assert.ok(world.logger.has('error', /start failed \(attempt 1\)/));
+  let rec = world.repo.get('AG-1');
+  assert.equal(rec.startSendonDone, false);
+  assert.equal(rec.lastErrorStage, 'start');
+  assert.equal(world.timers.length, 1, 'retry agendado');
+
+  // o OTCS volta: o runQueue (poller) reenvia o pedido
+  world.otcs.sendOnFailsAlways = false;
+  world.clock.advance(61 * 1000);
+  assert.deepEqual(await world.reconciliation.runQueue(), ['AG-1']);
+  rec = world.repo.get('AG-1');
+  assert.equal(rec.startSendonDone, true);
+  assert.equal(rec.attempts, 0);
+  assert.equal(world.otcs.sendons.length, 1);
   await world.close();
 });
 

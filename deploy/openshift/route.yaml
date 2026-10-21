@@ -1,0 +1,23 @@
+# Route HTTPS pública do orquestrador (roteador do OpenShift).
+# O host deve ser o mesmo de PUBLIC_URL (configmap.yaml): https://<host-da-rota>.
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: signature-orchestrator
+  labels:
+    app: signature-orchestrator
+  annotations:
+    # Timeout do roteador: maior que OTCS_TIMEOUT_MS e ADOBE_TIMEOUT_MS (60s por padrão)
+    haproxy.router.openshift.io/timeout: 120s
+spec:
+  host: <host-da-rota>
+  to:
+    kind: Service
+    name: signature-orchestrator
+    weight: 100
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    # HTTP é redirecionado para HTTPS
+    insecureEdgeTerminationPolicy: Redirect

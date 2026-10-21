@@ -94,11 +94,15 @@ test('storage: efêmero sem erro só gera warn', () => {
   assert.equal(logger.lines.error.length, 0);
 });
 
-test('disposições: Firmado/Rechazado por padrão; expirado/cancelado/conversão vazios', () => {
+test('disposições: Firmado/Rechazado por padrão; expirado/cancelado/conversão também Rechazado (vazio => needs_attention)', () => {
   const c = cfg({});
   assert.deepEqual(c.dispositions, {
-    signed: 'Firmado', rejected: 'Rechazado', expired: '', recalled: '', conversionFailed: ''
+    signed: 'Firmado', rejected: 'Rechazado', expired: 'Rechazado', recalled: 'Rechazado', conversionFailed: 'Rechazado'
   });
+  assert.deepEqual(
+    cfg({ DISPOSITION_EXPIRED: '', DISPOSITION_RECALLED: '', DISPOSITION_CONVERSION_FAILED: '' }).dispositions,
+    { signed: 'Firmado', rejected: 'Rechazado', expired: '', recalled: '', conversionFailed: '' }
+  );
   const c2 = cfg({
     DISPOSITION_SIGNED: 'Signed', DISPOSITION_REJECTED: 'Rejected', DISPOSITION_EXPIRED: 'Expirado',
     DISPOSITION_RECALLED: 'Cancelado', DISPOSITION_CONVERSION_FAILED: 'Erro'
@@ -106,6 +110,38 @@ test('disposições: Firmado/Rechazado por padrão; expirado/cancelado/conversã
   assert.deepEqual(c2.dispositions, {
     signed: 'Signed', rejected: 'Rejected', expired: 'Expirado', recalled: 'Cancelado', conversionFailed: 'Erro'
   });
+});
+
+test('config: variáveis do pacote de resiliência (padrões e listas)', () => {
+  const c = cfg({});
+  assert.deepEqual(c.webhookClientIds, []);
+  assert.deepEqual(c.signTaskNames, ['Aguardar Firma']);
+  assert.deepEqual(c.startTaskNames, ['Enviar solicitud de firma']);
+  assert.equal(c.attentionRetryHours, 6);
+  assert.equal(c.adoptUnknownAgreements, true);
+  assert.equal(c.signTaskId, 3, 'obsoleto, mantido por compatibilidade');
+  assert.deepEqual(c.wfAttributes, {
+    enabled: false,
+    labels: {
+      agreementId: 'Adobe ID Acuerdo', status: 'Adobe Estado', lastEvent: 'Adobe Último Evento',
+      updatedAt: 'Adobe Fecha Actualización', integrationState: 'Estado Integración Firma'
+    }
+  });
+
+  const c2 = cfg({
+    WEBHOOK_CLIENT_IDS: ' a1 , b2,, ', SIGN_TASK_NAMES: 'Esperar Firma,Aguardar Firma', START_TASK_NAMES: ' Enviar ',
+    ATTENTION_RETRY_HOURS: '0', ADOPT_UNKNOWN_AGREEMENTS: 'false', WF_ATTRIBUTES_ENABLED: 'true',
+    WF_ATTR_STATUS: 'Estado Adobe', WF_ATTR_LAST_EVENT: ''
+  });
+  assert.deepEqual(c2.webhookClientIds, ['a1', 'b2']);
+  assert.deepEqual(c2.signTaskNames, ['Esperar Firma', 'Aguardar Firma']);
+  assert.deepEqual(c2.startTaskNames, ['Enviar']);
+  assert.equal(c2.attentionRetryHours, 0);
+  assert.equal(c2.adoptUnknownAgreements, false);
+  assert.equal(c2.wfAttributes.enabled, true);
+  assert.equal(c2.wfAttributes.labels.status, 'Estado Adobe');
+  assert.equal(c2.wfAttributes.labels.lastEvent, '', 'vazio desliga o atributo');
+  assert.equal(cfg({ SIGN_TASK_NAMES: ' , ' }).signTaskNames[0], 'Aguardar Firma', 'lista sem itens volta ao padrão');
 });
 
 test('config: padrões de polling, retenção e região Adobe', () => {

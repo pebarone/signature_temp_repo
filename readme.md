@@ -4,7 +4,7 @@ Exposes endpoints to trigger document signing, monitor status via webhooks, and 
 
 ## 📌 Purpose
 
-This project enables the sending of documents from OTCS to Adobe Sign for electronic signatures, automatic retrieval of the signed document, and final upload to the correct folder in the Content Server — all via API, with no manual intervention.
+This project sends documents from OTCS to Adobe Sign, retrieves the signed PDF and adds it as a new version of the original Content Server node. The attachment folder is a fallback when that node no longer exists.
 
 ---
 
@@ -29,12 +29,14 @@ This project enables the sending of documents from OTCS to Adobe Sign for electr
 - 📅 Secure download of the original PDF via OTCS API
 - ✍️ Supports multiple signers (via Adobe Sign)
 - 📡 Webhook to monitor signature status
-- 📄 Automatic upload of the signed PDF to the designated folder in OTCS
+- 📄 Signed PDF as a new version of the original OTCS node (attachment folder fallback if the node was deleted)
 - 🗒️ Detailed logging (daily `audit-YYYY-MM-DD.log` / `error-YYYY-MM-DD.log`, 15-day retention)
 - 🧼 Optional purge of temporary files
 - ⛔ Duplicate check: prevents resending the same document to the same recipients within 15 minutes
-- 🔒 Signature authentication via HMAC with timestamp (anti-replay)
-- 🔐 /auth endpoint protected with Basic Auth to restrict public key access
+- 🔒 `/start` authenticated by an HMAC (v2) bound to the request fields, with timestamp and a single-use nonce (anti-replay)
+- 🔐 `/auth` endpoint protected with Basic Auth (own credential `START_AUTH_*`) to restrict who can obtain signatures
+- ✅ `/start` is validated against the OTCS workflow (the Content Server is the source of truth, not the browser)
+- 🌐 CORS restricted to `/auth` and `/start`, only for the OTCS origin
 ---
 
 ## 🚀 How to Run
@@ -71,19 +73,46 @@ ADOBE_AUTH_BASE=https://secure.eu1.adobesign.com
 OTCS_BASE=https://your-content-server/<api-base>   # the code appends /v1/... and /v2/...
 OTCS_USER=otds.username
 OTCS_PASS=otds.password
-SIGN_TASK_ID=3                                     # task that receives the final disposition
+SIGN_TASK_NAMES=Aguardar Firma                     # task that receives the final disposition, found BY NAME (comma list; "starts with")
+START_TASK_NAMES=Enviar solicitud de firma         # task the integration sends on after creating the agreement (comma list)
+# SIGN_TASK_ID=3                                   # OBSOLETE: no longer addresses the disposition (the task is resolved by name)
 
 # Security (required)
 SIGNATURE_SECRET=hmac_secret_shared_with_the_webreport
-LOG_USER=basic_auth_user                           # Basic Auth for /auth, /logs, /admin/agreements, /admin/reconcile
+LOG_USER=basic_auth_user                           # Basic Auth for /logs and /admin/* (and for /auth if START_AUTH_* is not set)
 LOG_PASS=basic_auth_password
+START_AUTH_USER=                                   # optional own Basic Auth for POST /auth (the credential embedded in the WebReport);
+START_AUTH_PASS=                                   #   both or none; none => LOG_USER/LOG_PASS
+CORS_ORIGINS=                                      # origins allowed on /auth and /start (comma list; "*" only if set). Default: the origin of OTCS_BASE
+
+# POST /start validation against the OTCS workflow (see "/auth and /start")
+START_VERIFY_WORKFLOW=true            # false => trusts the (HMAC-bound) payload, as before
+START_FIELD_DOCID=DocID               # labels of the start task form attributes (the OTCS values are the source of truth)
+START_FIELD_ATTACHID=AttachID
+START_FIELD_DOCNAME=Nombre del Documento
+START_FIELD_EMAILS=Email Firmante 1,Email Firmante 2
+# WebReport migration window ONLY (both OFF by default; each use logs a warn). Legacy always validates against the OTCS
+START_LEGACY_SIGNATURE=false          # true => accepts GET /auth and the v1 signature (timestamp only) on POST /start
+START_LEGACY_GET_ENABLED=false        # true => accepts the old GET /start?userEmail1=... contract (no HMAC)
 
 # Disposition names in the OTCS workflow (custom_action)
 DISPOSITION_SIGNED=Firmado
 DISPOSITION_REJECTED=Rechazado
-DISPOSITION_EXPIRED=                  # empty => agreement goes to needs_attention
-DISPOSITION_RECALLED=                 # empty => needs_attention
-DISPOSITION_CONVERSION_FAILED=        # empty => needs_attention
+DISPOSITION_EXPIRED=Rechazado         # the maps only have Firmado/Rechazado; Rechazado ends the flow. Empty => needs_attention
+DISPOSITION_RECALLED=Rechazado        # empty => needs_attention
+DISPOSITION_CONVERSION_FAILED=Rechazado  # empty => needs_attention
+
+# Resilience (defaults shown; see docs/REGLAS_DEL_FLUJO.md)
+ATTENTION_RETRY_HOURS=6               # needs_attention for "retries exhausted" reopens by itself after N hours (0 = never)
+ADOPT_UNKNOWN_AGREEMENTS=true         # webhook of an agreement not in SQLite: adopt it if its Adobe externalId is ours
+WEBHOOK_CLIENT_IDS=                   # extra accepted X-AdobeSign-ClientId values (comma list), besides CLIENT_ID
+# Workflow attributes with Adobe data (best effort, OFF: the formUpdate call is not validated in QA yet)
+WF_ATTRIBUTES_ENABLED=false
+WF_ATTR_AGREEMENT_ID=Adobe ID Acuerdo           # attribute labels in the workflow map; empty disables that attribute
+WF_ATTR_STATUS=Adobe Estado
+WF_ATTR_LAST_EVENT=Adobe Último Evento
+WF_ATTR_UPDATED_AT=Adobe Fecha Actualización
+WF_ATTR_INTEGRATION_STATE=Estado Integración Firma
 
 # Storage (see below)
 DATA_DIR=                             # explicit data directory (OpenShift: the PVC mount, e.g. /data)
@@ -102,7 +131,7 @@ ADOBE_DOWNLOAD_ATTEMPTS=8             # retries of 403 on combinedDocument right
 LOG_RETENTION_DAYS=15                 # 0 disables the purge
 OTCS_TIMEOUT_MS=60000
 ADOBE_TIMEOUT_MS=60000                # timeout of every Adobe call (REST and OAuth token refresh/exchange)
-WEBHOOK_REQUIRE_CLIENT_ID=false       # true => POST /webhook without X-AdobeSign-ClientId == CLIENT_ID gets 401
+WEBHOOK_REQUIRE_CLIENT_ID=false       # true => POST /webhook without X-AdobeSign-ClientId in {CLIENT_ID} + WEBHOOK_CLIENT_IDS gets 401
 KEEPALIVE_INTERVAL_MS=600000          # self-ping of /health, only on Render (RENDER=true) with PUBLIC_URL (0 disables)
 PORT=3000
 ```
@@ -121,6 +150,9 @@ with `REQUIRE_PERSISTENT_STORAGE=true` the process exits instead. A PVC is RWO, 
 `Recreate` strategy (example in `deploy/openshift/`). An old `agreements.json` found in a previous location is
 imported into SQLite on the first start and renamed to `.migrated`.
 
+- OpenShift: requisitos de storage (volume de bloco RWO, uma réplica, classes a evitar) em [`deploy/openshift/README.md`](deploy/openshift/README.md).
+- QA no Render (storage efêmero e mitigações) em [`docs/QA_RENDER.md`](docs/QA_RENDER.md).
+
 ### 4. Start the server
 
 ```bash
@@ -133,35 +165,106 @@ python3, make and g++ to compile.
 
 ---
 
+## 🔏 `/auth` and `/start` (WebReport)
+
+Two WebReports call these endpoints from the browser (see [`webreports/README.md`](webreports/README.md): which node to
+replace per environment, the rollout order and the QA checklist). Protocol **v2**:
+
+1. `POST /auth` (Basic Auth: `START_AUTH_USER`/`START_AUTH_PASS`, or `LOG_USER`/`LOG_PASS`) with JSON
+   `{workflowId, subworkflowId, nodeId, attachId, docName, userEmail1, userEmail2}` returns
+   `{ v: 2, timestamp, nonce, signature }`. `nonce` is 16 random bytes (hex); `signature` is the HMAC-SHA256 (hex, key
+   `SIGNATURE_SECRET`) of the canonical string
+   `v2\n<timestamp>\n<nonce>\n<workflowId>\n<subworkflowId>\n<nodeId>\n<attachId>\n<emails>\n<docName>`, where
+   `<emails>` are the e-mails of `userEmail1`/`userEmail2` (split on `;`/`,`), trimmed, lower-cased, sorted and joined by
+   `,`; absent fields are empty strings (`canonicalStart` in `server/http/middleware/hmac.js`).
+2. `POST /start` with the same fields (+ `taskId`, informative) and `timestamp`, `nonce`, `signature`. The server
+   recomputes the canonical string from the body (constant-time comparison), requires the timestamp within 2 min and
+   consumes the `nonce` (single use, table `start_nonces` in SQLite, expired ones purged on each insert). The nonce is
+   consumed only after the signature is valid. Errors: `401` missing signature/timestamp, `400` malformed, `403`
+   `Invalid signature.` / `Timestamp expired.` / `Solicitud ya utilizada.` (replay) / `Unsupported signature version.` (v1).
+
+**Validation against the workflow** (`START_VERIFY_WORKFLOW=true`, default; the OTCS is the source of truth):
+`workflowId` (numeric) is mandatory; the task named by `START_TASK_NAMES` must be `current` (else `409`
+"El flujo no está en el paso de envío a firma."); its form (read with the integration user) provides `DocID`,
+`AttachID`, the document name and the signers' e-mails (labels in `START_FIELD_*`; e-mails split on `;`/`,`). The agreement
+uses **those** values and the `subprocessId`/`taskId` found in the OTCS. If the payload carries a different
+`nodeId`/`attachId` or a different e-mail set (case-insensitive, any order): `409` "Los datos enviados no coinciden con el
+flujo." (details only in the log). Missing `DocID`/`AttachID`/e-mails in the form: `422`. OTCS errors: `401/403` on the form
+=> `409` "La tarea no está asignada al usuario de integración."; process `404` => `409` "Flujo no encontrado."; network
+error/timeout/5xx => `503` "Content Server no disponible; intente nuevamente.".
+
+**Idempotency** (only with the validation): if there is already a non-final agreement (no final result and no disposition
+sent) for the same `workflowId` + resolved `subworkflowId` + `nodeId`, `/start` returns `200`
+`{ message: "Signature already requested. ID: ...", id, existing: true }` and creates nothing (page reload after a network
+error); it also applies when the start task has already advanced. With `START_VERIFY_WORKFLOW=false` the previous behaviour
+is kept (the 15 min duplicate check applies in both modes).
+
+**Legacy (migration window of the WebReports, OFF by default).** `START_LEGACY_SIGNATURE=true` accepts `GET /auth`
+(timestamp only) and the v1 signature on `POST /start`; `START_LEGACY_GET_ENABLED=true` accepts the old
+`GET /start?userEmail1=&userEmail2=&nodeId=&attachId=&docName=&workflowId=&subworkflowId=&taskId=` (no HMAC). Neither
+binds the payload, so in these modes the validation against the OTCS is **always** applied, even with
+`START_VERIFY_WORKFLOW=false`. Every use logs a `warn`. With the flags off, `GET /auth` and `GET /start` answer `404`
+`{ "error": "Endpoint not found" }`.
+
+**CORS.** Only `/auth` and `/start` (including the `OPTIONS` preflight). `CORS_ORIGINS` (comma list) defaults to the origin of
+`OTCS_BASE`; `*` only if set explicitly. A disallowed origin gets no `Access-Control-Allow-Origin`. `/webhook`, `/admin/*`,
+`/logs` and `/health` carry no CORS headers.
+
+---
+
 ## 🔀 Webhook
 
-- **Endpoint:** `/webhook` — `HEAD`/`GET` echo the configured `CLIENT_ID` in `X-AdobeSign-ClientId` (verification handshake; the request header is echoed only if `CLIENT_ID` is unset); `POST` receives the events
+- **Endpoint:** `/webhook` — `HEAD`/`GET` echo, in `X-AdobeSign-ClientId`, **the same value received** (Adobe requires the
+  echo of what it sent; only `[A-Za-z0-9._-]`, up to 200 chars). Without the header (or with an invalid one) the
+  configured `CLIENT_ID` is echoed. `POST` receives the events
+- **Accepted ClientIds:** `CLIENT_ID` + `WEBHOOK_CLIENT_IDS`. A webhook created in the Adobe UI sends the ClientId of the
+  application that created it, which is not the OAuth `CLIENT_ID` of this integration: list it in `WEBHOOK_CLIENT_IDS`.
+  A mismatch only logs a `warn`, unless `WEBHOOK_REQUIRE_CLIENT_ID=true` (then `401`, nothing persisted)
 - **Content-Type:** `application/json`
 
 The `POST` persists the event (deduplicated by `webhookNotificationId`) and answers `200` with
-`X-AdobeSign-ClientId` immediately; downloading the PDF, uploading it to OTCS and executing the disposition run in the
-background and are retried with exponential backoff (1 min ... 1 h). A poller (`POLL_INTERVAL_MS`) also re-checks
-agreements that never received a final event. Event policy (Adobe Sign v6 names):
+`X-AdobeSign-ClientId` immediately; confirming `SIGNED`, downloading the PDF, writing it to OTCS and executing the
+disposition run in the background and are retried with exponential backoff (1 min ... 1 h). A poller
+(`POLL_INTERVAL_MS`) also re-checks agreements that never received a final event, and reopens `needs_attention`
+agreements whose retries were exhausted after `ATTENTION_RETRY_HOURS`. Event policy (Adobe Sign v6 names); the full
+rules (states, stages, retry/attention/reopen, adoption) are in [`docs/REGLAS_DEL_FLUJO.md`](docs/REGLAS_DEL_FLUJO.md):
 
 | Event | Action |
 |---|---|
-| `AGREEMENT_WORKFLOW_COMPLETED` (or `AGREEMENT_ACTION_COMPLETED` with `agreement.status = SIGNED`) | upload the final PDF (with audit report) as a new version in `attachId`, then disposition `Firmado` |
+| `AGREEMENT_WORKFLOW_COMPLETED` (or `AGREEMENT_ACTION_COMPLETED` with `agreement.status = SIGNED`) | write the final PDF (with audit report) as a **new version of the same node** (`nodeId`) that was sent to sign — folder `attachId` only as a fallback if the node no longer exists — then disposition `Firmado` on the signing task |
 | `AGREEMENT_REJECTED` | disposition `Rechazado` (no PDF) |
-| `AGREEMENT_EXPIRED`, `AGREEMENT_RECALLED`, `AGREEMENT_AUTO_CANCELLED_CONVERSION_PROBLEM` | configurable disposition (`DISPOSITION_*`); empty => `needs_attention` |
+| `AGREEMENT_EXPIRED`, `AGREEMENT_RECALLED`, `AGREEMENT_AUTO_CANCELLED_CONVERSION_PROBLEM` | disposition `DISPOSITION_*` (default `Rechazado`, the only other action in the maps); empty => `needs_attention` |
 | `AGREEMENT_DOCUMENTS_DELETED` | `needs_attention` |
 | informational / unavailable / unknown events | history only |
 
-Adobe is the source of truth: before delivering the PDF for a final OK that came from a webhook, the agreement is
-fetched and must be `SIGNED` (otherwise `needs_attention`). A signer rejection seen by polling (`CANCELLED`) is told
-apart from a recall through `GET /agreements/{id}/events` (`REJECTED`/`ACTION_REJECTED` => rejected).
+Adobe is the source of truth for every final result, from a webhook or from polling: before the PDF is delivered or the
+disposition is sent, the agreement is fetched from Adobe and must confirm the result. An in-progress status retries with
+backoff; another final result on Adobe replaces the one stored from the webhook or polling; anything without a final result
+(`ABORTED` outside conversion failures, an unknown or an empty status) goes to `needs_attention` (`unconfirmed`), and so
+does a result that cannot replace the stored one because the PDF was already delivered. A `CANCELLED` status is told apart
+from a recall through `GET /agreements/{id}/events`: `REJECTED`/`ACTION_REJECTED` means rejected, otherwise it is a recall.
+A webhook that changes an already stored result clears the stored Adobe status, so the agreement is fetched again; a status
+already stored by a previous fetch that confirms the result is not fetched again.
 
 Legacy names (`AGREEMENT_COMPLETED`, `AGREEMENT_SIGNED`, `DOCUMENT_SIGNED`, `PARTICIPANT_*`) are accepted as aliases.
+
+PDF delivery records `Adobe Sign: <agreementId>` in the version description (or the node description for a new fallback
+document). Retries check this remote marker before writing, including after a lost response or restart before SQLite
+confirmed delivery. Keep the marker intact until reconciliation completes. This also protects delivery after adoption;
+it does not provide an atomic lock against other processes writing the same node.
 
 ### Admin endpoints (Basic Auth `LOG_USER`/`LOG_PASS`)
 
 - `GET /admin/agreements[?state=needs_attention][&events=5]` — state of every agreement
 - `POST /admin/reconcile/:id` — force a reconciliation (asks Adobe if no final result is known yet); also takes a
   `needs_attention` agreement back and resets its attempts
+- `POST /admin/adopt/:id` — registers an Adobe agreement that is not in SQLite (lost ephemeral database, new deploy) and
+  reconciles it. It uses the agreement's `externalId` (`otcs|wf=..|sub=..|node=..|attach=..`, set by `/start` since this
+  version); for older agreements send JSON `{ "workflowId", "subworkflowId"?, "nodeId", "attachId", "fileName"? }`.
+  `409` if already registered, `422` if data is missing, `404` if the agreement does not exist in Adobe. The webhook does
+  the same automatically for unknown agreements with our `externalId` (`ADOPT_UNKNOWN_AGREEMENTS`). Adopted agreements
+  enter the retry queue to check the start task in OTCS, sending it on only if still active. This also recovers a
+  restart before the initial SendOn, including with `POLL_ENABLED=false`.
 - `GET /logs`, `GET /logs/stream` — today's `audit-YYYY-MM-DD.log` (download / live SSE)
 - `GET /admin/login` (Basic Auth) — Adobe OAuth consent with a random one-time `state` (10 min); `GET /admin/callback` —
   Adobe's redirect (no Basic Auth, requires a valid `state`); `GET /health` — liveness
@@ -175,9 +278,10 @@ Legacy names (`AGREEMENT_COMPLETED`, `AGREEMENT_SIGNED`, `DOCUMENT_SIGNED`, `PAR
 ├── .env                  # Environment variables (not committed)
 ├── package.json
 ├── readme.md
-├── template.html         # WebReport page that calls /auth and /start
+├── template.html         # WebReport "Requisicion de Firma" (pure flow): POST /auth + POST /start (v2)
+├── webreports/           # WebReport of the hiring sub-flow + README (rollout, per-environment changes, QA checklist)
 ├── static/               # logs viewer (logs.html/js/css)
-├── docs/                 # design notes (DESIGN_TICKET_2026062210004476.md)
+├── docs/                 # design notes (DESIGN_TICKET_2026062210004476.md) and flow rules (REGLAS_DEL_FLUJO.md)
 ├── deploy/openshift/     # PVC + README (example)
 ├── test/                 # node:test suites + fakes (test/support)
 ├── data/                 # local state (git-ignored): state/, logs/, inprocess/
@@ -186,9 +290,9 @@ Legacy names (`AGREEMENT_COMPLETED`, `AGREEMENT_SIGNED`, `DOCUMENT_SIGNED`, `PAR
     ├── index.js          # entrypoint: wires real dependencies, poller, listen, keepalive
     ├── app.js            # createApp(deps): Express app with injected dependencies
     ├── config/           # env -> config, storage selection per platform
-    ├── domain/           # pure functions: eventPolicy (events), agreementState (state machine)
+    ├── domain/           # pure functions: eventPolicy (events), agreementState (state machine), workflowSteps (task lookup by name), externalId
     ├── infra/            # SQLite (db, agreementRepository, legacyImport), tokenStore, adobeClient, otcsClient, logger
-    ├── services/         # reconciliationService (PDF -> disposition), signatureService (/start), poller
+    ├── services/         # reconciliationService (start -> verify -> PDF -> disposition), signatureService (/start), poller
     ├── http/             # routes (webhook, start, admin, logs) and middleware (hmac, basicAuth)
     └── serverModules/
         └── backend.js    # shim kept for `node server/serverModules/backend.js`
@@ -207,7 +311,9 @@ Legacy names (`AGREEMENT_COMPLETED`, `AGREEMENT_SIGNED`, `DOCUMENT_SIGNED`, `PAR
 
 ## 🛡️ Security
 
-- No sensitive tokens are exposed on the frontend.
+- No sensitive tokens are exposed on the frontend. The WebReport only holds the Basic credential of `/auth` (use `START_AUTH_*`, which does not open `/admin` or `/logs`); the HMAC key never leaves the server.
+- `/start` cannot be forged from the browser: the signature binds the request fields, expires in 2 min and its nonce is single use; the server re-reads the workflow in the OTCS and uses those values (the integration user must hold the start task).
+- CORS is limited to `/auth` and `/start` and to the OTCS origin (`CORS_ORIGINS`).
 - Passwords and keys are read from the `.env` file.
 - Webhook filters out irrelevant events and only processes mapped agreements; events are deduplicated and failures are retried, never swallowed.
 

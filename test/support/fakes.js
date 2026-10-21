@@ -10,8 +10,9 @@ const { createAgreementRepository } = require('../../server/infra/agreementRepos
 const { createReconciliationService } = require('../../server/services/reconciliationService');
 const { createSignatureService } = require('../../server/services/signatureService');
 const { createPoller } = require('../../server/services/poller');
+const { classifyEvent, isFinalKind, KINDS } = require('../../server/domain/eventPolicy');
 const { createApp } = require('../../server/app');
-const { sign } = require('../../server/http/middleware/hmac');
+const { sign, signStart } = require('../../server/http/middleware/hmac');
 
 const PDF = Buffer.from('%PDF-1.4\n% fake signed pdf\n');
 const T0 = Date.parse('2026-06-22T12:00:00.000Z');
@@ -64,10 +65,10 @@ function makeAdobe(calls = []) {
       calls.push(['adobe.transient', fileName]);
       return 'transient-1';
     },
-    async createAgreement({ name, transientDocumentId, emails }) {
+    async createAgreement({ name, transientDocumentId, emails, externalId }) {
       const id = `AG-${adobe.created.length + 1}`;
-      adobe.created.push({ id, name, transientDocumentId, emails });
-      adobe.agreements[id] = { id, status: 'OUT_FOR_SIGNATURE' };
+      adobe.created.push({ id, name, transientDocumentId, emails, externalId });
+      adobe.agreements[id] = { id, name, status: 'OUT_FOR_SIGNATURE', ...(externalId ? { externalId: { id: externalId } } : {}) };
       calls.push(['adobe.createAgreement', id]);
       return { id };
     },
@@ -93,40 +94,161 @@ function makeAdobe(calls = []) {
   return adobe;
 }
 
-// OTCS falso. `gate` (Promise) segura o upload até ser liberada (teste de "200 rápido").
+/*
+  Estado padrão do Adobe falso para um webhook (quando o teste não define o acordo): só cria o que ainda não existe, e
+  só para eventos finais (progresso, informativos e desconhecidos não semeiam nada). Como no Adobe real: REJECTED = recusa
+  (CANCELLED + evento REJECTED); RECALLED e falha de conversão = CANCELLED sem recusa; EXPIRED; SIGNED no final OK.
+  `payload` é o do webhook: ACTION_COMPLETED só é final com status SIGNED no payload.
+*/
+function seedAdobeForEvent(adobe, event, id, payload = {}) {
+  const { kind } = classifyEvent(event, { agreement: { status: payload.status || 'OUT_FOR_SIGNATURE' } });
+  if (!isFinalKind(kind)) return;
+  if (kind === KINDS.FINAL_REJECTED) {
+    adobe.agreements[id] ||= { id, status: 'CANCELLED' };
+    adobe.events[id] ||= [{ type: 'REJECTED' }];
+  } else if (kind === KINDS.FINAL_EXPIRED) {
+    adobe.agreements[id] ||= { id, status: 'EXPIRED' };
+  } else if (kind === KINDS.FINAL_OK) {
+    adobe.agreements[id] ||= { id, status: 'SIGNED' };
+  } else {
+    // RECALLED e falha de conversão
+    adobe.agreements[id] ||= { id, status: 'CANCELLED' };
+  }
+}
+
+// Nomes reais dos mapas de workflow (PROD/QA)
+const START_TASK_NAME = 'Enviar solicitud de firma (Empleado y/o Firmante 2)';
+const SIGN_TASK_NAME = 'Aguardar Firma';
+
+/*
+  OTCS falso. `gate` (Promise) segura a escrita do PDF até ser liberada (teste de "200 rápido").
+  Modelo de workflow em memória (`workflows`): processo -> tarefas { subprocessId, taskId, name, status }.
+  `addWorkflow(processId, { subprocessId, stage })`: subprocessId diferente do processo simula um sub-fluxo.
+  O SendOn da tarefa de início ativa "Aguardar Firma"; a disposição conclui a tarefa de firma.
+  Chamadas ao modelo (getProcessSteps/getTaskForm/updateTaskForm) vão para `modelCalls` (não poluem `calls`).
+*/
 function makeOtcs(calls = []) {
   const otcs = {
     calls,
-    uploadFailures: 0,
+    modelCalls: [],
+    uploadFailures: 0,       // próximas N escritas do PDF (addVersion/uploadToFolder) falham
     dispositionFailures: 0,
     uploadGate: null,
     uploadFailStatus: 500,   // status HTTP dos erros de uploadFailures
     dispositionFailStatus: 500,
-    uploads: [],
+    uploads: [],             // uploadToFolder (PDF criado na pasta: fallback)
+    versions: [],            // addVersion (PDF como nova versão do nó assinado)
+    missingNodes: new Set(), // nós que respondem 404 em addVersion
     sendons: [],
     downloads: [],
     sendOnFailsAlways: false,
+    sendOnFailures: 0,       // próximos N SendOn (de qualquer tipo) falham
+    sendOnFailStatus: 500,
+    workflows: {},
+    stepsFailures: 0,        // próximas N consultas de getProcessSteps falham
+    stepsFailStatus: 500,
+    formFailure: null,       // se definido, getTaskForm lança
+    customActions: ['Firmado', 'Rechazado'],
+    formFields: {},          // rótulo -> { key, value } devolvido por getTaskForm
+    updateFormFailures: 0,
+    updateFormCalls: [],
+    addWorkflow(processId, { subprocessId = processId, stage = 'sign' } = {}) {
+      const sub = Number(subprocessId);
+      const status = {
+        start: ['current', 'next'],
+        sign: ['completed', 'current'],
+        done: ['completed', 'completed']
+      }[stage];
+      otcs.workflows[String(processId)] = {
+        processId: Number(processId),
+        tasks: [
+          { subprocessId: sub, taskId: 1, name: 'Trae Documento a Firmar', status: 'completed' },
+          { subprocessId: sub, taskId: 2, name: START_TASK_NAME, status: status[0] },
+          { subprocessId: sub, taskId: 3, name: SIGN_TASK_NAME, status: status[1] },
+          { subprocessId: sub, taskId: 4, name: 'Firmado?', status: 'next' }
+        ]
+      };
+      return otcs.workflows[String(processId)];
+    },
+    task(processId, taskId) {
+      return otcs.workflows[String(processId)]?.tasks.find((t) => t.taskId === Number(taskId));
+    },
     async downloadNode(nodeId) {
       calls.push(['otcs.download', String(nodeId)]);
       otcs.downloads.push(String(nodeId));
       return Buffer.from('%PDF-1.4 original');
     },
-    async uploadToFolder(folderId, buffer, fileName) {
+    async uploadToFolder(folderId, buffer, fileName, { agreementId } = {}) {
       calls.push(['otcs.upload', String(folderId), fileName]);
       if (otcs.uploadGate) await otcs.uploadGate;
       if (otcs.uploadFailures > 0) {
         otcs.uploadFailures--;
         throw httpError(otcs.uploadFailStatus, 'otcs upload failed');
       }
-      otcs.uploads.push({ folderId: String(folderId), fileName, size: buffer.length });
+      otcs.uploads.push({ folderId: String(folderId), fileName, size: buffer.length, agreementId });
+      return { id: 9000 + otcs.uploads.length };
+    },
+    async addVersion(nodeId, buffer, fileName, { agreementId } = {}) {
+      calls.push(['otcs.addVersion', String(nodeId), fileName]);
+      if (otcs.uploadGate) await otcs.uploadGate;
+      if (otcs.missingNodes.has(String(nodeId))) throw httpError(404, 'node not found');
+      if (otcs.uploadFailures > 0) {
+        otcs.uploadFailures--;
+        throw httpError(otcs.uploadFailStatus, 'otcs upload failed');
+      }
+      otcs.versions.push({ nodeId: String(nodeId), fileName, size: buffer.length, agreementId });
+      return { ok: true };
+    },
+    async getProcessSteps(processId) {
+      otcs.modelCalls.push(['getProcessSteps', String(processId)]);
+      if (otcs.stepsFailures > 0) {
+        otcs.stepsFailures--;
+        throw httpError(otcs.stepsFailStatus, 'steps failed');
+      }
+      const wf = otcs.workflows[String(processId)];
+      if (!wf) throw httpError(404, 'process not found');
+      const out = { current: [], completed: [], next: [] };
+      for (const t of wf.tasks) {
+        out[t.status].push({
+          processId: wf.processId, subprocessId: t.subprocessId, taskId: t.taskId, name: t.name, status: t.status
+        });
+      }
+      return out;
+    },
+    async getTaskForm(processId, subprocessId, taskId) {
+      otcs.modelCalls.push(['getTaskForm', Number(processId), Number(subprocessId), Number(taskId)]);
+      if (otcs.formFailure) throw otcs.formFailure;
+      return { title: 'Tarea', customActions: [...otcs.customActions], fields: otcs.formFields };
+    },
+    async updateTaskForm(processId, subprocessId, taskId, values) {
+      otcs.modelCalls.push(['updateTaskForm', Number(processId), Number(subprocessId), Number(taskId)]);
+      if (otcs.updateFormFailures > 0) {
+        otcs.updateFormFailures--;
+        throw httpError(500, 'formUpdate failed');
+      }
+      otcs.updateFormCalls.push({ processId: Number(processId), subprocessId: Number(subprocessId), taskId: Number(taskId), values });
       return { ok: true };
     },
     async sendOnWorkflow(args) {
       calls.push(['otcs.sendon', args.disposition || 'sendon', args.taskId]);
       if (otcs.sendOnFailsAlways) throw httpError(500, 'sendon failed');
+      if (otcs.sendOnFailures > 0) {
+        otcs.sendOnFailures--;
+        throw httpError(otcs.sendOnFailStatus, 'sendon failed');
+      }
       if (args.disposition && otcs.dispositionFailures > 0) {
         otcs.dispositionFailures--;
         throw httpError(otcs.dispositionFailStatus, 'otcs disposition failed');
+      }
+      // Modelo: só uma tarefa ativa pode receber SendOn; o início ativa a firma e a disposição conclui a firma
+      const task = otcs.task(args.workflowId, args.taskId);
+      if (task) {
+        if (task.status !== 'current' || Number(args.subworkflowId) !== task.subprocessId) {
+          throw httpError(409, 'task is not current');
+        }
+        task.status = 'completed';
+        const next = otcs.task(args.workflowId, Number(args.taskId) + 1);
+        if (next && next.status === 'next') next.status = 'current';
       }
       otcs.sendons.push(args);
       return { ok: true };
@@ -169,7 +291,9 @@ const baseEnv = (dataDir) => ({
   LOG_USER: 'admin',
   LOG_PASS: 'pa:ss',
   PUBLIC_URL: 'http://localhost:0',
-  POLL_ENABLED: 'false'
+  POLL_ENABLED: 'false',
+  // Os testes de /start que não tratam da validação do workflow rodam sem consultar o OTCS (os de validação ligam)
+  START_VERIFY_WORKFLOW: 'false'
 });
 
 /*
@@ -192,7 +316,9 @@ async function buildWorld({
     setTimer: (fn, ms) => { const t = { fn, ms, cleared: false }; timers.push(t); return t; },
     clearTimer: (t) => { if (t) t.cleared = true; }
   });
-  const signatureService = createSignatureService({ repo, adobe, otcs, logger, config, now: clock.now });
+  const signatureService = createSignatureService({
+    repo, adobe, otcs, logger, config, now: clock.now, onCreated: (id) => reconciliation.reconcile(id)
+  });
   const poller = createPoller({ repo, adobe, processor: reconciliation, config, logger, now: clock.now });
   tokenStore = tokenStore || makeTokenStore();
 
@@ -220,12 +346,20 @@ async function buildWorld({
 }
 
 // Cria um acordo "pendente" já mapeado (como o /start faria)
+// (e, se o workflow ainda não existe no OTCS falso, o cria já na tarefa de firma — ou na de início se startSendonDone=false)
 function seedAgreement(world, id = 'AG-1', extra = {}) {
-  return world.repo.upsert(id, {
+  const rec = world.repo.upsert(id, {
     nodeId: '1001', attachId: '2002', fileName: 'contrato.pdf',
     workflowId: '3003', subworkflowId: '3004', taskId: 2,
     emails: ['a@example.com'], state: 'pending', ...extra
   });
+  if (rec.workflowId && !world.otcs.workflows[rec.workflowId]) {
+    world.otcs.addWorkflow(rec.workflowId, {
+      subprocessId: rec.subworkflowId || rec.workflowId,
+      stage: rec.startSendonDone ? 'sign' : 'start'
+    });
+  }
+  return rec;
 }
 
 // Payload de webhook no formato v6 do Adobe
@@ -251,27 +385,59 @@ async function waitFor(fn, { timeout = 3000, interval = 10 } = {}) {
   }
 }
 
-// Corpo do /start como o template.html monta (timestamp+signature via /auth)
+const START_FIELDS = {
+  userEmail1: 'one@example.com',
+  userEmail2: 'two@example.com',
+  nodeId: 1001,
+  attachId: 2002,
+  docName: 'contrato.pdf',
+  workflowId: 3003,
+  subworkflowId: 3004,
+  taskId: 2
+};
+let nonceSeq = 0;
+
+// Corpo do /start no protocolo v2 (timestamp+nonce+signature, como /auth devolveria). `over` sobrescreve campos e,
+// se trouxer timestamp/nonce/signature, são usados como vieram (a assinatura, se omitida, é calculada sobre o resultado).
 function startBody(world, over = {}) {
+  const merged = { ...START_FIELDS, ...over };
+  const timestamp = merged.timestamp ?? String(world.clock.ms());
+  const nonce = merged.nonce ?? `n${String(++nonceSeq).padStart(8, '0')}${'a'.repeat(16)}`;
+  const signature = 'signature' in over
+    ? over.signature
+    : signStart(world.config.signatureSecret, { ...merged, timestamp, nonce });
+  return { ...merged, timestamp, nonce, signature };
+}
+
+// Corpo do /start no protocolo v1 (legado: HMAC só do timestamp, sem nonce)
+function startBodyV1(world, over = {}) {
   const timestamp = String(world.clock.ms());
-  return {
-    userEmail1: 'one@example.com',
-    userEmail2: 'two@example.com',
-    nodeId: 1001,
-    attachId: 2002,
-    docName: 'contrato.pdf',
-    workflowId: 3003,
-    subworkflowId: 3004,
-    taskId: 2,
-    timestamp,
-    signature: sign(world.config.signatureSecret, timestamp),
-    ...over
+  return { ...START_FIELDS, timestamp, signature: sign(world.config.signatureSecret, timestamp), ...over };
+}
+
+/*
+  Formulário da tarefa de início no OTCS falso (atributos do workflow) + o workflow na tarefa de início.
+  Devolve o workflow. `fields` sobrescreve/remove (null) atributos pelo rótulo.
+*/
+function seedStartFlow(world, { processId = '3003', subprocessId = '3004', stage = 'start', fields = {} } = {}) {
+  const base = {
+    DocID: '1001',
+    AttachID: '2002',
+    'Nombre del Documento': 'contrato.pdf',
+    'Email Firmante 1': 'one@example.com',
+    'Email Firmante 2': 'two@example.com',
+    ...fields
   };
+  world.otcs.formFields = {};
+  for (const [label, value] of Object.entries(base)) {
+    if (value !== null) world.otcs.formFields[label] = { key: `k_${label.replace(/\W/g, '')}`, value };
+  }
+  return world.otcs.addWorkflow(processId, { subprocessId, stage });
 }
 
 const basicHeader = (user, pass) => 'Basic ' + Buffer.from(`${user}:${pass}`).toString('base64');
 
 module.exports = {
-  PDF, T0, makeClock, makeLogger, makeAdobe, makeOtcs, makeTokenStore, httpError, tmpDir, buildWorld,
-  seedAgreement, webhookPayload, waitFor, startBody, basicHeader
+  PDF, T0, START_TASK_NAME, SIGN_TASK_NAME, makeClock, makeLogger, makeAdobe, makeOtcs, makeTokenStore, httpError, tmpDir, buildWorld,
+  seedAdobeForEvent, seedAgreement, webhookPayload, waitFor, startBody, startBodyV1, seedStartFlow, basicHeader
 };

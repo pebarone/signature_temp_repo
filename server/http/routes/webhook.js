@@ -6,15 +6,26 @@ const express = require('express');
 const { parseWebhookPayload } = require('../../domain/eventPolicy');
 const { describeError, oneLine } = require('../../infra/util');
 
+// Só caracteres seguros num header (evita injeção de cabeçalho/log); o ClientId do Adobe é alfanumérico
+const CLIENT_ID_RE = /^[A-Za-z0-9._-]{1,200}$/;
+
 function webhookRoutes({ config, logger, reconciliation }) {
   const router = express.Router();
 
-  const sentClientId = (req) => req.headers['x-adobesign-clientid'] || req.headers['x-adobesign-client-id'];
+  const rawClientId = (req) => req.headers['x-adobesign-clientid'] || req.headers['x-adobesign-client-id'];
+  // Valor recebido, se tiver formato válido
+  const sentClientId = (req) => {
+    const v = rawClientId(req);
+    return typeof v === 'string' && CLIENT_ID_RE.test(v) ? v : null;
+  };
+  // Conjunto aceito: CLIENT_ID da integração + WEBHOOK_CLIENT_IDS (o webhook criado pela UI do Adobe envia o ClientId
+  // do aplicativo que o criou, que não é o CLIENT_ID OAuth daqui)
+  const acceptedIds = () => new Set([config.clientId, ...(config.webhookClientIds || [])].filter(Boolean));
 
-  // Adobe exige o eco do X-AdobeSign-ClientId: devolvemos o CLIENT_ID configurado (nunca um valor
-  // arbitrário da requisição); o header da requisição só serve de fallback se CLIENT_ID não estiver definido
+  // Adobe exige que a resposta ecoe o MESMO valor recebido no X-AdobeSign-ClientId. Sem header (ou inválido),
+  // devolvemos o CLIENT_ID configurado
   const echoClientId = (req, res) => {
-    const cid = config.clientId || sentClientId(req);
+    const cid = sentClientId(req) || config.clientId;
     if (cid) res.setHeader('X-AdobeSign-ClientId', cid);
   };
 
@@ -40,10 +51,11 @@ function webhookRoutes({ config, logger, reconciliation }) {
     echoClientId(req, res);
 
     // Autenticidade (best effort: o ClientId não é segredo). Com WEBHOOK_REQUIRE_CLIENT_ID=true header
-    // ausente ou diferente é recusado antes de persistir; sem CLIENT_ID configurado não há com o que comparar
+    // ausente ou fora do conjunto aceito é recusado antes de persistir; sem nenhum ID configurado não há com o que comparar
+    const accepted = acceptedIds();
     const sent = sentClientId(req);
-    const mismatch = !config.clientId || sent !== config.clientId;
-    if (sent && config.clientId && mismatch) {
+    const mismatch = !accepted.size || !sent || !accepted.has(sent);
+    if (rawClientId(req) && accepted.size && mismatch) {
       logger.warn('Webhook com X-AdobeSign-ClientId diferente do CLIENT_ID configurado');
     }
     if (config.webhookRequireClientId && mismatch) {
@@ -78,8 +90,9 @@ function webhookRoutes({ config, logger, reconciliation }) {
 
     res.status(200).send('OK');
 
-    // O processamento já está em andamento; só garante que nenhuma rejeição fique solta
+    // O processamento (e a adoção de acordo desconhecido) já está em andamento; só garante que nenhuma rejeição fique solta
     if (result.processing) result.processing.catch(() => {});
+    if (result.adoption) result.adoption.catch(() => {});
   });
 
   return router;

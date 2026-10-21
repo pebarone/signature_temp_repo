@@ -3,6 +3,7 @@
 const crypto = require('crypto');
 const express = require('express');
 const { describeError } = require('../../infra/util');
+const { AdoptError } = require('../../services/reconciliationService');
 
 const OAUTH_STATE_TTL_MS = 10 * 60 * 1000;
 
@@ -70,6 +71,33 @@ function adminRoutes({ config, logger, repo, reconciliation, tokenStore, basicAu
     } catch (e) {
       logger.error(`[${id}] reconcile manual falló: ${describeError(e)}`);
       res.status(500).json({ error: describeError(e) });
+    }
+  });
+
+  /*
+    Adota um acordo do Adobe que não está no store (banco efêmero perdido, acordos anteriores ao externalId).
+    Usa o externalId do acordo; sem ele aceita JSON { workflowId, subworkflowId?, nodeId, attachId, fileName? }.
+    Depois reconcilia (consulta o Adobe e entrega o que estiver pendente).
+  */
+  router.post('/admin/adopt/:id', basicAuth, async (req, res) => {
+    const id = String(req.params.id);
+    try {
+      await reconciliation.adopt(id, req.body || {});
+    } catch (e) {
+      if (e instanceof AdoptError) {
+        logger.warn(`[${id}] adopción manual rechazada (${e.status}): ${e.message}`);
+        return res.status(e.status).json({ error: e.message, ...(e.missing ? { missing: e.missing } : {}) });
+      }
+      logger.error(`[${id}] adopción manual falló: ${describeError(e)}`);
+      return res.status(500).json({ error: 'Internal error' });
+    }
+    try {
+      const { record, ...result } = await reconciliation.reconcile(id, { force: true, refresh: true, manual: true });
+      logger.info(`[${id}] adopción manual + reconcile: ${result.status}`);
+      res.json({ adopted: true, result, agreement: repo.get(id) });
+    } catch (e) {
+      logger.error(`[${id}] reconcile tras la adopción falló: ${describeError(e)}`);
+      res.status(500).json({ error: 'Internal error', adopted: true });
     }
   });
 

@@ -37,7 +37,9 @@ function start() {
   const otcs = createOtcsClient({ ...config.otcs });
 
   const reconciliation = createReconciliationService({ repo, adobe, otcs, config, logger });
-  const signatureService = createSignatureService({ repo, adobe, otcs, logger, config });
+  const signatureService = createSignatureService({
+    repo, adobe, otcs, logger, config, onCreated: (id) => reconciliation.reconcile(id)
+  });
   const poller = createPoller({ repo, adobe, processor: reconciliation, config, logger });
 
   const app = createApp({ config, logger, repo, reconciliation, signatureService, tokenStore });

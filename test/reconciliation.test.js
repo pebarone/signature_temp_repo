@@ -3,14 +3,15 @@ const assert = require('node:assert/strict');
 const { parseWebhookPayload } = require('../server/domain/eventPolicy');
 const { backoffDelay } = require('../server/domain/agreementState');
 const {
-  buildWorld, seedAgreement, webhookPayload, makeClock, makeAdobe, makeOtcs, tmpDir, httpError, basicHeader, waitFor
+  buildWorld, seedAgreement, seedAdobeForEvent, webhookPayload, makeClock, makeAdobe, makeOtcs, tmpDir, httpError, basicHeader,
+  waitFor
 } = require('./support/fakes');
 const path = require('path');
 
 // Entrega um evento de webhook ao serviço e aguarda o processamento assíncrono
-// O Adobe "confirma" SIGNED por padrão (a verificação do final OK consulta o Adobe); testes podem sobrescrever
+// O Adobe confirma o evento por padrão (toda verificação de final consulta o Adobe); testes podem sobrescrever antes
 async function fire(world, event, id = 'AG-1', opts = {}) {
-  world.adobe.agreements[id] ||= { id, status: 'SIGNED' };
+  seedAdobeForEvent(world.adobe, event, id, opts);
   const result = world.reconciliation.handleEvent(parseWebhookPayload(webhookPayload(event, id, opts)));
   if (result.processing) await result.processing;
   return result;
@@ -21,6 +22,7 @@ const sendonNames = (world) => world.otcs.sendons.map((s) => s.disposition || 's
 
 test('tabela de política (fim a fim): cada evento produz a ação e o estado esperados', async (t) => {
   const EXP = { DISPOSITION_EXPIRED: 'Expirado', DISPOSITION_RECALLED: 'Cancelado', DISPOSITION_CONVERSION_FAILED: 'Erro' };
+  const NONE = { DISPOSITION_EXPIRED: '', DISPOSITION_RECALLED: '', DISPOSITION_CONVERSION_FAILED: '' };
   const cases = [
     // [evento, opts, env, estado final, disposição, baixou PDF?]
     ['AGREEMENT_WORKFLOW_COMPLETED', {}, {}, 'completed', 'Firmado', true],
@@ -30,10 +32,14 @@ test('tabela de política (fim a fim): cada evento produz a ação e o estado es
     ['AGREEMENT_EXPIRED', {}, EXP, 'expired', 'Expirado', false],
     ['AGREEMENT_RECALLED', {}, EXP, 'cancelled', 'Cancelado', false],
     ['AGREEMENT_AUTO_CANCELLED_CONVERSION_PROBLEM', {}, EXP, 'cancelled', 'Erro', false],
-    // sem disposição configurada => needs_attention
-    ['AGREEMENT_EXPIRED', {}, {}, 'needs_attention', null, false],
-    ['AGREEMENT_RECALLED', {}, {}, 'needs_attention', null, false],
-    ['AGREEMENT_AUTO_CANCELLED_CONVERSION_PROBLEM', {}, {}, 'needs_attention', null, false],
+    // padrão: o mapa só tem Firmado/Rechazado, então expirado/cancelado/conversão encerram como Rechazado
+    ['AGREEMENT_EXPIRED', {}, {}, 'expired', 'Rechazado', false],
+    ['AGREEMENT_RECALLED', {}, {}, 'cancelled', 'Rechazado', false],
+    ['AGREEMENT_AUTO_CANCELLED_CONVERSION_PROBLEM', {}, {}, 'cancelled', 'Rechazado', false],
+    // disposição vazia => needs_attention
+    ['AGREEMENT_EXPIRED', {}, NONE, 'needs_attention', null, false],
+    ['AGREEMENT_RECALLED', {}, NONE, 'needs_attention', null, false],
+    ['AGREEMENT_AUTO_CANCELLED_CONVERSION_PROBLEM', {}, NONE, 'needs_attention', null, false],
     ['AGREEMENT_DOCUMENTS_DELETED', {}, {}, 'needs_attention', null, false],
     // legados
     ['AGREEMENT_COMPLETED', {}, {}, 'completed', 'Firmado', true],
@@ -54,6 +60,7 @@ test('tabela de política (fim a fim): cada evento produz a ação e o estado es
   for (const [event, opts, env, state, disposition, downloaded] of cases) {
     await t.test(`${event} ${opts.status || ''} ${Object.keys(env).length ? '(disposições configuradas)' : ''}`, async () => {
       const world = await buildWorld({ env });
+      world.otcs.customActions.push(...Object.values(env).filter(Boolean)); // nomes configurados existem no mapa
       seedAgreement(world);
       const result = await fire(world, event, 'AG-1', opts);
       assert.equal(result.known, true);
@@ -62,7 +69,7 @@ test('tabela de política (fim a fim): cada evento produz a ação e o estado es
       assert.equal(rec.state, state);
       assert.deepEqual(world.otcs.dispositionCalls().map((s) => s.disposition), disposition ? [disposition] : []);
       assert.equal(callNames(world).includes('adobe.download'), downloaded);
-      assert.equal(world.otcs.uploads.length, downloaded ? 1 : 0);
+      assert.equal(world.otcs.versions.length, downloaded ? 1 : 0);
       assert.equal(rec.sendonDone, !!disposition);
       assert.equal(world.repo.listEvents('AG-1').length, 1, 'evento sempre vai ao histórico');
       if (state === 'needs_attention') assert.ok(rec.attentionReason);
@@ -103,20 +110,25 @@ test('PDF final é enviado ao OTCS ANTES da disposição', async () => {
   assert.deepEqual(world.calls, [
     ['adobe.getAgreement', 'AG-1'], // confirmação do SIGNED no Adobe antes de entregar
     ['adobe.download', 'AG-1'],
-    ['otcs.upload', '2002', 'contrato.pdf'],
+    ['otcs.addVersion', '1001', 'contrato.pdf'],
     ['otcs.sendon', 'Firmado', 3]
   ]);
-  assert.equal(world.otcs.uploads[0].folderId, '2002');
+  assert.equal(world.otcs.versions[0].nodeId, '1001', 'PDF assinado = nova versão do nó enviado à assinatura');
+  assert.equal(world.otcs.uploads.length, 0, 'nenhum documento novo na pasta');
   const sendon = world.otcs.sendons[0];
-  assert.equal(sendon.workflowId, '3003');
-  assert.equal(sendon.subworkflowId, '3004');
+  assert.equal(sendon.workflowId, 3003);
+  assert.equal(sendon.subworkflowId, 3004);
   assert.equal(sendon.taskId, 3);
 
   const rec = world.repo.get('AG-1');
   assert.equal(rec.state, 'completed');
   assert.equal(rec.pdfDelivered, true);
+  assert.equal(rec.pdfNodeId, '1001');
   assert.equal(rec.sendonDone, true);
   assert.equal(rec.disposition, 'Firmado');
+  assert.equal(rec.signSubprocessId, '3004');
+  assert.equal(rec.signTaskId, 3);
+  assert.equal(rec.completedExternally, false);
   assert.equal(rec.attempts, 0);
   await world.close();
 });
@@ -164,7 +176,7 @@ test('falha no upload do PDF: não avança a tarefa e agenda retry com backoff',
   assert.equal(rec.state, 'completed');
   assert.equal(rec.attempts, 0);
   assert.equal(rec.lastError, null);
-  assert.equal(world.otcs.uploads.length, 1);
+  assert.equal(world.otcs.versions.length, 1);
   assert.equal(world.otcs.dispositionCalls().length, 1);
   await world.close();
 });
@@ -181,11 +193,11 @@ test('falha na disposição mantém pdf_delivered e retenta só a disposição',
   assert.equal(rec.sendonDone, false);
   assert.equal(rec.lastErrorStage, 'disposition');
   assert.equal(rec.attempts, 1);
-  assert.equal(world.otcs.uploads.length, 1);
+  assert.equal(world.otcs.versions.length, 1);
   assert.equal(world.timers[0].ms, 60 * 1000);
 
   const downloads = () => callNames(world).filter((c) => c === 'adobe.download').length;
-  const uploads = () => callNames(world).filter((c) => c === 'otcs.upload').length;
+  const uploads = () => callNames(world).filter((c) => c === 'otcs.addVersion').length;
   assert.equal(downloads(), 1);
   assert.equal(uploads(), 1);
 
@@ -207,7 +219,7 @@ test('falha no download do Adobe também agenda retry (nada é engolido)', async
   const rec = world.repo.get('AG-1');
   assert.equal(rec.lastErrorStage, 'pdf');
   assert.equal(rec.pdfDelivered, false);
-  assert.equal(world.otcs.uploads.length, 0);
+  assert.equal(world.otcs.versions.length, 0);
   assert.equal(world.otcs.sendons.length, 0);
   assert.equal(world.timers.length, 1);
   await world.close();
@@ -236,7 +248,7 @@ test('disposição é executada uma única vez (eventos repetidos, concorrência
   const manual = await world.reconciliation.reconcile('AG-1');
 
   assert.equal(manual.status, 'done');
-  assert.equal(world.otcs.uploads.length, 1);
+  assert.equal(world.otcs.versions.length, 1);
   assert.equal(world.otcs.dispositionCalls().length, 1);
   assert.equal(callNames(world).filter((c) => c === 'adobe.download').length, 1);
   assert.equal(world.repo.get('AG-1').state, 'completed');
@@ -273,7 +285,11 @@ test('rejeitado: só disposição Rechazado, sem baixar PDF', async () => {
   const world = await buildWorld();
   seedAgreement(world);
   await fire(world, 'AGREEMENT_REJECTED');
-  assert.deepEqual(world.calls, [['otcs.sendon', 'Rechazado', 3]]);
+  assert.deepEqual(world.calls, [
+    ['adobe.getAgreement', 'AG-1'], // o CANCELLED é confirmado no Adobe (recusa, pelos eventos) antes da disposição
+    ['adobe.getAgreementEvents', 'AG-1'],
+    ['otcs.sendon', 'Rechazado', 3]
+  ]);
   const rec = world.repo.get('AG-1');
   assert.equal(rec.state, 'rejected');
   assert.equal(rec.sendonDone, true);
@@ -282,19 +298,21 @@ test('rejeitado: só disposição Rechazado, sem baixar PDF', async () => {
 });
 
 test('expirado/cancelado/falha de conversão: nome da disposição é configurável; vazio => needs_attention', async () => {
-  // padrão (vazio)
-  const w1 = await buildWorld();
+  // vazio explícito => needs_attention (o padrão agora é Rechazado)
+  const w1 = await buildWorld({ env: { DISPOSITION_EXPIRED: '' } });
   seedAgreement(w1);
   await fire(w1, 'AGREEMENT_EXPIRED');
   let rec = w1.repo.get('AG-1');
   assert.equal(rec.state, 'needs_attention');
   assert.match(rec.attentionReason, /sin disposición configurada \(expired\)/);
+  assert.equal(rec.attentionKind, 'config');
   assert.equal(w1.otcs.sendons.length, 0);
   assert.equal(w1.timers.filter((t) => !t.cleared).length, 0, 'sem retry automático');
 
   // o operador configura o nome e força a reconciliação
   w1.config.dispositions.expired = 'Expirado';
-  const res = await w1.reconciliation.reconcile('AG-1');
+  w1.otcs.customActions.push('Expirado');
+  const res = await w1.reconciliation.reconcile('AG-1', { manual: true });
   assert.equal(res.status, 'completed');
   rec = w1.repo.get('AG-1');
   assert.equal(rec.state, 'expired');
@@ -304,8 +322,9 @@ test('expirado/cancelado/falha de conversão: nome da disposição é configurá
 
   // configurado desde o início
   const w2 = await buildWorld({ env: { DISPOSITION_RECALLED: 'Cancelado', DISPOSITION_CONVERSION_FAILED: 'Erro Conv' } });
-  seedAgreement(w2, 'AG-R');
-  seedAgreement(w2, 'AG-C');
+  w2.otcs.customActions.push('Cancelado', 'Erro Conv');
+  seedAgreement(w2, 'AG-R', { workflowId: '3103', subworkflowId: '3104' });
+  seedAgreement(w2, 'AG-C', { workflowId: '3203', subworkflowId: '3204' });
   await fire(w2, 'AGREEMENT_RECALLED', 'AG-R');
   await fire(w2, 'AGREEMENT_AUTO_CANCELLED_CONVERSION_PROBLEM', 'AG-C');
   assert.deepEqual(w2.otcs.dispositionCalls().map((s) => s.disposition), ['Cancelado', 'Erro Conv']);
@@ -321,9 +340,16 @@ test('AGREEMENT_DOCUMENTS_DELETED depois de concluído não reabre o acordo', as
   await world.close();
 });
 
-test('acordo sem attachId ou sem workflowId vai para needs_attention', async () => {
+test('acordo sem nodeId/attachId ou sem workflowId vai para needs_attention (attachId só importa no fallback)', async () => {
+  // sem attachId mas com nodeId: o PDF vira versão do nó, então segue normalmente
+  const w0 = await buildWorld();
+  seedAgreement(w0, 'AG-1', { attachId: null });
+  await fire(w0, 'AGREEMENT_WORKFLOW_COMPLETED');
+  assert.equal(w0.repo.get('AG-1').state, 'completed');
+  await w0.close();
+
   const w1 = await buildWorld();
-  seedAgreement(w1, 'AG-1', { attachId: null });
+  seedAgreement(w1, 'AG-1', { attachId: null, nodeId: null });
   await fire(w1, 'AGREEMENT_WORKFLOW_COMPLETED');
   assert.equal(w1.repo.get('AG-1').state, 'needs_attention');
   assert.equal(w1.otcs.sendons.length, 0);
@@ -361,7 +387,7 @@ test('poller recupera acordo SIGNED sem webhook', async () => {
   const rec = world.repo.get('AG-1');
   assert.equal(rec.state, 'completed');
   assert.equal(rec.adobeStatus, 'SIGNED');
-  assert.deepEqual(callNames(world).filter((c) => c !== 'adobe.getAgreement'), ['adobe.download', 'otcs.upload', 'otcs.sendon']);
+  assert.deepEqual(callNames(world).filter((c) => c !== 'adobe.getAgreement'), ['adobe.download', 'otcs.addVersion', 'otcs.sendon']);
   assert.equal(world.repo.listEvents('AG-1')[0].source, 'poll');
 
   // acordo concluído não é mais consultado
@@ -386,9 +412,10 @@ test('poller: acordo ainda em andamento só atualiza o status', async () => {
 });
 
 test('poller: expirado e cancelado/recolhido (com e sem disposição configurada)', async () => {
-  const world = await buildWorld({ env: { DISPOSITION_EXPIRED: 'Expirado' } });
+  const world = await buildWorld({ env: { DISPOSITION_EXPIRED: 'Expirado', DISPOSITION_RECALLED: '' } });
+  world.otcs.customActions.push('Expirado');
   seedAgreement(world, 'AG-E');
-  seedAgreement(world, 'AG-C');
+  seedAgreement(world, 'AG-C', { workflowId: '3103', subworkflowId: '3104' });
   world.adobe.agreements['AG-E'] = { id: 'AG-E', status: 'EXPIRED' };
   world.adobe.agreements['AG-C'] = { id: 'AG-C', status: 'CANCELLED' };
   await world.poller.tick();
@@ -400,6 +427,7 @@ test('poller: expirado e cancelado/recolhido (com e sem disposição configurada
 
 test('poller: CANCELLED sem evento de recusa é recall e usa a disposição de cancelado', async () => {
   const world = await buildWorld({ env: { DISPOSITION_RECALLED: 'Cancelado' } });
+  world.otcs.customActions.push('Cancelado');
   seedAgreement(world);
   world.adobe.agreements['AG-1'] = { id: 'AG-1', status: 'CANCELLED' };
   world.adobe.events['AG-1'] = [{ type: 'CREATED' }, { type: 'CANCELLED' }];
@@ -412,7 +440,7 @@ test('poller: CANCELLED sem evento de recusa é recall e usa a disposição de c
 test('poller: rejeição no Adobe v6 (CANCELLED + evento REJECTED/ACTION_REJECTED) usa a disposição de rejeitado', async () => {
   const world = await buildWorld({ env: { DISPOSITION_RECALLED: 'Cancelado' } });
   seedAgreement(world, 'AG-R');
-  seedAgreement(world, 'AG-A');
+  seedAgreement(world, 'AG-A', { workflowId: '3103', subworkflowId: '3104' });
   for (const [id, type] of [['AG-R', 'REJECTED'], ['AG-A', 'ACTION_REJECTED']]) {
     world.adobe.agreements[id] = { id, status: 'CANCELLED' };
     world.adobe.events[id] = [{ type: 'CREATED' }, { type }];
@@ -493,12 +521,14 @@ test('poller reprocessa pendências vencidas (PDF entregue sem disposição) e r
   assert.equal(s.retried, 1);
   assert.equal(world.repo.get('AG-1').state, 'completed');
   assert.equal(world.otcs.dispositionCalls().length, 1);
-  assert.equal(world.otcs.uploads.length, 1);
+  assert.equal(world.otcs.versions.length, 1);
   await world.close();
 });
 
-test('POLL_ENABLED=false: a fila de retries continua sendo revisada após o restart (backoff ainda não vencido no start)', async () => {
+test('POLL_ENABLED=false: a fila de retries continua sendo revisada após o restart (backoff ainda não vencido no start)', async (t) => {
+  t.mock.timers.enable({ apis: ['setInterval'] });
   const world = await buildWorld({ env: { POLL_ENABLED: 'false', POLL_INTERVAL_MS: '1000', POLL_INITIAL_DELAY_MS: '0' } });
+  t.after(() => world.close());
   seedAgreement(world);
   world.otcs.dispositionFailures = 1;
   await fire(world, 'AGREEMENT_WORKFLOW_COMPLETED');
@@ -514,10 +544,10 @@ test('POLL_ENABLED=false: a fila de retries continua sendo revisada após o rest
   assert.equal(world.otcs.dispositionCalls().length, 0);
 
   world.clock.advance(61 * 1000);
+  t.mock.timers.tick(1000);
   await waitFor(() => world.repo.get('AG-1').state === 'completed');
   assert.equal(world.otcs.dispositionCalls().length, 1);
   assert.equal(world.calls.filter((c) => c[0] === 'adobe.getAgreement').length, 1, 'só a verificação do final OK; sem polling de status');
-  await world.close();
 });
 
 test('poller: acordos além de POLL_MAX_AGE_DAYS deixam de ser consultados', async () => {
@@ -544,6 +574,7 @@ test('estado persistido sobrevive a restart (reabre o arquivo SQLite) e retoma s
 
   // novo processo: fakes novos, mesmo arquivo
   const w2 = await buildWorld({ dbFile, clock });
+  w2.otcs.addWorkflow('3003', { subprocessId: '3004' });
   const rec = w2.repo.get('AG-1');
   assert.ok(rec, 'mapa agreement -> workflow sobreviveu');
   assert.equal(rec.workflowId, '3003');
@@ -564,7 +595,7 @@ test('estado persistido sobrevive a restart (reabre o arquivo SQLite) e retoma s
   clock.advance(61 * 1000);
   assert.deepEqual(await w2.reconciliation.runQueue(), ['AG-1']);
   assert.deepEqual(w2.calls, [['otcs.sendon', 'Firmado', 3]]);
-  assert.equal(w2.otcs.uploads.length, 0, 'PDF não é reenviado após o restart');
+  assert.equal(w2.otcs.versions.length, 0, 'PDF não é reenviado após o restart');
   assert.equal(w2.repo.get('AG-1').state, 'completed');
   await w2.close();
 
@@ -585,11 +616,12 @@ test('restart no meio: evento final persistido mas processamento não concluído
   w1.db.close();
 
   const w2 = await buildWorld({ dbFile, clock });
+  w2.otcs.addWorkflow('3003', { subprocessId: '3004' });
   assert.equal(w2.repo.get('AG-1').finalKind, 'final_ok');
   w2.adobe.agreements['AG-1'] = { id: 'AG-1', status: 'SIGNED' };
   assert.deepEqual(await w2.reconciliation.runQueue(), ['AG-1']);
   assert.equal(w2.repo.get('AG-1').state, 'completed');
-  assert.equal(w2.otcs.uploads.length, 1);
+  assert.equal(w2.otcs.versions.length, 1);
   await w2.close();
 });
 
@@ -684,7 +716,7 @@ test('POST /admin/reconcile/:id reprocessa um needs_attention (erro permanente) 
   assert.equal(rec.state, 'completed');
   assert.equal(rec.attempts, 0);
   assert.equal(rec.attentionReason, null);
-  assert.equal(world.otcs.uploads.length, 1, 'PDF não é reenviado');
+  assert.equal(world.otcs.versions.length, 1, 'PDF não é reenviado');
   await world.close();
 });
 
@@ -772,7 +804,7 @@ test('final OK por webhook confirma SIGNED no Adobe antes do PDF e grava adobeSt
   seedAgreement(world);
   world.adobe.agreements['AG-1'] = { id: 'AG-1', status: 'SIGNED' };
   await fire(world, 'AGREEMENT_WORKFLOW_COMPLETED');
-  assert.deepEqual(callNames(world), ['adobe.getAgreement', 'adobe.download', 'otcs.upload', 'otcs.sendon']);
+  assert.deepEqual(callNames(world), ['adobe.getAgreement', 'adobe.download', 'otcs.addVersion', 'otcs.sendon']);
   const rec = world.repo.get('AG-1');
   assert.equal(rec.state, 'completed');
   assert.equal(rec.adobeStatus, 'SIGNED');
@@ -795,7 +827,7 @@ test('final OK forjado (Adobe diz que não está SIGNED): needs_attention, sem P
     assert.equal(rec.attentionReason, 'evento final no confirmado por Adobe: CANCELLED');
     assert.equal(rec.adobeStatus, null, 'status do payload/Adobe não confirmado não vira "verificado"');
     assert.equal(rec.sendonDone, false);
-    assert.equal(world.otcs.uploads.length, 0);
+    assert.equal(world.otcs.versions.length, 0);
     assert.equal(world.otcs.sendons.length, 0);
     assert.equal(callNames(world).includes('adobe.download'), false);
     assert.ok(world.logger.has('error', /evento final no confirmado por Adobe: CANCELLED/));
@@ -818,7 +850,7 @@ test('falha ao consultar o Adobe na verificação: registerFailure stage "verify
   assert.equal(world.timers.length, 1);
   assert.equal(world.timers[0].ms, 60 * 1000);
   assert.match(rec.lastError, /adobe down/);
-  assert.equal(world.otcs.uploads.length, 0);
+  assert.equal(world.otcs.versions.length, 0);
   assert.equal(callNames(world).includes('adobe.download'), false);
 
   world.adobe.agreements['AG-1'] = { id: 'AG-1', status: 'SIGNED' };
@@ -839,7 +871,7 @@ test('final OK com Adobe ainda em andamento (OUT_FOR_SIGNATURE) é transitório:
   assert.equal(rec.lastErrorStage, 'verify');
   assert.equal(rec.nextAttemptAt, new Date(world.clock.ms() + 60 * 1000).toISOString());
   assert.equal(world.timers.length, 1);
-  assert.equal(world.otcs.uploads.length, 0);
+  assert.equal(world.otcs.versions.length, 0);
   assert.equal(callNames(world).includes('adobe.download'), false);
   assert.equal(world.otcs.dispositionCalls().length, 0);
 
@@ -883,15 +915,241 @@ test('status do payload do webhook não é gravado em adobeStatus (fica só no r
   await world.close();
 });
 
-test('só o final OK é verificado: rejeição/expiração por webhook seguem sem consultar o Adobe', async () => {
+test('rejeição/expiração por webhook são confirmadas no Adobe antes da disposição', async () => {
   const world = await buildWorld({ env: { DISPOSITION_EXPIRED: 'Expirado' } });
+  world.otcs.customActions.push('Expirado');
   seedAgreement(world, 'AG-R');
-  seedAgreement(world, 'AG-E');
+  seedAgreement(world, 'AG-E', { workflowId: '3103', subworkflowId: '3104' });
   await fire(world, 'AGREEMENT_REJECTED', 'AG-R');
   await fire(world, 'AGREEMENT_EXPIRED', 'AG-E');
-  assert.equal(getAgreementCalls(world), 0);
+  assert.equal(getAgreementCalls(world), 2, 'uma consulta por webhook: o status do payload não basta');
+  assert.equal(world.calls.filter((c) => c[0] === 'adobe.getAgreementEvents').length, 1, 'só o CANCELLED pede o histórico');
   assert.equal(world.repo.get('AG-R').state, 'rejected');
+  assert.equal(world.repo.get('AG-R').adobeStatus, 'CANCELLED');
   assert.equal(world.repo.get('AG-E').state, 'expired');
+  assert.equal(world.repo.get('AG-E').adobeStatus, 'EXPIRED');
+  await world.close();
+});
+
+test('expiração confirmada pelo Adobe (EXPIRED): disposição Rechazado (padrão) e adobeStatus gravado', async () => {
+  const world = await buildWorld();
+  seedAgreement(world);
+  await fire(world, 'AGREEMENT_EXPIRED');
+  assert.deepEqual(world.otcs.dispositionCalls().map((s) => s.disposition), ['Rechazado']);
+  const rec = world.repo.get('AG-1');
+  assert.equal(rec.state, 'expired');
+  assert.equal(rec.adobeStatus, 'EXPIRED');
+  assert.equal(getAgreementCalls(world), 1);
+  await world.close();
+});
+
+test('AGREEMENT_EXPIRED forjado com o Adobe em andamento: nenhuma disposição; retry com backoff; esgotado => retries_exhausted', async () => {
+  const world = await buildWorld({ env: { RETRY_MAX_ATTEMPTS: '2' } });
+  seedAgreement(world);
+  world.adobe.agreements['AG-1'] = { id: 'AG-1', status: 'OUT_FOR_SIGNATURE' };
+  await fire(world, 'AGREEMENT_EXPIRED');
+  let rec = world.repo.get('AG-1');
+  assert.equal(rec.lastErrorStage, 'verify');
+  assert.equal(rec.attempts, 1);
+  assert.equal(rec.nextAttemptAt, new Date(world.clock.ms() + 60 * 1000).toISOString());
+  assert.equal(world.otcs.dispositionCalls().length, 0);
+  assert.equal(callNames(world).includes('adobe.download'), false);
+
+  world.clock.advance(60 * 1000);
+  await world.reconciliation.reconcile('AG-1', { force: false });
+  rec = world.repo.get('AG-1');
+  assert.equal(rec.state, 'needs_attention');
+  assert.equal(rec.attentionKind, 'retries_exhausted');
+  assert.match(rec.attentionReason, /reintentos agotados en verify \(2\/2\)/);
+  assert.equal(world.otcs.dispositionCalls().length, 0, 'nenhuma disposição');
+  assert.equal(world.otcs.versions.length, 0);
+  await world.close();
+});
+
+test('AGREEMENT_REJECTED forjado com o Adobe em SIGNED: adota o final OK (PDF como versão, Firmado) e registra a troca', async () => {
+  const world = await buildWorld();
+  seedAgreement(world);
+  world.adobe.agreements['AG-1'] = { id: 'AG-1', status: 'SIGNED' };
+  await fire(world, 'AGREEMENT_REJECTED');
+  assert.deepEqual(callNames(world), ['adobe.getAgreement', 'adobe.download', 'otcs.addVersion', 'otcs.sendon'], 'uma só consulta ao Adobe');
+  const rec = world.repo.get('AG-1');
+  assert.equal(rec.finalKind, 'final_ok');
+  assert.equal(rec.state, 'completed');
+  assert.equal(rec.adobeStatus, 'SIGNED');
+  assert.equal(world.otcs.versions.length, 1);
+  assert.deepEqual(world.otcs.dispositionCalls().map((s) => s.disposition), ['Firmado']);
+  const verify = world.repo.listEvents('AG-1').filter((e) => e.source === 'verify');
+  assert.equal(verify.length, 1);
+  assert.equal(verify[0].canonical, 'VERIFY_STATUS_SIGNED');
+  assert.equal(verify[0].kind, 'final_ok');
+  assert.ok(world.logger.has('warn', /se adopta el resultado de Adobe/));
+  await world.close();
+});
+
+test('AGREEMENT_RECALLED com o Adobe CANCELLED + evento de recusa: adota final_rejected', async () => {
+  const world = await buildWorld();
+  seedAgreement(world);
+  world.adobe.agreements['AG-1'] = { id: 'AG-1', status: 'CANCELLED' };
+  world.adobe.events['AG-1'] = [{ type: 'REJECTED' }];
+  await fire(world, 'AGREEMENT_RECALLED');
+  const rec = world.repo.get('AG-1');
+  assert.equal(rec.finalKind, 'final_rejected');
+  assert.equal(rec.state, 'rejected');
+  assert.equal(rec.adobeStatus, 'CANCELLED');
+  assert.equal(world.otcs.dispositionCalls()[0].comment, 'Rechazado por el firmante en Adobe Sign');
+  assert.equal(world.repo.listEvents('AG-1').find((e) => e.source === 'verify').kind, 'final_rejected');
+  await world.close();
+});
+
+test('falha de conversão: CANCELLED (com ou sem recusa) e ABORTED confirmam o resultado, sem adotar outro', async () => {
+  for (const [status, events] of [['CANCELLED', []], ['CANCELLED', [{ type: 'REJECTED' }]], ['ABORTED', []]]) {
+    const world = await buildWorld();
+    seedAgreement(world);
+    world.adobe.agreements['AG-1'] = { id: 'AG-1', status };
+    world.adobe.events['AG-1'] = events;
+    await fire(world, 'AGREEMENT_AUTO_CANCELLED_CONVERSION_PROBLEM');
+    const rec = world.repo.get('AG-1');
+    assert.equal(rec.finalKind, 'final_conversion_failed', `${status} com ${events.length} evento(s)`);
+    assert.equal(rec.state, 'cancelled');
+    assert.equal(rec.adobeStatus, status);
+    assert.equal(world.repo.listEvents('AG-1').filter((e) => e.source === 'verify').length, 0);
+    assert.equal(world.otcs.dispositionCalls()[0].comment, 'Adobe Sign no pudo procesar el documento');
+    await world.close();
+  }
+});
+
+test('falha ao consultar os eventos do CANCELLED: retry com backoff, sem disposição; depois conclui', async () => {
+  const world = await buildWorld();
+  seedAgreement(world);
+  world.adobe.agreements['AG-1'] = { id: 'AG-1', status: 'CANCELLED' };
+  world.adobe.eventsError = httpError(503, 'events down');
+  await fire(world, 'AGREEMENT_REJECTED');
+  let rec = world.repo.get('AG-1');
+  assert.equal(rec.lastErrorStage, 'verify');
+  assert.equal(rec.attempts, 1);
+  assert.equal(world.otcs.dispositionCalls().length, 0);
+  assert.equal(world.timers.length, 1);
+
+  world.adobe.eventsError = null;
+  world.clock.advance(60 * 1000);
+  const res = await world.reconciliation.reconcile('AG-1', { force: false });
+  assert.equal(res.status, 'completed');
+  rec = world.repo.get('AG-1');
+  assert.equal(rec.disposition, 'Rechazado');
+  assert.equal(rec.adobeStatus, 'CANCELLED');
+  await world.close();
+});
+
+test('webhook que troca o resultado gravado pelo polling zera o adobeStatus: o verify consulta o Adobe e adota o recall', async () => {
+  const world = await buildWorld({ env: { DISPOSITION_RECALLED: 'Cancelado' } });
+  world.otcs.customActions.push('Cancelado');
+  seedAgreement(world);
+  // o polling viu CANCELLED sem recusa (recall); a disposição falha uma vez, de forma transitória
+  world.adobe.agreements['AG-1'] = { id: 'AG-1', status: 'CANCELLED' };
+  world.adobe.events['AG-1'] = [];
+  world.otcs.dispositionFailures = 1;
+  await world.poller.tick();
+  let rec = world.repo.get('AG-1');
+  assert.equal(rec.finalKind, 'final_recalled');
+  assert.equal(rec.adobeStatus, 'CANCELLED');
+  assert.equal(rec.sendonDone, false);
+  assert.equal(world.otcs.dispositionCalls().length, 0);
+
+  // webhook forjado diz REJECTED: troca o kind e zera o adobeStatus; o verify consulta os eventos e adota o recall
+  await fire(world, 'AGREEMENT_REJECTED');
+  rec = world.repo.get('AG-1');
+  assert.equal(world.calls.filter((c) => c[0] === 'adobe.getAgreementEvents').length, 2, 'uma do polling e uma da verificação');
+  assert.equal(rec.finalKind, 'final_recalled');
+  assert.equal(rec.state, 'cancelled');
+  assert.equal(rec.adobeStatus, 'CANCELLED');
+  assert.deepEqual(world.otcs.dispositionCalls().map((s) => s.disposition), ['Cancelado']);
+  assert.equal(world.otcs.dispositionCalls()[0].comment, 'Acuerdo cancelado en Adobe Sign');
+  assert.equal(world.repo.listEvents('AG-1').find((e) => e.source === 'verify').kind, 'final_recalled');
+  await world.close();
+});
+
+test('webhook do mesmo resultado não zera o adobeStatus gravado pelo polling (sem consulta extra)', async () => {
+  const world = await buildWorld();
+  seedAgreement(world);
+  world.adobe.agreements['AG-1'] = { id: 'AG-1', status: 'EXPIRED' };
+  world.otcs.dispositionFailures = 1;
+  await world.poller.tick(); // EXPIRED gravado; a disposição falha uma vez
+  assert.equal(world.repo.get('AG-1').adobeStatus, 'EXPIRED');
+
+  await fire(world, 'AGREEMENT_EXPIRED');
+  assert.equal(getAgreementCalls(world), 1, 'só a consulta do polling');
+  assert.equal(world.repo.get('AG-1').adobeStatus, 'EXPIRED');
+  assert.equal(world.repo.get('AG-1').state, 'expired');
+  assert.deepEqual(world.otcs.dispositionCalls().map((s) => s.disposition), ['Rechazado']);
+  await world.close();
+});
+
+test('webhook final com o Adobe sem resultado (ABORTED, status desconhecido ou vazio): needs_attention unconfirmed, sem disposição nem PDF', async () => {
+  for (const event of ['AGREEMENT_REJECTED', 'AGREEMENT_EXPIRED']) {
+    for (const status of ['ABORTED', 'FOO', '']) {
+      const world = await buildWorld();
+      seedAgreement(world);
+      world.adobe.agreements['AG-1'] = { id: 'AG-1', status };
+      await fire(world, event);
+      const rec = world.repo.get('AG-1');
+      assert.equal(rec.state, 'needs_attention', `${event} com ${status || 'vazio'}`);
+      assert.equal(rec.attentionKind, 'unconfirmed');
+      assert.equal(rec.attentionReason, `evento final no confirmado por Adobe: ${status || 'sin estado'}`);
+      assert.equal(world.otcs.dispositionCalls().length, 0);
+      assert.equal(world.otcs.versions.length, 0);
+      assert.equal(callNames(world).includes('adobe.download'), false);
+      await world.close();
+    }
+  }
+});
+
+test('poll gravou andamento (adobeStatus OUT_FOR_SIGNATURE) e depois chega o final: o verify consulta o Adobe de novo', async () => {
+  const world = await buildWorld();
+  seedAgreement(world);
+  world.adobe.agreements['AG-1'] = { id: 'AG-1', status: 'OUT_FOR_SIGNATURE' };
+  await world.poller.tick();
+  assert.equal(world.repo.get('AG-1').adobeStatus, 'OUT_FOR_SIGNATURE');
+  assert.equal(getAgreementCalls(world), 1);
+
+  world.adobe.agreements['AG-1'] = { id: 'AG-1', status: 'SIGNED' };
+  await fire(world, 'AGREEMENT_WORKFLOW_COMPLETED');
+  assert.equal(getAgreementCalls(world), 2, 'andamento gravado não confirma o final: nova consulta');
+  assert.equal(world.repo.get('AG-1').state, 'completed');
+  assert.equal(world.repo.get('AG-1').adobeStatus, 'SIGNED');
+  await world.close();
+});
+
+test('final vindo do polling (adobeStatus gravado e compatível): o verify não consulta o Adobe de novo', async () => {
+  const cases = [
+    ['EXPIRED', [], 'expired', 0],
+    ['CANCELLED', [{ type: 'REJECTED' }], 'rejected', 1],
+    ['CANCELLED', [], 'cancelled', 1]
+  ];
+  for (const [status, events, state, eventsCalls] of cases) {
+    const world = await buildWorld();
+    seedAgreement(world);
+    world.adobe.agreements['AG-1'] = { id: 'AG-1', status };
+    world.adobe.events['AG-1'] = events;
+    await world.poller.tick();
+    assert.equal(world.repo.get('AG-1').state, state, status);
+    assert.equal(getAgreementCalls(world), 1, `${status}: só a consulta do próprio polling`);
+    assert.equal(world.calls.filter((c) => c[0] === 'adobe.getAgreementEvents').length, eventsCalls, `${status}: eventos`);
+    await world.close();
+  }
+});
+
+test('verify que adotaria outro resultado com PDF já entregue: needs_attention unconfirmed, sem PDF nem disposição', async () => {
+  const world = await buildWorld();
+  seedAgreement(world, 'AG-1', { finalKind: 'final_rejected', state: 'rejected', pdfDelivered: true });
+  world.adobe.agreements['AG-1'] = { id: 'AG-1', status: 'SIGNED' };
+  await world.reconciliation.reconcile('AG-1', { force: true });
+  const rec = world.repo.get('AG-1');
+  assert.equal(rec.state, 'needs_attention');
+  assert.equal(rec.attentionKind, 'unconfirmed');
+  assert.match(rec.attentionReason, /ya tiene final_rejected con el PDF entregado/);
+  assert.equal(world.otcs.dispositionCalls().length, 0);
+  assert.equal(world.otcs.versions.length, 0);
+  assert.equal(callNames(world).includes('adobe.download'), false);
   await world.close();
 });
 

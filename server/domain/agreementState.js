@@ -1,6 +1,9 @@
 // domain/agreementState.js
 // Máquina de estados do acordo — pura, sem I/O. Cada função devolve um "patch" para o repositório.
 //
+// Etapas (reconciliationService): start (SendOn do pedido de firma) -> verify (SIGNED no Adobe) -> pdf (nova versão
+// do documento) -> disposition (Firmado/Rechazado na tarefa de firma). Cada uma é idempotente e persistida.
+//
 // Fluxo OK:  pending -> signed -> pdf_delivered -> completed
 // Demais finais: pending -> rejected | expired | cancelled (sendonDone marca a disposição entregue)
 // needs_attention: exige intervenção (sem disposição configurada, sem workflowId, documentos apagados...)
@@ -44,32 +47,50 @@ function finalPatch(rec, kind, { nowIso, adobeStatus } = {}) {
     finalKind: kind,
     finalAt: rec.finalKind === kind && rec.finalAt ? rec.finalAt : nowIso,
     attentionReason: null,
+    attentionKind: null,
+    ...(rec.state === STATES.NEEDS_ATTENTION ? { attempts: 0, nextAttemptAt: null } : {}),
     state: kind === KINDS.FINAL_OK && rec.pdfDelivered ? STATES.PDF_DELIVERED : plan.openState
   };
   if (adobeStatus) patch.adobeStatus = adobeStatus;
   return patch;
 }
 
-const attentionPatch = (reason) => ({
+// Tipos de needs_attention: só 'retries_exhausted' é reaberto sozinho (ATTENTION_RETRY_HOURS)
+const ATTENTION_KINDS = {
+  PERMANENT: 'permanent',
+  RETRIES_EXHAUSTED: 'retries_exhausted',
+  CONFIG: 'config',
+  UNCONFIRMED: 'unconfirmed',
+  EVENT: 'event'
+};
+
+const attentionPatch = (reason, kind = ATTENTION_KINDS.PERMANENT) => ({
   state: STATES.NEEDS_ATTENTION,
   attentionReason: reason,
+  attentionKind: kind,
   nextAttemptAt: null
 });
 
-// Reabre um final em needs_attention (reconcile manual): volta ao estado "aberto" e zera as tentativas
+// Reabre um needs_attention (reconcile manual / reabertura automática): volta ao estado "aberto" e zera as tentativas.
+// Sem resultado final (falha na etapa start) volta a pending.
 function reopenPatch(rec) {
   const plan = planFor(rec.finalKind);
   return {
-    state: rec.finalKind === KINDS.FINAL_OK && rec.pdfDelivered ? STATES.PDF_DELIVERED : plan.openState,
+    state: !plan
+      ? STATES.PENDING
+      : (rec.finalKind === KINDS.FINAL_OK && rec.pdfDelivered ? STATES.PDF_DELIVERED : plan.openState),
     attentionReason: null,
+    attentionKind: null,
     attempts: 0,
     nextAttemptAt: null
   };
 }
 
-const pdfDeliveredPatch = (nowIso) => ({
+// pdfNodeId: nó que recebeu o PDF final (nova versão do documento ou, no fallback, o documento criado na pasta)
+const pdfDeliveredPatch = (nowIso, pdfNodeId = null) => ({
   pdfDelivered: true,
   pdfDeliveredAt: nowIso,
+  pdfNodeId: pdfNodeId ? String(pdfNodeId) : null,
   state: STATES.PDF_DELIVERED,
   attempts: 0,
   lastError: null,
@@ -77,12 +98,16 @@ const pdfDeliveredPatch = (nowIso) => ({
   nextAttemptAt: null
 });
 
-const completedPatch = (plan, disposition, nowIso) => ({
+// externally: a tarefa de firma já estava concluída fora da integração (ex.: recuperação manual); nada foi enviado
+const completedPatch = (plan, disposition, nowIso, { externally = false } = {}) => ({
   sendonDone: true,
   sendonAt: nowIso,
-  disposition,
+  disposition: externally ? null : disposition,
+  completedExternally: !!externally,
+  startSendonDone: true,
   state: plan.doneState,
   attentionReason: null,
+  attentionKind: null,
   attempts: 0,
   lastError: null,
   lastErrorStage: null,
@@ -110,11 +135,18 @@ function failurePatch(rec, stage, message, nowMs, backoff, { permanent = false }
   const delayMs = backoffDelay(attempts, backoff);
   const max = backoff?.maxAttempts || 0;
   let attention = null;
-  if (permanent) attention = `error permanente en ${stage}: ${message}`;
-  else if (max > 0 && attempts >= max) attention = `reintentos agotados en ${stage} (${attempts}/${max}): ${message}`;
+  let attentionKind = null;
+  if (permanent) {
+    attention = `error permanente en ${stage}: ${message}`;
+    attentionKind = ATTENTION_KINDS.PERMANENT;
+  } else if (max > 0 && attempts >= max) {
+    attention = `reintentos agotados en ${stage} (${attempts}/${max}): ${message}`;
+    attentionKind = ATTENTION_KINDS.RETRIES_EXHAUSTED;
+  }
   return {
     delayMs,
     attention,
+    attentionKind,
     patch: {
       attempts,
       lastError: message,
@@ -125,7 +157,20 @@ function failurePatch(rec, stage, message, nowMs, backoff, { permanent = false }
   };
 }
 
-const hasPendingWork = (rec) => !!rec.finalKind && !rec.sendonDone;
+// Etapa start pendente: o pedido de firma ainda não foi enviado (SendOn da tarefa de início)
+const isStartPending = (rec) => !rec.startSendonDone && !rec.sendonDone && !!rec.workflowId;
+
+const hasPendingWork = (rec) => (!!rec.finalKind && !rec.sendonDone) || isStartPending(rec);
+
+// Marca a etapa start como concluída (zera o contador só se a última falha era do próprio start)
+const startDonePatch = (rec, nowIso) => ({
+  startSendonDone: true,
+  startSendonAt: nowIso,
+  startSendOnError: null,
+  ...(rec.lastErrorStage === 'start'
+    ? { attempts: 0, lastError: null, lastErrorStage: null, nextAttemptAt: null }
+    : {})
+});
 
 const isDue = (rec, nowMs) => !rec.nextAttemptAt || Date.parse(rec.nextAttemptAt) <= nowMs;
 
@@ -144,6 +189,7 @@ function shouldPoll(rec, nowMs, maxAgeDays = 0) {
 }
 
 module.exports = {
-  STATES, FINAL_PLANS, planFor, dispositionFor, finalPatch, attentionPatch, reopenPatch, pdfDeliveredPatch,
-  completedPatch, backoffDelay, isPermanentHttpError, failurePatch, hasPendingWork, isDue, isRetryable, shouldPoll
+  STATES, ATTENTION_KINDS, FINAL_PLANS, planFor, dispositionFor, finalPatch, attentionPatch, reopenPatch,
+  pdfDeliveredPatch, completedPatch, startDonePatch, backoffDelay, isPermanentHttpError, failurePatch,
+  isStartPending, hasPendingWork, isDue, isRetryable, shouldPoll
 };

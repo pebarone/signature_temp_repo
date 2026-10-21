@@ -1,5 +1,7 @@
 [LL_WEBREPORT_EXCLUDEHTML /]
-[LL_REPTAG_{'[LL_REPTAG_&WORKID /]','[LL_REPTAG_&SUBWORKID /]', 2} WFTASKACTION:REASSIGN:279463 /]
+[// 11742766 = ID do usuario de integracao (OTCS_USER do orquestrador) NESTE ambiente: QA = AdminKeralty (11742766), PROD = a confirmar. /]
+[// A tarefa Enviar solicitud de firma precisa estar atribuida a esse usuario: o orquestrador le o formulario dela. /]
+[LL_REPTAG_{'[LL_REPTAG_&WORKID /]','[LL_REPTAG_&SUBWORKID /]', 2} WFTASKACTION:REASSIGN:11742766 /]
 
 
 [LL_REPTAG_&WORKID SETVAR:WFID /]
@@ -299,20 +301,6 @@ const h2 = mainContainer.querySelector('h2');
 mainContainer.insertBefore(docLink, h2.nextSibling);
 
 
-async function generateSignature(secret,timestamp) {
-    const enc = new TextEncoder()
-    const key = await crypto.subtle.importkey(
-        "raw", enc.encode(secret), {name:"HMAC", hash: "SHA-256"}, false, ["sign"]
-        );
-    const sig = await crypto.subtle.sign("HMAC", key, enc.encode(timestamp));
-    return[...new Uint8Array(sig)].map(b => b.toString(16).padStart(2,'0')).join('');
-    
-    
-    
-}
-
-
-
 function createSendOnButton() {
     if(document.querySelector('.btn-premium')) return;
     const btn = document.createElement('button');
@@ -372,6 +360,12 @@ function triggerSuccessFeedback() {
 
 
 
+/*
+  Protocolo v2:
+   1) POST /auth (Basic) com os campos do envio => { timestamp, nonce, signature } vinculados a ESTES campos (2 min, uso unico);
+   2) POST /start com os mesmos campos + timestamp, nonce e signature.
+  O orquestrador revalida tudo contra o fluxo no OTCS (DocID, AttachID, e-mails): o navegador so confirma o que viu.
+*/
 async function startProcess() {
   // 1) coleta e valida e-mails e IDs
   const e1 = document.getElementById('email1').innerText.trim();
@@ -391,53 +385,46 @@ async function startProcess() {
   showStatus('Buscando las credenciales', 'active');
 
   try {
-    // 3) obtém timestamp + signature do servidor
+    // 3) campos do envio (os mesmos em /auth e /start)
+    const fields = {
+      workflowId: WORKFLOW_ID,
+      subworkflowId: SUBWORKFLOW_ID,
+      nodeId: NODE_ID,
+      attachId: ATTACH_ID,
+      docName: DOC_NAME,
+      userEmail1: e1,
+      userEmail2: e2
+    };
+
+    // 4) obtém timestamp + nonce + signature do servidor (assinatura vinculada aos campos)
     const BASIC_USER = 'ADOBE-LOGS';
     const BASIC_PASS = 'ADOBE-LOGS-PASS';
     const BASIC_HEADER = 'Basic ' + btoa(`${BASIC_USER}:${BASIC_PASS}`);
 
     const authResp = await fetch(`${SERVER_URL}/auth`, {
-     headers: {
-    'Authorization': BASIC_HEADER,
-    'ngrok-skip-browser-warning': 'true'
-  }
-});
-    
-    
-    
+      method: 'POST',
+      headers: {
+        'Authorization': BASIC_HEADER,
+        'Content-Type': 'application/json',
+        'ngrok-skip-browser-warning': 'true'
+      },
+      body: JSON.stringify(fields)
+    });
     if (!authResp.ok) {
       throw new Error('Não foi possível obter credenciais de autenticação');
     }
-    const { timestamp, signature } = await authResp.json();
+    const { timestamp, nonce, signature } = await authResp.json();
 
-    // 4) monta payload
-    const payload = {
-      userEmail1: e1,
-      userEmail2: e2,
-      nodeId: NODE_ID,
-      attachId: ATTACH_ID,
-      docName: DOC_NAME,
-      workflowId: WORKFLOW_ID,
-      subworkflowId: SUBWORKFLOW_ID,
-      taskId: TASK_ID,
-      timestamp,
-      signature
-    };
-    
-    
-    // 5) envia para /start
+    // 5) envia para /start (taskId e informativo: o servidor usa a tarefa que encontra no fluxo)
     const startResp = await fetch(`${SERVER_URL}/start`, {
       method: 'POST',
       headers: {
-        'ngrok-skip-browser-warning': 'true',   
-        'Content-Type': 'application/json',
+        'ngrok-skip-browser-warning': 'true',
+        'Content-Type': 'application/json'
       },
-      body: JSON.stringify(payload),            
+      body: JSON.stringify({ ...fields, taskId: TASK_ID, timestamp, nonce, signature })
     });
-    
-    
-const data = await startResp.json();
-
+    const data = await startResp.json().catch(() => ({}));
 
     // 6) limpa loading e mostra resultado
     spinner.classList.remove('is-visible');
@@ -446,10 +433,15 @@ const data = await startResp.json();
     setTimeout(() => progressEl.style.opacity = '0', 850);
 
     if (startResp.ok) {
+      // 200 tambem quando o acordo ja tinha sido solicitado (existing: true): a mensagem do servidor traz o ID
       showStatus(data.message || 'Documento enviado com sucesso!', 'success');
       createSendOnButton();
     } else {
-      showStatus(data.error || data.message || 'Erro desconhecido', 'error');
+      // 409 (fluxo fora do passo de envio / dados divergentes), 422, 503... trazem a mensagem do servidor
+      const errMsg = typeof data.error === 'string'
+        ? data.error
+        : (data.error?.message || data.message || 'Erro desconhecido');
+      showStatus(errMsg, 'error');
     }
 
   } catch (err) {

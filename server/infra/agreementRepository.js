@@ -1,7 +1,7 @@
 // infra/agreementRepository.js
 // Repositório de acordos/eventos sobre SQLite (better-sqlite3, síncrono).
-// Interface usada pelos services: get, has, upsert, list, listPending, listPollable, recordEvent, listEvents, findRecent,
-// countByState, transaction.
+// Interface usada pelos services: get, has, upsert, list, listPending, listPollable, listAttentionToReopen, recordEvent,
+// listEvents, findRecent, findOpenByWorkflow, consumeNonce (nonces do /start), countByState, transaction.
 
 // [chave JS, coluna SQL, tipo]
 const COLUMNS = [
@@ -29,6 +29,15 @@ const COLUMNS = [
   ['lastPolledAt', 'last_polled_at', 'text'],
   ['startSendOnError', 'start_sendon_error', 'text'],
   ['finalAt', 'final_at', 'text'],
+  ['startSendonDone', 'start_sendon_done', 'bool'],
+  ['startSendonAt', 'start_sendon_at', 'text'],
+  ['signSubprocessId', 'sign_subprocess_id', 'text'],
+  ['signTaskId', 'sign_task_id', 'int'],
+  ['pdfNodeId', 'pdf_node_id', 'text'],
+  ['attentionKind', 'attention_kind', 'text'],
+  ['completedExternally', 'completed_externally', 'bool'],
+  ['wfAttrsFingerprint', 'wf_attrs_fingerprint', 'text'],
+  ['adopted', 'adopted', 'bool'],
   ['createdAt', 'created_at', 'text'],
   ['updatedAt', 'updated_at', 'text']
 ];
@@ -73,15 +82,30 @@ function createAgreementRepository(db, { now = () => new Date(), maxEvents = 50 
     ),
     list: db.prepare('SELECT * FROM agreements ORDER BY created_at, id'),
     listByState: db.prepare('SELECT * FROM agreements WHERE state = ? ORDER BY created_at, id'),
+    // Pendente: resultado final ainda não entregue OU pedido de firma (SendOn de início) ainda não enviado
     listPending: db.prepare(
-      `SELECT * FROM agreements WHERE final_kind IS NOT NULL AND sendon_done = 0 AND state != 'needs_attention'
-       ORDER BY created_at, id`
+      `SELECT * FROM agreements WHERE state != 'needs_attention' AND (
+         (final_kind IS NOT NULL AND sendon_done = 0)
+         OR (start_sendon_done = 0 AND sendon_done = 0 AND COALESCE(workflow_id, '') != '')
+       ) ORDER BY created_at, id`
+    ),
+    // needs_attention por tentativas esgotadas, com a última falha anterior ao corte (reabertura automática)
+    listAttentionToReopen: db.prepare(
+      `SELECT * FROM agreements WHERE state = 'needs_attention' AND attention_kind = 'retries_exhausted'
+         AND sendon_done = 0 AND last_error_at IS NOT NULL AND last_error_at < ? ORDER BY created_at, id`
     ),
     listPollable: db.prepare(
       `SELECT * FROM agreements WHERE final_kind IS NULL AND sendon_done = 0 AND state != 'needs_attention'
        ORDER BY created_at, id`
     ),
     recent: db.prepare('SELECT * FROM agreements WHERE node_id = ? AND created_at > ?'),
+    // Acordo ainda não final (sem resultado final e sem SendOn do resultado) do mesmo workflow/subprocesso/documento
+    openByWorkflow: db.prepare(
+      `SELECT * FROM agreements WHERE workflow_id = ? AND subworkflow_id = ? AND node_id = ?
+         AND final_kind IS NULL AND sendon_done = 0 ORDER BY created_at DESC, id DESC LIMIT 1`
+    ),
+    purgeNonces: db.prepare('DELETE FROM start_nonces WHERE expires_at < ?'),
+    insertNonce: db.prepare('INSERT OR IGNORE INTO start_nonces (nonce, expires_at) VALUES (?, ?)'),
     countByState: db.prepare('SELECT state, COUNT(*) AS n FROM agreements GROUP BY state'),
     insertEvent: db.prepare(
       `INSERT OR IGNORE INTO agreement_events
@@ -104,7 +128,7 @@ function createAgreementRepository(db, { now = () => new Date(), maxEvents = 50 
     id = String(id);
     const existing = get(id);
     const merged = existing || {
-      id, emails: [], state: 'pending', pdfDelivered: false, sendonDone: false, attempts: 0
+      id, emails: [], state: 'pending', pdfDelivered: false, sendonDone: false, attempts: 0, startSendonDone: true
     };
     for (const [k, v] of Object.entries(patch || {})) {
       if (KEYS.has(k) && v !== undefined) merged[k] = v;
@@ -154,6 +178,7 @@ function createAgreementRepository(db, { now = () => new Date(), maxEvents = 50 
     // Com resultado final e trabalho pendente (runQueue) / ainda sem resultado final (polling); sem needs_attention
     listPending: () => stmts.listPending.all().map(rowToRecord),
     listPollable: () => stmts.listPollable.all().map(rowToRecord),
+    listAttentionToReopen: (cutoffIso) => stmts.listAttentionToReopen.all(String(cutoffIso)).map(rowToRecord),
 
     /*
       Registra o evento (dedupe por notification_id) e, se não for duplicado, aplica o patch
@@ -180,6 +205,23 @@ function createAgreementRepository(db, { now = () => new Date(), maxEvents = 50 
       const key = [...emails].sort().join('|');
       return stmts.recent.all(String(nodeId), cutoff).map(rowToRecord).find((r) =>
         Array.isArray(r.emails) && [...r.emails].sort().join('|') === key) || null;
+    },
+
+    // Idempotência do /start: acordo não final do mesmo workflow + subprocesso + documento (ou null)
+    findOpenByWorkflow(workflowId, subworkflowId, nodeId) {
+      const row = stmts.openByWorkflow.get(String(workflowId), String(subworkflowId), String(nodeId));
+      return row ? rowToRecord(row) : null;
+    },
+
+    /*
+      Nonce de uso único do /start (HMAC v2): true se foi consumido agora, false se já tinha sido usado.
+      Purga os expirados a cada inserção. Persistido no SQLite (sobrevive a restart e vale entre réplicas do mesmo volume).
+    */
+    consumeNonce(nonce, ttlMs) {
+      return db.transaction(() => {
+        stmts.purgeNonces.run(nowIso());
+        return stmts.insertNonce.run(String(nonce), new Date(now().getTime() + ttlMs).toISOString()).changes === 1;
+      })();
     },
 
     countByState() {

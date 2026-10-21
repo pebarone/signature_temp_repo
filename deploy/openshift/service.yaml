@@ -1,0 +1,16 @@
+# Service interno (ClusterIP) do orquestrador. A Route (route.yaml) expõe o HTTPS para fora do cluster.
+apiVersion: v1
+kind: Service
+metadata:
+  name: signature-orchestrator
+  labels:
+    app: signature-orchestrator
+spec:
+  type: ClusterIP
+  selector:
+    app: signature-orchestrator
+  ports:
+    - name: http
+      port: 3000
+      targetPort: http
+      protocol: TCP

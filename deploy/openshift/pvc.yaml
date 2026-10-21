@@ -1,6 +1,15 @@
-# EXEMPLO — ajustar nome, namespace e storageClassName ao cluster antes de aplicar.
-# O orquestrador guarda SQLite, tokens.json e logs em DATA_DIR; sem volume persistente o estado
-# se perde a cada restart do pod. RWO => um único pod (ver README: replicas 1 + strategy Recreate).
+# Volume de dados do orquestrador: SQLite (mapa acordo->workflow), tokens OAuth e logs.
+# Montado em /data no pod (DATA_DIR=/data). Antes de aplicar, leia "Requisitos de storage" em README.md.
+#
+# Requisitos obrigatórios:
+#  - volume de BLOCO, ReadWriteOnce (RWO), com filesystem local (ext4 ou xfs);
+#  - NÃO usar NFS, SMB/Azure Files, CephFS, AWS EFS nem qualquer classe ReadWriteMany (compartilhada):
+#    o SQLite em modo WAL exige locks POSIX e memória compartilhada no mesmo host;
+#  - um único pod (Deployment com replicas: 1 e strategy: Recreate).
+#
+# storageClassName: escolha uma classe de bloco da tabela do README (ex.: ocs-storagecluster-ceph-rbd,
+# gp3-csi, managed-csi, thin-csi, standard-csi). Listar com: oc get storageclass
+# Se a linha ficar comentada, o cluster usa a classe marcada como (default): ela também precisa ser de bloco.
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -12,5 +21,5 @@ spec:
     - ReadWriteOnce
   resources:
     requests:
-      storage: 1Gi
-  # storageClassName: <classe-do-cluster>   # omitir para usar a classe padrão
+      storage: 2Gi
+  # storageClassName: <classe-de-bloco>   # ex.: ocs-storagecluster-ceph-rbd (AWS: gp3-csi); ver README

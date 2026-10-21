@@ -51,6 +51,33 @@ const MIGRATIONS = [
     received_at     TEXT NOT NULL
   );
   CREATE INDEX idx_events_agreement ON agreement_events(agreement_id, id);
+  `,
+  // v2: etapa start, tarefa de firma resolvida, nó do PDF, tipo de atenção, conclusão externa, atributos e adoção.
+  // start_sendon_done DEFAULT 1: preserva o envio antigo, salvo quando há uma falha de SendOn registrada.
+  `
+  ALTER TABLE agreements ADD COLUMN start_sendon_done INTEGER NOT NULL DEFAULT 1;
+  ALTER TABLE agreements ADD COLUMN start_sendon_at TEXT;
+  ALTER TABLE agreements ADD COLUMN sign_subprocess_id TEXT;
+  ALTER TABLE agreements ADD COLUMN sign_task_id INTEGER;
+  ALTER TABLE agreements ADD COLUMN pdf_node_id TEXT;
+  ALTER TABLE agreements ADD COLUMN attention_kind TEXT;
+  ALTER TABLE agreements ADD COLUMN completed_externally INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE agreements ADD COLUMN wf_attrs_fingerprint TEXT;
+  ALTER TABLE agreements ADD COLUMN adopted INTEGER NOT NULL DEFAULT 0;
+  UPDATE agreements SET start_sendon_done = 0
+    WHERE sendon_done = 0 AND COALESCE(workflow_id, '') != '' AND COALESCE(start_sendon_error, '') != '';
+  UPDATE agreements SET attention_kind = CASE
+    WHEN attention_reason LIKE 'reintentos agotados en %' THEN 'retries_exhausted'
+    WHEN attention_reason LIKE 'error permanente en %' THEN 'permanent'
+    ELSE NULL END WHERE state = 'needs_attention';
+  `,
+  // v3: nonces de uso único do POST /start (HMAC v2); expirados são purgados a cada inserção
+  `
+  CREATE TABLE start_nonces (
+    nonce      TEXT PRIMARY KEY,
+    expires_at TEXT NOT NULL
+  );
+  CREATE INDEX idx_start_nonces_expires ON start_nonces(expires_at);
   `
 ];
 

@@ -1,0 +1,84 @@
+# Configuração NÃO sensível do orquestrador. Segredos ficam no Secret signature-orchestrator-env (ver secret.example.yaml).
+# Defaults: server/config/index.js. Região Adobe: NA4 (produção); o padrão do código é EU1.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: signature-orchestrator-config
+  labels:
+    app: signature-orchestrator
+data:
+  # URL pública (Route) do orquestrador: base do redirect OAuth (<PUBLIC_URL>/admin/callback) e do webhook (<PUBLIC_URL>/webhook)
+  PUBLIC_URL: "https://<host-da-rota>"
+  # Base da API do Content Server (OTCS); o código acrescenta /v1 e /v2
+  OTCS_BASE: "https://otcs.g115.opentext.cloud/cs/cs/api"
+  # Região Adobe Sign de produção (NA4): API
+  ADOBE_API_BASE: "https://api.na4.adobesign.com"
+  # Região Adobe Sign de produção (NA4): OAuth
+  ADOBE_AUTH_BASE: "https://secure.na4.adobesign.com"
+  # Timeout (ms) de cada chamada ao Adobe, inclusive refresh e troca de token
+  ADOBE_TIMEOUT_MS: "60000"
+  # Timeout (ms) de cada chamada ao OTCS
+  OTCS_TIMEOUT_MS: "60000"
+  # Liga o polling de acordos sem resultado final
+  POLL_ENABLED: "true"
+  # Intervalo do polling (ms)
+  POLL_INTERVAL_MS: "600000"
+  # Atraso (ms) antes do primeiro ciclo de polling após o start
+  POLL_INITIAL_DELAY_MS: "30000"
+  # Máximo de acordos consultados por ciclo de polling
+  POLL_MAX_PER_TICK: "50"
+  # Idade máxima (dias) de um acordo que ainda é consultado pelo polling
+  POLL_MAX_AGE_DAYS: "90"
+  # Base (ms) do backoff exponencial dos retries
+  RETRY_BASE_MS: "60000"
+  # Teto (ms) do backoff exponencial dos retries
+  RETRY_MAX_MS: "3600000"
+  # Tentativas antes de needs_attention (0 = sem limite)
+  RETRY_MAX_ATTEMPTS: "10"
+  # Dias de retenção dos logs diários (0 desativa a purga)
+  LOG_RETENTION_DAYS: "15"
+  # Nome da disposição (custom_action) de assinatura concluída no workflow
+  DISPOSITION_SIGNED: "Firmado"
+  # Nome da disposição (custom_action) de recusa no workflow
+  DISPOSITION_REJECTED: "Rechazado"
+  # Disposição de expiração (os mapas só têm Firmado/Rechazado); vazio => needs_attention
+  DISPOSITION_EXPIRED: "Rechazado"
+  # Disposição de recall; vazio => needs_attention
+  DISPOSITION_RECALLED: "Rechazado"
+  # Disposição de falha de conversão; vazio => needs_attention
+  DISPOSITION_CONVERSION_FAILED: "Rechazado"
+  # OBSOLETO: a tarefa da disposição é localizada pelo nome (SIGN_TASK_NAMES); mantido só por compatibilidade
+  SIGN_TASK_ID: "3"
+  # Tarefa que recebe a disposição final, localizada pelo NOME (lista; o nome normalizado COMEÇA com um destes)
+  SIGN_TASK_NAMES: "Aguardar Firma"
+  # Tarefa de início (SendOn depois de criar o acordo; /start exige que esteja ativa), localizada pelo nome
+  START_TASK_NAMES: "Enviar solicitud de firma"
+  # Horas até reabrir sozinho um needs_attention por "reintentos agotados" (0 = nunca)
+  ATTENTION_RETRY_HOURS: "6"
+  # Webhook de acordo desconhecido (banco perdido/deploy novo): adota se o externalId for nosso
+  ADOPT_UNKNOWN_AGREEMENTS: "true"
+  # ClientIds extras aceitos no X-AdobeSign-ClientId do webhook, além do CLIENT_ID (lista; ex.: o do app que criou o webhook na UI)
+  WEBHOOK_CLIENT_IDS: ""
+  # Atributos do workflow com dados do Adobe (best effort; formUpdate ainda não validado em QA => desligado)
+  WF_ATTRIBUTES_ENABLED: "false"
+  # Rótulos dos atributos no mapa do workflow; vazio desliga aquele atributo
+  WF_ATTR_AGREEMENT_ID: "Adobe ID Acuerdo"
+  WF_ATTR_STATUS: "Adobe Estado"
+  WF_ATTR_LAST_EVENT: "Adobe Último Evento"
+  WF_ATTR_UPDATED_AT: "Adobe Fecha Actualización"
+  WF_ATTR_INTEGRATION_STATE: "Estado Integración Firma"
+  # POST /start: confere o pedido contra o workflow no OTCS (fonte da verdade: DocID, AttachID, e-mails)
+  START_VERIFY_WORKFLOW: "true"
+  # Rótulos dos atributos do formulário da tarefa de início
+  START_FIELD_DOCID: "DocID"
+  START_FIELD_ATTACHID: "AttachID"
+  START_FIELD_DOCNAME: "Nombre del Documento"
+  START_FIELD_EMAILS: "Email Firmante 1,Email Firmante 2"
+  # Origens com CORS em /auth e /start (lista). Vazio => a origem de OTCS_BASE. Em PROD, a do OTCS de produção
+  CORS_ORIGINS: "https://otcs.g115.opentext.cloud"
+  # SÓ durante a migração dos WebReports (ver webreports/README.md): ligar "true" no deploy, publicar os WebReports novos,
+  # testar e voltar para "false". Aceitam GET /auth + assinatura v1 e o GET /start antigo (sempre validados contra o OTCS)
+  START_LEGACY_SIGNATURE: "false"
+  START_LEGACY_GET_ENABLED: "false"
+  # false: aceita POST /webhook sem ClientId conhecido; true: exige CLIENT_ID ou um dos WEBHOOK_CLIENT_IDS
+  WEBHOOK_REQUIRE_CLIENT_ID: "false"

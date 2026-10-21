@@ -12,8 +12,11 @@ function createPoller({ repo, adobe, processor, config, logger, now = () => new 
   let first = null;
 
   async function runTick() {
-    const summary = { polled: 0, finalized: 0, errors: 0, retried: 0 };
+    const summary = { polled: 0, finalized: 0, errors: 0, retried: 0, reopened: 0 };
     const t = now().getTime();
+
+    // needs_attention por tentativas esgotadas volta à fila depois de ATTENTION_RETRY_HOURS
+    summary.reopened = await reopen();
 
     // Mais antigos sem consulta primeiro, limitado por tick
     const candidates = repo
@@ -46,6 +49,17 @@ function createPoller({ repo, adobe, processor, config, logger, now = () => new 
     return summary;
   }
 
+  // Reabre needs_attention antigos por tentativas esgotadas (o runQueue os reprocessa); nunca rejeita
+  async function reopen() {
+    if (typeof processor.reopenStale !== 'function') return 0;
+    try {
+      return (await processor.reopenStale()).length;
+    } catch (e) {
+      logger.error(`[poll] reopenStale falló: ${describeError(e)}`);
+      return 0;
+    }
+  }
+
   // Sem sobreposição: se há um tick em curso, devolve o mesmo
   function tick() {
     if (!ticking) ticking = runTick().finally(() => { ticking = null; });
@@ -55,7 +69,7 @@ function createPoller({ repo, adobe, processor, config, logger, now = () => new 
   // Só a fila persistida (retries com backoff), sem consultar o Adobe; sem sobreposição
   let draining = null;
   function drainQueue() {
-    if (!draining) draining = processor.runQueue().finally(() => { draining = null; });
+    if (!draining) draining = reopen().then(() => processor.runQueue()).finally(() => { draining = null; });
     return draining;
   }
 

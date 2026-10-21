@@ -1,0 +1,88 @@
+# Deployment do orquestrador. Requisitos de storage em README.md: um pod, PVC RWO, estratégia Recreate.
+# Antes de aplicar: trocar a imagem pelo build feito com deploy/openshift/Containerfile.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: signature-orchestrator
+  labels:
+    app: signature-orchestrator
+spec:
+  # PVC RWO + SQLite: exatamente uma réplica. Não aumentar sem rever o storage.
+  replicas: 1
+  strategy:
+    # Recreate: o pod antigo termina antes de o novo subir (nunca dois processos sobre o mesmo volume).
+    type: Recreate
+  selector:
+    matchLabels:
+      app: signature-orchestrator
+  template:
+    metadata:
+      labels:
+        app: signature-orchestrator
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: signature-orchestrator
+          # Substituir pela imagem construída e enviada ao registry (ver README, passo 2.5).
+          image: <registry>/<namespace>/signature-orchestrator:<tag>
+          command: ["node", "server/index.js"]
+          ports:
+            - name: http
+              containerPort: 3000
+          env:
+            - name: NODE_ENV
+              value: production
+            # Diretório de dados: é a montagem do PVC (volumeMounts abaixo)
+            - name: DATA_DIR
+              value: /data
+            # Recusa subir sem storage persistente, em vez de rodar perdendo estado
+            - name: REQUIRE_PERSISTENT_STORAGE
+              value: "true"
+            - name: PORT
+              value: "3000"
+          envFrom:
+            # Segredos: criados no cluster, fora do repositório (ver README, passo 2.2)
+            - secretRef:
+                name: signature-orchestrator-env
+            # Variáveis não sensíveis (ver configmap.yaml)
+            - configMapRef:
+                name: signature-orchestrator-config
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          # Probes em /health, que não consulta OTCS nem Adobe: tempos folgados para não reiniciar o pod por lentidão externa
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 5
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          # Compatível com a SCC restricted-v2: sem runAsUser nem fsGroup (o OpenShift atribui)
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: signature-orchestrator-data

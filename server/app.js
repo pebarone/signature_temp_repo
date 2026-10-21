@@ -22,9 +22,26 @@ function createApp({ config, logger, repo, reconciliation, signatureService, tok
   const app = express();
   app.disable('x-powered-by');
   const basicAuth = createBasicAuth({ user: config.logUser, pass: config.logPass });
-  const verifySignature = createVerifySignature({ secret: config.signatureSecret, now, logger });
+  // /auth tem credencial própria (START_AUTH_*) ou, sem ela, a mesma de LOG_USER/LOG_PASS
+  const startBasicAuth = createBasicAuth({ user: config.startAuth.user, pass: config.startAuth.pass, realm: 'Start' });
+  const verifySignature = createVerifySignature({
+    secret: config.signatureSecret,
+    now,
+    logger,
+    consumeNonce: (nonce, ttlMs) => repo.consumeNonce(nonce, ttlMs),
+    allowLegacy: config.startLegacySignature
+  });
 
-  app.use(cors());
+  /*
+    CORS só para /auth e /start (chamados pelo navegador, a partir do WebReport no OTCS). Origem não permitida não
+    recebe Access-Control-Allow-Origin (o navegador bloqueia); webhook, admin, logs e health ficam sem CORS.
+  */
+  const corsOrigins = config.corsOrigins || [];
+  const startCors = cors({
+    origin: corsOrigins.includes('*') ? '*' : corsOrigins,
+    maxAge: 600
+  });
+  app.use(['/auth', '/start'], startCors);
   app.use(express.json({ limit: '10mb' }));
   app.use(express.urlencoded({ extended: true }));
   app.use(express.static(path.join(__dirname, '../static')));
@@ -32,7 +49,7 @@ function createApp({ config, logger, repo, reconciliation, signatureService, tok
   app.get('/health', (_, res) => res.status(200).json({ status: 'ok' }));
 
   app.use(webhookRoutes({ config, logger, reconciliation }));
-  app.use(startRoutes({ config, logger, signatureService, basicAuth, verifySignature, now }));
+  app.use(startRoutes({ config, logger, signatureService, startBasicAuth, verifySignature, now }));
   app.use(adminRoutes({ config, logger, repo, reconciliation, tokenStore, basicAuth, now }));
   app.use(logsRoutes({ logger, basicAuth }));
 

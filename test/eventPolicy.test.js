@@ -2,7 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const {
   KINDS, isFinalKind, canonicalName, classifyEvent, classifyAgreementStatus, classifyCancelled,
-  parseWebhookPayload
+  confirmsFinalKind, parseWebhookPayload
 } = require('../server/domain/eventPolicy');
 
 const kindOf = (event, status) => classifyEvent(event, { agreement: { status } }).kind;
@@ -100,6 +100,25 @@ test('parseWebhookPayload: formato v6 (event string, id em agreement.id)', () =>
   assert.equal(p.notificationId, 'n1');
   assert.equal(p.status, 'SIGNED');
   assert.equal(p.participant, 'x@y.z');
+});
+
+test('confirmsFinalKind: o Adobe confirma o resultado pedido; CANCELLED depende dos eventos (ou só do status gravado)', () => {
+  assert.equal(confirmsFinalKind(KINDS.FINAL_OK, 'SIGNED'), true);
+  assert.equal(confirmsFinalKind(KINDS.FINAL_OK, 'CANCELLED', []), false);
+  assert.equal(confirmsFinalKind(KINDS.FINAL_OK, 'OUT_FOR_SIGNATURE'), false);
+  assert.equal(confirmsFinalKind(KINDS.FINAL_OK, undefined), false);
+  assert.equal(confirmsFinalKind(KINDS.FINAL_EXPIRED, 'EXPIRED'), true);
+  assert.equal(confirmsFinalKind(KINDS.FINAL_REJECTED, 'CANCELLED', [{ type: 'REJECTED' }]), true);
+  assert.equal(confirmsFinalKind(KINDS.FINAL_RECALLED, 'CANCELLED', [{ type: 'REJECTED' }]), false, 'recusa não é recall');
+  assert.equal(confirmsFinalKind(KINDS.FINAL_RECALLED, 'CANCELLED', []), true);
+  assert.equal(confirmsFinalKind(KINDS.FINAL_REJECTED, 'SIGNED'), false);
+  // status gravado sem histórico: CANCELLED vale para recusa e recall
+  assert.equal(confirmsFinalKind(KINDS.FINAL_REJECTED, 'CANCELLED'), true);
+  assert.equal(confirmsFinalKind(KINDS.FINAL_RECALLED, 'CANCELLED'), true);
+  // falha de conversão: CANCELLED (com ou sem recusa) e ABORTED
+  assert.equal(confirmsFinalKind(KINDS.FINAL_CONVERSION_FAILED, 'CANCELLED', [{ type: 'REJECTED' }]), true);
+  assert.equal(confirmsFinalKind(KINDS.FINAL_CONVERSION_FAILED, 'ABORTED'), true);
+  assert.equal(confirmsFinalKind(KINDS.FINAL_CONVERSION_FAILED, 'EXPIRED'), false);
 });
 
 test('parseWebhookPayload: tolera o formato antigo e payload inválido', () => {

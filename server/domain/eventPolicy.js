@@ -98,6 +98,21 @@ function classifyAgreementStatus(status, events) {
 }
 
 /*
+  O estado do acordo no Adobe confirma o resultado final pedido (webhook ou polling)? `events` (GET /events) só é
+  preciso para CANCELLED, para distinguir recusa de recall. `events === undefined` = histórico não consultado (status
+  já gravado por consulta anterior): CANCELLED então confirma recusa ou recall. Falha de conversão aceita CANCELLED
+  (com ou sem recusa) e ABORTED, porque o Adobe não informa o motivo.
+*/
+function confirmsFinalKind(finalKind, status, events) {
+  const s = String(status || '').trim().toUpperCase();
+  if (finalKind === KINDS.FINAL_CONVERSION_FAILED) return s === 'CANCELLED' || s === 'ABORTED';
+  if (s === 'CANCELLED' && events === undefined) {
+    return finalKind === KINDS.FINAL_REJECTED || finalKind === KINDS.FINAL_RECALLED;
+  }
+  return classifyAgreementStatus(s, events) === finalKind;
+}
+
+/*
   Extrai os campos relevantes do payload do webhook (formato v6; tolera o formato antigo
   em que `event` era um objeto).
 */
@@ -119,5 +134,5 @@ function parseWebhookPayload(payload) {
 
 module.exports = {
   KINDS, isFinalKind, canonicalName, classifyEvent, classifyAgreementStatus, classifyCancelled, isCancelledStatus,
-  parseWebhookPayload
+  confirmsFinalKind, parseWebhookPayload
 };

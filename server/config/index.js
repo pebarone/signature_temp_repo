@@ -12,6 +12,17 @@ const int = (v, def) => {
 };
 const str = (v, def = '') => (v === undefined || v === null ? def : String(v).trim());
 const noSlash = (v) => String(v).replace(/\/+$/, '');
+// Origem (esquema+host+porta) de uma URL; '' se inválida/vazia
+const originOf = (v) => {
+  try { return v ? new URL(v).origin : ''; } catch { return ''; }
+};
+// Lista separada por vírgula (itens vazios descartados); ausente ou sem itens => padrão
+const list = (v, def = []) => {
+  const items = v === undefined || v === null
+    ? []
+    : String(v).split(',').map((x) => x.trim()).filter(Boolean);
+  return items.length ? items : def;
+};
 
 /*
   === Config a partir de um objeto env (testável) ===
@@ -79,7 +90,9 @@ function computeConfig(env = process.env, { projectRoot = PROJECT_ROOT } = {}) {
     publicUrl,
     redirectUri: `${publicUrl}/admin/callback`,
     clientId: env.CLIENT_ID,
-    // true => POST /webhook sem X-AdobeSign-ClientId igual ao CLIENT_ID responde 401 (não persiste)
+    // ClientIds extras aceitos no webhook além do CLIENT_ID (ex.: o do aplicativo que criou o webhook na UI do Adobe)
+    webhookClientIds: list(env.WEBHOOK_CLIENT_IDS),
+    // true => POST /webhook sem X-AdobeSign-ClientId igual ao CLIENT_ID (ou a um WEBHOOK_CLIENT_IDS) responde 401 (não persiste)
     webhookRequireClientId: bool(env.WEBHOOK_REQUIRE_CLIENT_ID, false),
     adobeScopes: [
       'agreement_send:account', 'agreement_write:account', 'agreement_read:account',
@@ -89,6 +102,28 @@ function computeConfig(env = process.env, { projectRoot = PROJECT_ROOT } = {}) {
     signatureSecret: env.SIGNATURE_SECRET,
     logUser: env.LOG_USER,
     logPass: env.LOG_PASS,
+
+    /*
+      POST /auth e POST /start (WebReport). Basic Auth do /auth: START_AUTH_USER+START_AUTH_PASS (as duas) ou,
+      se ausentes, LOG_USER/LOG_PASS. O /start valida o pedido contra o workflow do OTCS (fonte da verdade).
+    */
+    startAuth: (str(env.START_AUTH_USER) && str(env.START_AUTH_PASS))
+      ? { user: str(env.START_AUTH_USER), pass: str(env.START_AUTH_PASS), own: true }
+      : { user: env.LOG_USER, pass: env.LOG_PASS, own: false },
+    startVerifyWorkflow: bool(env.START_VERIFY_WORKFLOW, true),
+    // Rótulos dos atributos do formulário da tarefa de início (GET /v1/forms/processes/tasks/update)
+    startFields: {
+      docId: str(env.START_FIELD_DOCID, 'DocID'),
+      attachId: str(env.START_FIELD_ATTACHID, 'AttachID'),
+      docName: str(env.START_FIELD_DOCNAME, 'Nombre del Documento'),
+      emails: list(env.START_FIELD_EMAILS, ['Email Firmante 1', 'Email Firmante 2'])
+    },
+    // Só para a janela de migração dos WebReports: assinatura v1 (só timestamp) e GET /start sem HMAC
+    startLegacySignature: bool(env.START_LEGACY_SIGNATURE, false),
+    startLegacyGet: bool(env.START_LEGACY_GET_ENABLED, false),
+    // Origens com CORS em /auth e /start (lista; '*' só se configurado). Padrão: a origem do OTCS_BASE.
+    corsOrigins: list(env.CORS_ORIGINS, originOf(str(env.OTCS_BASE)) ? [originOf(str(env.OTCS_BASE))] : [])
+      .map((o) => (o === '*' ? o : noSlash(o))),
 
     adobeApiBase: noSlash(str(env.ADOBE_API_BASE, 'https://api.eu1.adobesign.com')),
     adobeAuthBase: noSlash(str(env.ADOBE_AUTH_BASE, 'https://secure.eu1.adobesign.com')),
@@ -127,15 +162,38 @@ function computeConfig(env = process.env, { projectRoot = PROJECT_ROOT } = {}) {
     // 0 desativa a purga
     logRetentionDays: int(env.LOG_RETENTION_DAYS, 15),
 
-    // Nomes das disposições (custom_action) do workflow. Vazio => needs_attention
+    // 0 desativa. needs_attention por "reintentos agotados" é reaberto sozinho após N horas
+    attentionRetryHours: int(env.ATTENTION_RETRY_HOURS, 6),
+    // Acordo desconhecido no webhook (banco perdido/deploy novo): adota se o externalId for nosso
+    adoptUnknownAgreements: bool(env.ADOPT_UNKNOWN_AGREEMENTS, true),
+
+    // Nomes das disposições (custom_action) do workflow. Vazio => needs_attention.
+    // O mapa só tem Firmado/Rechazado: expirado, cancelado e falha de conversão encerram o fluxo como Rechazado.
     dispositions: {
       signed: str(env.DISPOSITION_SIGNED, 'Firmado'),
       rejected: str(env.DISPOSITION_REJECTED, 'Rechazado'),
-      expired: str(env.DISPOSITION_EXPIRED),
-      recalled: str(env.DISPOSITION_RECALLED),
-      conversionFailed: str(env.DISPOSITION_CONVERSION_FAILED)
+      expired: str(env.DISPOSITION_EXPIRED, 'Rechazado'),
+      recalled: str(env.DISPOSITION_RECALLED, 'Rechazado'),
+      conversionFailed: str(env.DISPOSITION_CONVERSION_FAILED, 'Rechazado')
     },
-    signTaskId: int(env.SIGN_TASK_ID, 3)
+    // Tarefas localizadas pelo nome (GET /v2/workflows/status/processes/{id}); o nome normalizado COMEÇA com um destes
+    signTaskNames: list(env.SIGN_TASK_NAMES, ['Aguardar Firma']),
+    startTaskNames: list(env.START_TASK_NAMES, ['Enviar solicitud de firma']),
+    // OBSOLETO: a disposição é endereçada pela tarefa resolvida por nome (SIGN_TASK_NAMES); mantido só por compatibilidade
+    signTaskId: int(env.SIGN_TASK_ID, 3),
+
+    // Atributos do workflow com dados do Adobe (best effort; formUpdate ainda não validado em QA => desligado)
+    wfAttributes: {
+      enabled: bool(env.WF_ATTRIBUTES_ENABLED, false),
+      // Rótulo do atributo no mapa; vazio desliga aquele atributo
+      labels: {
+        agreementId: str(env.WF_ATTR_AGREEMENT_ID, 'Adobe ID Acuerdo'),
+        status: str(env.WF_ATTR_STATUS, 'Adobe Estado'),
+        lastEvent: str(env.WF_ATTR_LAST_EVENT, 'Adobe Último Evento'),
+        updatedAt: str(env.WF_ATTR_UPDATED_AT, 'Adobe Fecha Actualización'),
+        integrationState: str(env.WF_ATTR_INTEGRATION_STATE, 'Estado Integración Firma')
+      }
+    }
   };
 }
 

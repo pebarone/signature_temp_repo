@@ -1,0 +1,31 @@
+# Imagem do orquestrador. Construir a partir da RAIZ do repositório:
+#   podman build -f deploy/openshift/Containerfile -t <registry>/<namespace>/signature-orchestrator:<tag> .
+#
+# better-sqlite3 é um addon nativo (.node): o binário precisa ser o mesmo para o Node, a libc e a arquitetura
+# em que roda. Por isso build e runtime usam a MESMA família de imagem (UBI 9, glibc, Node 22).
+# Não usar alpine/musl: o addon não carrega, ou o npm tenta compilar o fonte sem as ferramentas necessárias.
+
+# Estágio 1: instala só as dependências de produção (o prebuild do better-sqlite3 é baixado aqui)
+FROM registry.access.redhat.com/ubi9/nodejs-22 AS build
+WORKDIR /opt/app-root/src
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
+
+# Estágio 2: runtime enxuto, com node_modules do estágio 1 e o código da aplicação
+FROM registry.access.redhat.com/ubi9/nodejs-22-minimal
+WORKDIR /opt/app-root/src
+COPY --from=build /opt/app-root/src/node_modules ./node_modules
+# Subpastas de server/ listadas uma a uma: server/serverModules e server/logs são locais, ignorados pelo Git,
+# e não devem entrar na imagem
+COPY server/index.js server/app.js ./server/
+COPY server/config ./server/config
+COPY server/domain ./server/domain
+COPY server/http ./server/http
+COPY server/infra ./server/infra
+COPY server/services ./server/services
+COPY static/ ./static/
+COPY package.json ./
+
+USER 1001
+EXPOSE 3000
+CMD ["node", "server/index.js"]

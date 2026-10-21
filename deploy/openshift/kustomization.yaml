@@ -1,0 +1,10 @@
+# Aplica os recursos de configuração do orquestrador: oc apply -k deploy/openshift
+# O Secret NÃO entra aqui: é criado separadamente com oc create secret (ver README, passo 2.2).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - pvc.yaml
+  - configmap.yaml
+  - deployment.yaml
+  - service.yaml
+  - route.yaml
