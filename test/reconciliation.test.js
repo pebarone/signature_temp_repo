@@ -763,19 +763,19 @@ test('final OK forjado (Adobe diz que não está SIGNED): needs_attention, sem P
   ]) {
     const world = await buildWorld();
     seedAgreement(world);
-    world.adobe.agreements['AG-1'] = { id: 'AG-1', status: 'OUT_FOR_SIGNATURE' };
+    world.adobe.agreements['AG-1'] = { id: 'AG-1', status: 'CANCELLED' };
     const result = await fire(world, event, 'AG-1', opts);
     assert.equal(result.known, true);
 
     const rec = world.repo.get('AG-1');
     assert.equal(rec.state, 'needs_attention');
-    assert.equal(rec.attentionReason, 'evento final no confirmado por Adobe: OUT_FOR_SIGNATURE');
+    assert.equal(rec.attentionReason, 'evento final no confirmado por Adobe: CANCELLED');
     assert.equal(rec.adobeStatus, null, 'status do payload/Adobe não confirmado não vira "verificado"');
     assert.equal(rec.sendonDone, false);
     assert.equal(world.otcs.uploads.length, 0);
     assert.equal(world.otcs.sendons.length, 0);
     assert.equal(callNames(world).includes('adobe.download'), false);
-    assert.ok(world.logger.has('error', /evento final no confirmado por Adobe: OUT_FOR_SIGNATURE/));
+    assert.ok(world.logger.has('error', /evento final no confirmado por Adobe: CANCELLED/));
     await world.close();
   }
 });
@@ -806,6 +806,31 @@ test('falha ao consultar o Adobe na verificação: registerFailure stage "verify
   await world.close();
 });
 
+test('final OK com Adobe ainda em andamento (OUT_FOR_SIGNATURE) é transitório: retry com backoff, não needs_attention', async () => {
+  const world = await buildWorld();
+  seedAgreement(world);
+  world.adobe.agreements['AG-1'] = { id: 'AG-1', status: 'OUT_FOR_SIGNATURE' };
+  await fire(world, 'AGREEMENT_WORKFLOW_COMPLETED');
+  const rec = world.repo.get('AG-1');
+  assert.notEqual(rec.state, 'needs_attention');
+  assert.equal(rec.lastErrorStage, 'verify');
+  assert.equal(rec.nextAttemptAt, new Date(world.clock.ms() + 60 * 1000).toISOString());
+  assert.equal(world.timers.length, 1);
+  assert.equal(world.otcs.uploads.length, 0);
+  assert.equal(callNames(world).includes('adobe.download'), false);
+  assert.equal(world.otcs.dispositionCalls().length, 0);
+
+  world.adobe.agreements['AG-1'] = { id: 'AG-1', status: 'SIGNED' };
+  world.clock.advance(60 * 1000);
+  const res = await world.reconciliation.reconcile('AG-1', { force: false });
+  assert.equal(res.status, 'completed');
+  const done = world.repo.get('AG-1');
+  assert.equal(done.state, 'completed');
+  assert.equal(done.disposition, 'Firmado');
+  assert.equal(done.adobeStatus, 'SIGNED');
+  await world.close();
+});
+
 test('adobeStatus já SIGNED (veio do polling) dispensa a consulta extra', async () => {
   const world = await buildWorld();
   seedAgreement(world);
@@ -819,7 +844,7 @@ test('adobeStatus já SIGNED (veio do polling) dispensa a consulta extra', async
 test('status do payload do webhook não é gravado em adobeStatus (fica só no resumo do evento)', async () => {
   const world = await buildWorld();
   seedAgreement(world);
-  world.adobe.agreements['AG-1'] = { id: 'AG-1', status: 'OUT_FOR_SIGNATURE' };
+  world.adobe.agreements['AG-1'] = { id: 'AG-1', status: 'CANCELLED' };
 
   // evento informativo forjado dizendo SIGNED não pode "pré-verificar" o acordo
   await fire(world, 'AGREEMENT_CREATED', 'AG-1', { status: 'SIGNED' });
@@ -850,7 +875,7 @@ test('só o final OK é verificado: rejeição/expiração por webhook seguem se
 test('reconcile manual de um final OK não confirmado volta a consultar o Adobe e conclui quando SIGNED', async () => {
   const world = await buildWorld();
   seedAgreement(world);
-  world.adobe.agreements['AG-1'] = { id: 'AG-1', status: 'OUT_FOR_SIGNATURE' };
+  world.adobe.agreements['AG-1'] = { id: 'AG-1', status: 'CANCELLED' };
   await fire(world, 'AGREEMENT_WORKFLOW_COMPLETED');
   assert.equal(world.repo.get('AG-1').state, 'needs_attention');
 

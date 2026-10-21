@@ -113,6 +113,10 @@ function createReconciliationService({
         return registerFailure(id, 'verify', e);
       }
       if (status !== 'SIGNED') {
+        // Estado em andamento logo após o webhook é transitório: retenta com backoff em vez de travar em needs_attention.
+        if (classifyAgreementStatus(status) === KINDS.PROGRESS) {
+          return registerFailure(id, 'verify', new Error(`Adobe aún no confirma la firma (estado ${status})`));
+        }
         logger.error(`[${id}] evento final no confirmado por Adobe: ${status || 'sin estado'}`);
         return markAttention(id, `evento final no confirmado por Adobe: ${status || 'sin estado'}`);
       }
