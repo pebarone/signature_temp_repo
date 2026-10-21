@@ -56,6 +56,15 @@ function createAdobeClient({
     return rsp.data;
   }
 
+  // Histórico do acordo (distingue recusa de cancelamento quando o status é CANCELLED)
+  async function getAgreementEvents(id) {
+    const rsp = await http.get(`${rest}/agreements/${encodeURIComponent(id)}/events`, {
+      headers: await authHeaders(),
+      timeout: REQUEST_TIMEOUT_MS
+    });
+    return rsp.data?.events || [];
+  }
+
   /*
     Baixa o PDF final (com relatório de auditoria). Retry limitado e *aguardado* em 403;
     qualquer outro erro (ou esgotadas as tentativas) é propagado.
@@ -90,7 +99,9 @@ function createAdobeClient({
   // Lança se não houver token válido (usado pelo /start para responder LOGIN_REQUIRED)
   const checkAuth = () => ensureToken();
 
-  return { createTransientDocument, createAgreement, getAgreement, downloadCombinedDocument, checkAuth };
+  return {
+    createTransientDocument, createAgreement, getAgreement, getAgreementEvents, downloadCombinedDocument, checkAuth
+  };
 }
 
 module.exports = { createAdobeClient };

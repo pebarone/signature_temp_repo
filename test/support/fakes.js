@@ -50,6 +50,8 @@ function makeAdobe(calls = []) {
   const adobe = {
     calls,
     agreements: {},          // id -> { status }
+    events: {},              // id -> [{ type }] (GET /agreements/{id}/events)
+    eventsError: null,       // se definido, getAgreementEvents lança
     downloadFailures: 0,     // próximas N chamadas de download falham
     pdf: PDF,
     created: [],
@@ -74,6 +76,11 @@ function makeAdobe(calls = []) {
       if (!adobe.agreements[id]) throw httpError(404, 'agreement not found');
       return adobe.agreements[id];
     },
+    async getAgreementEvents(id) {
+      calls.push(['adobe.getAgreementEvents', id]);
+      if (adobe.eventsError) throw adobe.eventsError;
+      return adobe.events[id] || [];
+    },
     async downloadCombinedDocument(id) {
       calls.push(['adobe.download', id]);
       if (adobe.downloadFailures > 0) {
@@ -93,6 +100,8 @@ function makeOtcs(calls = []) {
     uploadFailures: 0,
     dispositionFailures: 0,
     uploadGate: null,
+    uploadFailStatus: 500,   // status HTTP dos erros de uploadFailures
+    dispositionFailStatus: 500,
     uploads: [],
     sendons: [],
     downloads: [],
@@ -107,7 +116,7 @@ function makeOtcs(calls = []) {
       if (otcs.uploadGate) await otcs.uploadGate;
       if (otcs.uploadFailures > 0) {
         otcs.uploadFailures--;
-        throw httpError(500, 'otcs upload failed');
+        throw httpError(otcs.uploadFailStatus, 'otcs upload failed');
       }
       otcs.uploads.push({ folderId: String(folderId), fileName, size: buffer.length });
       return { ok: true };
@@ -117,7 +126,7 @@ function makeOtcs(calls = []) {
       if (otcs.sendOnFailsAlways) throw httpError(500, 'sendon failed');
       if (args.disposition && otcs.dispositionFailures > 0) {
         otcs.dispositionFailures--;
-        throw httpError(500, 'otcs disposition failed');
+        throw httpError(otcs.dispositionFailStatus, 'otcs disposition failed');
       }
       otcs.sendons.push(args);
       return { ok: true };

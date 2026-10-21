@@ -87,6 +87,13 @@ test('adobe: outros erros e conteúdo que não é PDF falham imediatamente', asy
   await assert.rejects(() => b.client.downloadCombinedDocument('AG-1'), /no es un PDF/);
 });
 
+test('adobe: getAgreementEvents lê /agreements/{id}/events e devolve a lista (vazia se não houver)', async () => {
+  const { client, calls } = adobeWith([{ events: [{ type: 'ACTION_REJECTED' }] }, {}]);
+  assert.deepEqual(await client.getAgreementEvents('AG 1'), [{ type: 'ACTION_REJECTED' }]);
+  assert.match(calls[0], /\/api\/rest\/v6\/agreements\/AG%201\/events$/);
+  assert.deepEqual(await client.getAgreementEvents('AG-1'), []);
+});
+
 /* ---------- tokenStore ---------- */
 
 // legacy.tokensFiles vazio: o teste não depende de /tmp/tokens.json da máquina

@@ -76,12 +76,21 @@ const PROGRESS_STATUSES = new Set([
   'WAITING_FOR_MULTI_SIGN', 'DOCUMENTS_NOT_YET_PROCESSED'
 ]);
 
-// Estado do acordo (GET /agreements/{id}) usado pelo polling.
-// Obs.: no v6 uma recusa aparece como CANCELLED (o evento AGREEMENT_REJECTED só vem pelo webhook).
-function classifyAgreementStatus(status) {
+const isCancelledStatus = (status) => String(status || '').trim().toUpperCase() === 'CANCELLED';
+
+// No v6 uma recusa do signatário também aparece como CANCELLED: o histórico (GET /agreements/{id}/events)
+// tem um evento REJECTED / ACTION_REJECTED quando foi recusa; sem ele, foi cancelamento (recall).
+function classifyCancelled(events) {
+  const rejected = (Array.isArray(events) ? events : []).some((e) =>
+    String(e?.type || e?.eventType || '').toUpperCase().includes('REJECTED'));
+  return rejected ? KINDS.FINAL_REJECTED : KINDS.FINAL_RECALLED;
+}
+
+// Estado do acordo (GET /agreements/{id}) usado pelo polling. Para CANCELLED passe `events`.
+function classifyAgreementStatus(status, events) {
   const s = String(status || '').trim().toUpperCase();
   if (s === 'SIGNED') return KINDS.FINAL_OK;
-  if (s === 'CANCELLED') return KINDS.FINAL_RECALLED;
+  if (s === 'CANCELLED') return classifyCancelled(events);
   if (s === 'EXPIRED') return KINDS.FINAL_EXPIRED;
   if (s === 'ABORTED') return KINDS.NEEDS_ATTENTION;
   if (PROGRESS_STATUSES.has(s)) return KINDS.PROGRESS;
@@ -109,5 +118,6 @@ function parseWebhookPayload(payload) {
 }
 
 module.exports = {
-  KINDS, isFinalKind, canonicalName, classifyEvent, classifyAgreementStatus, parseWebhookPayload
+  KINDS, isFinalKind, canonicalName, classifyEvent, classifyAgreementStatus, classifyCancelled, isCancelledStatus,
+  parseWebhookPayload
 };

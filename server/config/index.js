@@ -116,7 +116,9 @@ function computeConfig(env = process.env, { projectRoot = PROJECT_ROOT } = {}) {
     },
     backoff: {
       baseMs: Math.max(1, int(env.RETRY_BASE_MS, 60 * 1000)),
-      maxMs: Math.max(1, int(env.RETRY_MAX_MS, 60 * 60 * 1000))
+      maxMs: Math.max(1, int(env.RETRY_MAX_MS, 60 * 60 * 1000)),
+      // Tentativas até needs_attention; 0 = sem limite
+      maxAttempts: int(env.RETRY_MAX_ATTEMPTS, 10)
     },
 
     // 0 desativa a purga

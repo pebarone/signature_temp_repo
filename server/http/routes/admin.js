@@ -42,7 +42,7 @@ function adminRoutes({ config, logger, repo, reconciliation, tokenStore, basicAu
     const id = String(req.params.id);
     if (!repo.has(id)) return res.status(404).json({ error: 'Unknown agreement.' });
     try {
-      const { record, ...result } = await reconciliation.reconcile(id, { force: true, refresh: true });
+      const { record, ...result } = await reconciliation.reconcile(id, { force: true, refresh: true, manual: true });
       logger.info(`[${id}] reconcile manual: ${result.status}`);
       res.json({ result, agreement: repo.get(id) });
     } catch (e) {

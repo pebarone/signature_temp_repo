@@ -1,7 +1,8 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const {
-  KINDS, isFinalKind, canonicalName, classifyEvent, classifyAgreementStatus, parseWebhookPayload
+  KINDS, isFinalKind, canonicalName, classifyEvent, classifyAgreementStatus, classifyCancelled,
+  parseWebhookPayload
 } = require('../server/domain/eventPolicy');
 
 const kindOf = (event, status) => classifyEvent(event, { agreement: { status } }).kind;
@@ -76,6 +77,16 @@ test('classifyAgreementStatus (polling)', () => {
   assert.equal(classifyAgreementStatus('OUT_FOR_SIGNATURE'), KINDS.PROGRESS);
   assert.equal(classifyAgreementStatus('WHATEVER'), KINDS.UNKNOWN);
   assert.equal(classifyAgreementStatus(undefined), KINDS.UNKNOWN);
+});
+
+test('classifyCancelled: evento REJECTED/ACTION_REJECTED => recusa; senão recall', () => {
+  assert.equal(classifyCancelled([{ type: 'CREATED' }, { type: 'REJECTED' }]), KINDS.FINAL_REJECTED);
+  assert.equal(classifyCancelled([{ type: 'ACTION_REJECTED' }]), KINDS.FINAL_REJECTED);
+  assert.equal(classifyCancelled([{ eventType: 'action_rejected' }]), KINDS.FINAL_REJECTED);
+  assert.equal(classifyCancelled([{ type: 'CREATED' }, { type: 'CANCELLED' }]), KINDS.FINAL_RECALLED);
+  assert.equal(classifyCancelled([]), KINDS.FINAL_RECALLED);
+  assert.equal(classifyCancelled(undefined), KINDS.FINAL_RECALLED);
+  assert.equal(classifyAgreementStatus('CANCELLED', [{ type: 'REJECTED' }]), KINDS.FINAL_REJECTED);
 });
 
 test('parseWebhookPayload: formato v6 (event string, id em agreement.id)', () => {

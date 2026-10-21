@@ -17,7 +17,8 @@ function createPoller({ repo, adobe, processor, config, logger, now = () => new 
 
     // Mais antigos sem consulta primeiro, limitado por tick
     const candidates = repo
-      .list((r) => shouldPoll(r, t, poll.maxAgeDays))
+      .listPollable()
+      .filter((r) => shouldPoll(r, t, poll.maxAgeDays))
       .sort((a, b) => String(a.lastPolledAt || '').localeCompare(String(b.lastPolledAt || '')))
       .slice(0, poll.maxPerTick || 50);
 

@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const { parseWebhookPayload } = require('../server/domain/eventPolicy');
 const { backoffDelay } = require('../server/domain/agreementState');
 const {
-  buildWorld, seedAgreement, webhookPayload, makeClock, makeAdobe, makeOtcs, tmpDir
+  buildWorld, seedAgreement, webhookPayload, makeClock, makeAdobe, makeOtcs, tmpDir, httpError, basicHeader
 } = require('./support/fakes');
 const path = require('path');
 
@@ -395,13 +395,70 @@ test('poller: expirado e cancelado/recolhido (com e sem disposição configurada
   await world.close();
 });
 
-test('poller: rejeição no Adobe v6 aparece como CANCELLED e usa a disposição de cancelado', async () => {
+test('poller: CANCELLED sem evento de recusa é recall e usa a disposição de cancelado', async () => {
   const world = await buildWorld({ env: { DISPOSITION_RECALLED: 'Cancelado' } });
   seedAgreement(world);
   world.adobe.agreements['AG-1'] = { id: 'AG-1', status: 'CANCELLED' };
+  world.adobe.events['AG-1'] = [{ type: 'CREATED' }, { type: 'CANCELLED' }];
   await world.poller.tick();
   assert.equal(world.repo.get('AG-1').state, 'cancelled');
   assert.deepEqual(world.otcs.dispositionCalls().map((s) => s.disposition), ['Cancelado']);
+  await world.close();
+});
+
+test('poller: rejeição no Adobe v6 (CANCELLED + evento REJECTED/ACTION_REJECTED) usa a disposição de rejeitado', async () => {
+  const world = await buildWorld({ env: { DISPOSITION_RECALLED: 'Cancelado' } });
+  seedAgreement(world, 'AG-R');
+  seedAgreement(world, 'AG-A');
+  for (const [id, type] of [['AG-R', 'REJECTED'], ['AG-A', 'ACTION_REJECTED']]) {
+    world.adobe.agreements[id] = { id, status: 'CANCELLED' };
+    world.adobe.events[id] = [{ type: 'CREATED' }, { type }];
+  }
+  await world.poller.tick();
+  for (const id of ['AG-R', 'AG-A']) {
+    const rec = world.repo.get(id);
+    assert.equal(rec.state, 'rejected');
+    assert.equal(rec.finalKind, 'final_rejected');
+    assert.equal(rec.disposition, 'Rechazado');
+  }
+  assert.deepEqual(world.otcs.dispositionCalls().map((s) => s.disposition), ['Rechazado', 'Rechazado']);
+  assert.equal(callNames(world).includes('adobe.download'), false);
+  await world.close();
+});
+
+test('poller: falha ao ler os eventos de um CANCELLED não finaliza (warn) e o próximo ciclo retenta', async () => {
+  const world = await buildWorld({ env: { DISPOSITION_RECALLED: 'Cancelado' } });
+  seedAgreement(world);
+  world.adobe.agreements['AG-1'] = { id: 'AG-1', status: 'CANCELLED' };
+  world.adobe.events['AG-1'] = [{ type: 'REJECTED' }];
+  world.adobe.eventsError = httpError(500, 'events down');
+
+  await world.poller.tick();
+  let rec = world.repo.get('AG-1');
+  assert.equal(rec.state, 'pending');
+  assert.equal(rec.finalKind, null);
+  assert.equal(rec.adobeStatus, null, 'nada gravado');
+  assert.equal(rec.lastPolledAt, null);
+  assert.equal(world.repo.listEvents('AG-1').length, 0);
+  assert.equal(world.otcs.sendons.length, 0);
+  assert.ok(world.logger.has('warn', /events down/));
+
+  world.adobe.eventsError = null;
+  await world.poller.tick();
+  rec = world.repo.get('AG-1');
+  assert.equal(rec.state, 'rejected');
+  assert.equal(rec.disposition, 'Rechazado');
+  await world.close();
+});
+
+test('reconcile manual com refresh: falha nos eventos do CANCELLED devolve refresh_failed sem finalizar', async () => {
+  const world = await buildWorld();
+  seedAgreement(world);
+  world.adobe.agreements['AG-1'] = { id: 'AG-1', status: 'CANCELLED' };
+  world.adobe.eventsError = httpError(503, 'events down');
+  const res = await world.reconciliation.reconcile('AG-1', { refresh: true });
+  assert.equal(res.status, 'refresh_failed');
+  assert.equal(world.repo.get('AG-1').finalKind, null);
   await world.close();
 });
 
@@ -507,4 +564,174 @@ test('restart no meio: evento final persistido mas processamento não concluído
   assert.equal(w2.repo.get('AG-1').state, 'completed');
   assert.equal(w2.otcs.uploads.length, 1);
   await w2.close();
+});
+
+/* ---------- limite de tentativas e erros permanentes ---------- */
+
+test('RETRY_MAX_ATTEMPTS: ao atingir o limite vai para needs_attention com o motivo e o último erro', async () => {
+  const world = await buildWorld({ env: { RETRY_MAX_ATTEMPTS: '3' } });
+  seedAgreement(world);
+  world.otcs.uploadFailures = 99;
+
+  await fire(world, 'AGREEMENT_WORKFLOW_COMPLETED');
+  for (const wait of [60, 120]) {
+    assert.equal(world.repo.get('AG-1').state, 'signed');
+    world.clock.advance(wait * 1000);
+    await world.reconciliation.reconcile('AG-1', { force: false });
+  }
+  const rec = world.repo.get('AG-1');
+  assert.equal(rec.state, 'needs_attention');
+  assert.equal(rec.attempts, 3);
+  assert.equal(rec.nextAttemptAt, null);
+  assert.match(rec.attentionReason, /reintentos agotados en pdf \(3\/3\).*otcs upload failed/);
+  assert.match(rec.lastError, /otcs upload failed/);
+  assert.equal(world.timers.at(-1).cleared, true, 'sem timer de retry pendente');
+  assert.ok(world.logger.has('error', /needs_attention: reintentos agotados/));
+
+  // needs_attention não é reprocessado pelo runQueue
+  world.clock.advance(24 * 60 * 60 * 1000);
+  assert.deepEqual(await world.reconciliation.runQueue(), []);
+  await world.close();
+});
+
+test('RETRY_MAX_ATTEMPTS=0 não limita as tentativas; o padrão é 10', async () => {
+  assert.equal((await buildWorld()).config.backoff.maxAttempts, 10);
+  const world = await buildWorld({ env: { RETRY_MAX_ATTEMPTS: '0' } });
+  assert.equal(world.config.backoff.maxAttempts, 0);
+  seedAgreement(world);
+  world.otcs.uploadFailures = 99;
+  await fire(world, 'AGREEMENT_WORKFLOW_COMPLETED');
+  for (let i = 0; i < 14; i++) {
+    world.clock.advance(60 * 60 * 1000);
+    await world.reconciliation.reconcile('AG-1', { force: false });
+  }
+  const rec = world.repo.get('AG-1');
+  assert.equal(rec.attempts, 15);
+  assert.equal(rec.state, 'signed');
+  await world.close();
+});
+
+test('needs_attention por limite de tentativas: reconcile manual zera as tentativas (rodada nova)', async () => {
+  const world = await buildWorld({ env: { RETRY_MAX_ATTEMPTS: '2' } });
+  seedAgreement(world);
+  world.otcs.uploadFailures = 2;
+  await fire(world, 'AGREEMENT_WORKFLOW_COMPLETED');
+  world.clock.advance(60 * 1000);
+  await world.reconciliation.reconcile('AG-1', { force: false });
+  assert.equal(world.repo.get('AG-1').state, 'needs_attention');
+  assert.equal(world.repo.get('AG-1').attempts, 2);
+
+  // rodada nova: uma falha não estoura o limite de novo (attempts volta a 1, não 3)
+  world.otcs.uploadFailures = 1;
+  let res = await world.reconciliation.reconcile('AG-1', { force: true, refresh: true, manual: true });
+  assert.equal(res.status, 'failed');
+  let rec = world.repo.get('AG-1');
+  assert.equal(rec.attempts, 1);
+  assert.equal(rec.state, 'signed');
+  assert.equal(rec.attentionReason, null);
+
+  // e agora o manual conclui
+  res = await world.reconciliation.reconcile('AG-1', { force: true, refresh: true, manual: true });
+  assert.equal(res.status, 'completed');
+  rec = world.repo.get('AG-1');
+  assert.equal(rec.state, 'completed');
+  assert.equal(rec.attempts, 0);
+  assert.equal(world.otcs.dispositionCalls().length, 1);
+  await world.close();
+});
+
+test('POST /admin/reconcile/:id reprocessa um needs_attention (erro permanente) e conclui', async () => {
+  const world = await buildWorld({ listen: true });
+  seedAgreement(world);
+  world.otcs.dispositionFailStatus = 404;
+  world.otcs.dispositionFailures = 1;
+  await fire(world, 'AGREEMENT_WORKFLOW_COMPLETED');
+  assert.equal(world.repo.get('AG-1').state, 'needs_attention');
+  assert.equal(world.repo.get('AG-1').pdfDelivered, true);
+
+  const r = await fetch(`${world.baseUrl}/admin/reconcile/AG-1`, {
+    method: 'POST', headers: { authorization: basicHeader('admin', 'pa:ss') }
+  });
+  assert.equal((await r.json()).result.status, 'completed');
+  const rec = world.repo.get('AG-1');
+  assert.equal(rec.state, 'completed');
+  assert.equal(rec.attempts, 0);
+  assert.equal(rec.attentionReason, null);
+  assert.equal(world.otcs.uploads.length, 1, 'PDF não é reenviado');
+  await world.close();
+});
+
+test('erro 4xx na disposição (exceto 401/408/429) => needs_attention na hora; 401/408/429 e 5xx retentam', async () => {
+  for (const [status, permanent] of [[400, true], [403, true], [404, true], [409, true], [401, false], [408, false], [429, false], [500, false]]) {
+    const world = await buildWorld();
+    seedAgreement(world);
+    world.otcs.dispositionFailStatus = status;
+    world.otcs.dispositionFailures = 1;
+    await fire(world, 'AGREEMENT_WORKFLOW_COMPLETED');
+    const rec = world.repo.get('AG-1');
+    assert.equal(rec.attempts, 1, `HTTP ${status}`);
+    assert.equal(rec.lastErrorStage, 'disposition');
+    if (permanent) {
+      assert.equal(rec.state, 'needs_attention', `HTTP ${status}`);
+      assert.match(rec.attentionReason, new RegExp(`error permanente en disposition.*HTTP ${status}`));
+      assert.equal(rec.pdfDelivered, true, 'PDF entregue é preservado');
+      assert.equal(world.timers.length, 0, 'sem retry agendado');
+    } else {
+      assert.equal(rec.state, 'pdf_delivered', `HTTP ${status}`);
+      assert.equal(world.timers.length, 1);
+    }
+    await world.close();
+  }
+});
+
+test('erro 4xx no upload do PDF segue a mesma regra; falha de download no Adobe nunca é permanente', async () => {
+  let world = await buildWorld();
+  seedAgreement(world);
+  world.otcs.uploadFailStatus = 403;
+  world.otcs.uploadFailures = 1;
+  await fire(world, 'AGREEMENT_WORKFLOW_COMPLETED');
+  let rec = world.repo.get('AG-1');
+  assert.equal(rec.state, 'needs_attention');
+  assert.match(rec.attentionReason, /error permanente en pdf.*HTTP 403/);
+  assert.equal(rec.pdfDelivered, false);
+  assert.equal(world.otcs.dispositionCalls().length, 0);
+  await world.close();
+
+  world = await buildWorld();
+  seedAgreement(world);
+  world.otcs.uploadFailStatus = 429;
+  world.otcs.uploadFailures = 1;
+  await fire(world, 'AGREEMENT_WORKFLOW_COMPLETED');
+  assert.equal(world.repo.get('AG-1').state, 'signed');
+  assert.equal(world.timers.length, 1);
+  await world.close();
+
+  world = await buildWorld();
+  seedAgreement(world);
+  world.adobe.downloadFailures = 1; // httpError(500)
+  const origDownload = world.adobe.downloadCombinedDocument;
+  world.adobe.downloadCombinedDocument = async (id) => {
+    try { return await origDownload(id); } catch (e) { e.response.status = 404; throw e; }
+  };
+  await fire(world, 'AGREEMENT_WORKFLOW_COMPLETED');
+  rec = world.repo.get('AG-1');
+  assert.equal(rec.state, 'signed', 'download do Adobe com 404 ainda retenta (regra é do OTCS)');
+  assert.equal(world.timers.length, 1);
+  await world.close();
+});
+
+/* ---------- consultas filtradas no SQL ---------- */
+
+test('repo.listPending/listPollable: filtram no SQL (final x sem final, sem concluídos nem needs_attention)', async () => {
+  const world = await buildWorld();
+  seedAgreement(world, 'A-POLL');
+  seedAgreement(world, 'A-ATT-NOFINAL', { state: 'needs_attention' });
+  seedAgreement(world, 'A-PEND', { finalKind: 'final_ok', state: 'signed' });
+  seedAgreement(world, 'A-PEND-ATT', { finalKind: 'final_ok', state: 'needs_attention' });
+  seedAgreement(world, 'A-DONE', { finalKind: 'final_ok', state: 'completed', sendonDone: true });
+  seedAgreement(world, 'A-DONE-NOFINAL', { sendonDone: true });
+
+  assert.deepEqual(world.repo.listPollable().map((r) => r.id), ['A-POLL']);
+  assert.deepEqual(world.repo.listPending().map((r) => r.id), ['A-PEND']);
+  await world.close();
 });

@@ -56,6 +56,17 @@ const attentionPatch = (reason) => ({
   nextAttemptAt: null
 });
 
+// Reabre um final em needs_attention (reconcile manual): volta ao estado "aberto" e zera as tentativas
+function reopenPatch(rec) {
+  const plan = planFor(rec.finalKind);
+  return {
+    state: rec.finalKind === KINDS.FINAL_OK && rec.pdfDelivered ? STATES.PDF_DELIVERED : plan.openState,
+    attentionReason: null,
+    attempts: 0,
+    nextAttemptAt: null
+  };
+}
+
 const pdfDeliveredPatch = (nowIso) => ({
   pdfDelivered: true,
   pdfDeliveredAt: nowIso,
@@ -84,11 +95,26 @@ function backoffDelay(attempts, { baseMs = 60 * 1000, maxMs = 60 * 60 * 1000 } =
   return Math.min(maxMs, baseMs * 2 ** Math.min(n - 1, 30));
 }
 
-function failurePatch(rec, stage, message, nowMs, backoff) {
+// Erro HTTP 4xx permanente (nome de disposição errado, task já avançada...); 401/408/429 são transitórios
+const isPermanentHttpError = (err) => {
+  const status = err?.response?.status;
+  return status >= 400 && status <= 499 && ![401, 408, 429].includes(status);
+};
+
+/*
+  `attention` vem preenchido (motivo) quando não vale mais retentar: erro permanente ou
+  `backoff.maxAttempts` atingido (0/ausente = sem limite).
+*/
+function failurePatch(rec, stage, message, nowMs, backoff, { permanent = false } = {}) {
   const attempts = (rec.attempts || 0) + 1;
   const delayMs = backoffDelay(attempts, backoff);
+  const max = backoff?.maxAttempts || 0;
+  let attention = null;
+  if (permanent) attention = `error permanente en ${stage}: ${message}`;
+  else if (max > 0 && attempts >= max) attention = `reintentos agotados en ${stage} (${attempts}/${max}): ${message}`;
   return {
     delayMs,
+    attention,
     patch: {
       attempts,
       lastError: message,
@@ -118,6 +144,6 @@ function shouldPoll(rec, nowMs, maxAgeDays = 0) {
 }
 
 module.exports = {
-  STATES, FINAL_PLANS, planFor, dispositionFor, finalPatch, attentionPatch, pdfDeliveredPatch,
-  completedPatch, backoffDelay, failurePatch, hasPendingWork, isDue, isRetryable, shouldPoll
+  STATES, FINAL_PLANS, planFor, dispositionFor, finalPatch, attentionPatch, reopenPatch, pdfDeliveredPatch,
+  completedPatch, backoffDelay, isPermanentHttpError, failurePatch, hasPendingWork, isDue, isRetryable, shouldPoll
 };

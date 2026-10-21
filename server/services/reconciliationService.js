@@ -1,7 +1,9 @@
 // services/reconciliationService.js
 // Orquestra a entrega de resultado ao Content Server (PDF -> disposição) de forma idempotente.
 // A lógica de decisão vive em domain/; aqui só I/O (repositório, Adobe, OTCS) e serialização.
-const { KINDS, isFinalKind, classifyEvent, classifyAgreementStatus } = require('../domain/eventPolicy');
+const {
+  KINDS, isFinalKind, classifyEvent, classifyAgreementStatus, isCancelledStatus
+} = require('../domain/eventPolicy');
 const state = require('../domain/agreementState');
 const { describeError } = require('../infra/util');
 
@@ -35,11 +37,18 @@ function createReconciliationService({
     return { status: 'needs_attention', reason };
   }
 
-  function registerFailure(id, stage, err) {
+  // permanent: erro que não adianta retentar (4xx do OTCS) => needs_attention direto
+  function registerFailure(id, stage, err, { permanent = false } = {}) {
     const rec = repo.get(id);
     const message = describeError(err);
-    const { patch, delayMs } = state.failurePatch(rec, stage, message, now().getTime(), backoff);
+    const { patch, delayMs, attention } = state.failurePatch(
+      rec, stage, message, now().getTime(), backoff, { permanent }
+    );
     repo.upsert(id, patch);
+    if (attention) {
+      logger.error(`[${id}] ${stage} failed (attempt ${patch.attempts}): ${message}`);
+      return markAttention(id, attention);
+    }
     logger.error(
       `[${id}] ${stage} failed (attempt ${patch.attempts}); next retry at ${patch.nextAttemptAt}: ${message}`
     );
@@ -75,7 +84,8 @@ function createReconciliationService({
     if (opts.refresh && !rec.finalKind && !rec.sendonDone) {
       try {
         const ag = await adobe.getAgreement(id);
-        applyAdobeStatus(id, ag.status);
+        // null: não deu para ler os eventos do Adobe; não finaliza agora
+        if (await applyAdobeStatus(id, ag.status) === null) return { status: 'refresh_failed' };
         rec = repo.get(id);
       } catch (e) {
         logger.warn(`[${id}] no se pudo consultar el estado en Adobe: ${describeError(e)}`);
@@ -86,17 +96,26 @@ function createReconciliationService({
     const plan = state.planFor(rec.finalKind);
     if (!plan) return { status: 'no_final', record: rec };
     if (rec.sendonDone) return { status: 'done', record: rec };
+    // reconcile manual (POST /admin/reconcile): tira de needs_attention e zera as tentativas (rodada nova)
+    if (opts.manual && (rec.state === state.STATES.NEEDS_ATTENTION || rec.attempts)) {
+      rec = repo.upsert(id, state.reopenPatch(rec));
+    }
     if (!opts.force && !state.isDue(rec, now().getTime())) return { status: 'deferred', record: rec };
 
     // 1) PDF final -> nova versão no attachId
     if (plan.pdf && !rec.pdfDelivered) {
       if (!rec.attachId) return markAttention(id, 'acuerdo sin attachId: no hay carpeta destino para el PDF');
       const name = (rec.fileName || '').trim() || `node_${rec.nodeId}.pdf`;
+      let buf;
       try {
-        const buf = await adobe.downloadCombinedDocument(id);
-        await otcs.uploadToFolder(rec.attachId, buf, name);
+        buf = await adobe.downloadCombinedDocument(id);
       } catch (e) {
         return registerFailure(id, 'pdf', e);
+      }
+      try {
+        await otcs.uploadToFolder(rec.attachId, buf, name);
+      } catch (e) {
+        return registerFailure(id, 'pdf', e, { permanent: state.isPermanentHttpError(e) });
       }
       rec = repo.upsert(id, state.pdfDeliveredPatch(nowIso()));
       logger.info(`[${id}] PDF final enviado a la carpeta ${rec.attachId} del Content Server`);
@@ -119,7 +138,7 @@ function createReconciliationService({
         comment: `Documento ${disposition.toLowerCase()} via webhook`
       });
     } catch (e) {
-      return registerFailure(id, 'disposition', e);
+      return registerFailure(id, 'disposition', e, { permanent: state.isPermanentHttpError(e) });
     }
     clearTimeout_(id);
     rec = repo.upsert(id, state.completedPatch(plan, disposition, nowIso()));
@@ -228,12 +247,23 @@ function createReconciliationService({
 
   /*
     Aplica o estado do acordo consultado no Adobe (polling / reconcile manual).
-    Retorna o `kind` classificado.
+    Retorna o `kind` classificado, ou null se não deu para decidir (nada é gravado).
   */
-  function applyAdobeStatus(id, status) {
+  async function applyAdobeStatus(id, status) {
+    if (!repo.has(id)) return KINDS.UNKNOWN;
+    // CANCELLED: recusa ou recall? Só os eventos dizem. Se falhar, não finaliza (o próximo ciclo retenta)
+    let events;
+    if (isCancelledStatus(status)) {
+      try {
+        events = await adobe.getAgreementEvents(id);
+      } catch (e) {
+        logger.warn(`[${id}] no se pudo consultar los eventos del acuerdo en Adobe: ${describeError(e)}`);
+        return null;
+      }
+    }
     const rec = repo.get(id);
     if (!rec) return KINDS.UNKNOWN;
-    const kind = classifyAgreementStatus(status);
+    const kind = classifyAgreementStatus(status, events);
     const ts = nowIso();
     const patch = { adobeStatus: status, lastPolledAt: ts };
     if (isFinalKind(kind)) {
@@ -261,7 +291,7 @@ function createReconciliationService({
 
   async function handleStatus(id, status) {
     id = String(id);
-    const kind = applyAdobeStatus(id, status);
+    const kind = await applyAdobeStatus(id, status);
     if (isFinalKind(kind)) await reconcile(id, { force: false });
     return kind;
   }
@@ -272,7 +302,7 @@ function createReconciliationService({
   */
   async function runQueue() {
     const t = now().getTime();
-    const due = repo.list((r) => state.isRetryable(r, t));
+    const due = repo.listPending().filter((r) => state.isRetryable(r, t));
     const ids = [];
     for (const rec of due) {
       await reconcile(rec.id, { force: false });

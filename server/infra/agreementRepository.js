@@ -1,6 +1,6 @@
 // infra/agreementRepository.js
 // Repositório de acordos/eventos sobre SQLite (better-sqlite3, síncrono).
-// Interface usada pelos services: get, has, upsert, list, recordEvent, listEvents, findRecent,
+// Interface usada pelos services: get, has, upsert, list, listPending, listPollable, recordEvent, listEvents, findRecent,
 // countByState, transaction.
 
 // [chave JS, coluna SQL, tipo]
@@ -73,6 +73,14 @@ function createAgreementRepository(db, { now = () => new Date(), maxEvents = 50 
     ),
     list: db.prepare('SELECT * FROM agreements ORDER BY created_at, id'),
     listByState: db.prepare('SELECT * FROM agreements WHERE state = ? ORDER BY created_at, id'),
+    listPending: db.prepare(
+      `SELECT * FROM agreements WHERE final_kind IS NOT NULL AND sendon_done = 0 AND state != 'needs_attention'
+       ORDER BY created_at, id`
+    ),
+    listPollable: db.prepare(
+      `SELECT * FROM agreements WHERE final_kind IS NULL AND sendon_done = 0 AND state != 'needs_attention'
+       ORDER BY created_at, id`
+    ),
     recent: db.prepare('SELECT * FROM agreements WHERE node_id = ? AND created_at > ?'),
     countByState: db.prepare('SELECT state, COUNT(*) AS n FROM agreements GROUP BY state'),
     insertEvent: db.prepare(
@@ -142,6 +150,10 @@ function createAgreementRepository(db, { now = () => new Date(), maxEvents = 50 
       const records = rows.map(rowToRecord);
       return typeof filter === 'function' ? records.filter(filter) : records;
     },
+
+    // Com resultado final e trabalho pendente (runQueue) / ainda sem resultado final (polling); sem needs_attention
+    listPending: () => stmts.listPending.all().map(rowToRecord),
+    listPollable: () => stmts.listPollable.all().map(rowToRecord),
 
     /*
       Registra o evento (dedupe por notification_id) e, se não for duplicado, aplica o patch
