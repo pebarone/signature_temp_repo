@@ -53,6 +53,8 @@ data:
   SIGN_TASK_NAMES: "Aguardar Firma"
   # Tarefa de início (SendOn depois de criar o acordo; /start exige que esteja ativa), localizada pelo nome
   START_TASK_NAMES: "Enviar solicitud de firma"
+  # Rede de segurança do /start: nomes EXATOS das tarefas de envio procuradas na caixa do OTCS_USER (lista). Vazio = desligada (PROD: desligada por enquanto)
+  START_DISCOVERY_TASK_NAMES: ""
   # Horas até reabrir sozinho um needs_attention por "reintentos agotados" (0 = nunca)
   ATTENTION_RETRY_HOURS: "6"
   # Webhook de acordo desconhecido (banco perdido/deploy novo): adota se o externalId for nosso

@@ -152,6 +152,7 @@ function makeOtcs(calls = []) {
     formFields: {},          // rótulo -> { key, value } devolvido por getTaskForm
     updateFormFailures: 0,
     updateFormCalls: [],
+    assignments: [],         // caixa do usuário de integração (getAssignments): { workflowId, subworkflowId, taskId, name }
     addWorkflow(processId, { subprocessId = processId, stage = 'sign' } = {}) {
       const sub = Number(subprocessId);
       const status = {
@@ -214,6 +215,10 @@ function makeOtcs(calls = []) {
         });
       }
       return out;
+    },
+    async getAssignments() {
+      otcs.modelCalls.push(['getAssignments']);
+      return otcs.assignments.map((a) => ({ ...a }));
     },
     async getTaskForm(processId, subprocessId, taskId) {
       otcs.modelCalls.push(['getTaskForm', Number(processId), Number(subprocessId), Number(taskId)]);

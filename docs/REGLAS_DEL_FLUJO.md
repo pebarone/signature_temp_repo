@@ -70,6 +70,12 @@ fora da integração), `sign_subprocess_id`/`sign_task_id` (tarefa de firma reso
   - não encontrada / SendOn com erro → retry com backoff (o WebReport pode ainda estar ocupando a tarefa).
   - processo inexistente (404) → `needs_attention` permanente.
 - Registros com `start_sendon_done=0` e `workflow_id` entram em `listPending`, então o `runQueue`/poller os retoma após restart.
+- **Rede de segurança (descoberta; `START_DISCOVERY_TASK_NAMES`, desligada por padrão):** se a página não chama o `/start`
+  (fechou, falha de rede), o servidor lê a caixa do `OTCS_USER` (`GET /v2/members/assignments`, tarefas `type 153`) e procura
+  as tarefas cujo nome é **exatamente** um dos `START_DISCOVERY_TASK_NAMES` (sem prefixo; acentos e caixa não importam). A
+  tarefa precisa ficar visível por `START_DISCOVERY_GRACE_MS` antes da ação, que é o mesmo `/start` (com validação no OTCS).
+  Se ela sai da caixa e volta, a carência recomeça. Erro ⇒ nova tentativa só após `START_DISCOVERY_RETRY_MS`. Sucesso ou
+  acordo já aberto ⇒ não repete enquanto a tarefa estiver na caixa. Fica fora do poller, então vale com `POLL_ENABLED=false`.
 
 ### 4.2 verify
 Todo resultado final (webhook ou polling) é confirmado no Adobe por `GET /agreements/{id}` antes do PDF e da disposição:
@@ -187,3 +193,7 @@ incluídos nos formulários dessas tarefas:
 | `WEBHOOK_CLIENT_IDS` | vazio | ClientIds extras aceitos no webhook além do `CLIENT_ID` |
 | `WF_ATTRIBUTES_ENABLED` | `false` | grava dados do Adobe nos atributos do workflow |
 | `WF_ATTR_AGREEMENT_ID`, `WF_ATTR_STATUS`, `WF_ATTR_LAST_EVENT`, `WF_ATTR_UPDATED_AT`, `WF_ATTR_INTEGRATION_STATE` | ver seção 8 | rótulos dos atributos (vazio desliga) |
+| `START_DISCOVERY_TASK_NAMES` | vazio (desligada) | nomes exatos (lista) das tarefas de envio procuradas na caixa do `OTCS_USER` |
+| `START_DISCOVERY_GRACE_MS` | `120000` | tempo que a tarefa precisa ficar na caixa antes da ação |
+| `START_DISCOVERY_INTERVAL_MS` | `60000` | intervalo de leitura da caixa (mínimo 5000) |
+| `START_DISCOVERY_RETRY_MS` | `1800000` | espera após erro antes de nova tentativa |

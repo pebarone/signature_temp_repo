@@ -154,6 +154,34 @@ function createOtcsClient({
   });
 
   /*
+    Caixa do usuário de integração: GET /v2/members/assignments (sem paginação na spec). Cada item de results[] traz
+    data.assignments (objeto por item; aceita também array). Só tarefas de workflow (type 153) com workflow_id numérico.
+    Subprocesso ausente => o próprio workflow (no fluxo puro WORKID == SUBWORKID). => [{ workflowId, subworkflowId, taskId, name }]
+  */
+  const toId = (v) => (/^\d+$/.test(String(v ?? '').trim()) ? Number(v) : null);
+  const getAssignments = () => withTicket(async (tck) => {
+    const rsp = await http.get(`${base}/v2/members/assignments`, {
+      headers: { OTCSTicket: tck },
+      timeout: timeoutMs
+    });
+    const out = [];
+    for (const result of Array.isArray(rsp.data?.results) ? rsp.data.results : []) {
+      const raw = result?.data?.assignments;
+      for (const a of Array.isArray(raw) ? raw : [raw]) {
+        const workflowId = toId(a?.workflow_id);
+        if (Number(a?.type) !== 153 || workflowId === null) continue;
+        out.push({
+          workflowId,
+          subworkflowId: toId(a.workflow_subworkflow_id) ?? workflowId,
+          taskId: toId(a.workflow_subworkflow_task_id),
+          name: String(a.name ?? '')
+        });
+      }
+    }
+    return out;
+  });
+
+  /*
     Formulário de uma tarefa: GET /v1/forms/processes/tasks/update?process_id=&subprocess_id=&task_id=.
     => { title, customActions: [chaves das disposições], fields: { [rótulo do atributo]: { key, value } } }.
   */
@@ -196,7 +224,7 @@ function createOtcsClient({
   });
 
   return {
-    ensureTicket, downloadNode, uploadToFolder, addVersion, sendOnWorkflow, getProcessSteps, getTaskForm, updateTaskForm
+    ensureTicket, downloadNode, uploadToFolder, addVersion, sendOnWorkflow, getProcessSteps, getAssignments, getTaskForm, updateTaskForm
   };
 }
 
