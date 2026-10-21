@@ -29,19 +29,28 @@ function createOtcsClient({
     return inflight;
   }
 
-  async function downloadNode(nodeId, version = 1) {
+  // 401 (ticket expirado/revogado antes do validFor): descarta o ticket e repete a chamada uma vez com login novo
+  async function withTicket(fn) {
     const tck = await ensureTicket();
+    try {
+      return await fn(tck);
+    } catch (e) {
+      if (e.response?.status !== 401) throw e;
+      if (ticket === tck) { ticket = ''; expiresAt = 0; } // outro request pode já ter renovado
+      return fn(await ensureTicket());
+    }
+  }
+
+  const downloadNode = (nodeId, version = 1) => withTicket(async (tck) => {
     const rsp = await http.get(`${base}/v1/nodes/${nodeId}/versions/${version}/content`, {
       responseType: 'arraybuffer',
       headers: { OTCSTicket: tck },
       timeout: timeoutMs
     });
     return rsp.data; // Buffer com o PDF
-  }
+  });
 
-  async function uploadToFolder(folderId, buffer, fileName) {
-    const tck = await ensureTicket();
-
+  const uploadToFolder = (folderId, buffer, fileName) => withTicket(async (tck) => {
     // 1. Verifica se já existe um documento com mesmo nome na pasta
     const existing = await http.get(
       `${base}/v1/nodes/${folderId}/nodes?where_name=${encodeURIComponent(fileName)}`,
@@ -73,10 +82,9 @@ function createOtcsClient({
       maxBodyLength: Infinity
     });
     return rsp.data;
-  }
+  });
 
-  async function sendOnWorkflow({ workflowId, subworkflowId, taskId = 2, disposition = '', comment = '' }) {
-    const tck = await ensureTicket();
+  const sendOnWorkflow = ({ workflowId, subworkflowId, taskId = 2, disposition = '', comment = '' }) => withTicket(async (tck) => {
     const url = `${base}/v2/processes/${workflowId}/subprocesses/${subworkflowId}/tasks/${taskId}`;
 
     // Só um parâmetro: action OU custom_action (disposition)
@@ -89,7 +97,7 @@ function createOtcsClient({
       timeout: timeoutMs
     });
     return rsp.data;
-  }
+  });
 
   return { ensureTicket, downloadNode, uploadToFolder, sendOnWorkflow };
 }

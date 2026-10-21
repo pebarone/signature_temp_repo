@@ -2,7 +2,7 @@
 const fs = require('fs');
 const axios = require('axios');
 
-const { config, checkStorage } = require('./config');
+const { config, checkStorage, shouldKeepalive } = require('./config');
 const { createLogger } = require('./infra/logger');
 const { openDatabase } = require('./infra/db');
 const { createAgreementRepository } = require('./infra/agreementRepository');
@@ -29,6 +29,7 @@ function start() {
   const tokenStore = createTokenStore({ config, logger });
   const adobe = createAdobeClient({
     apiBase: config.adobeApiBase,
+    timeoutMs: config.adobeTimeoutMs,
     ensureToken: tokenStore.ensureToken,
     download: config.adobeDownload,
     logger
@@ -52,10 +53,10 @@ function start() {
 
   /*
     Keepalive / self-ping (Render): evita que o serviço hiberne.
-    Só em production; KEEPALIVE_INTERVAL_MS=0 desativa.
+    Só no Render (RENDER=true); KEEPALIVE_INTERVAL_MS=0 desativa.
   */
   let keepalive = null;
-  if (config.platform.isProduction && config.publicUrl && config.keepaliveMs > 0) {
+  if (shouldKeepalive(config)) {
     keepalive = setInterval(() => {
       axios.get(`${config.publicUrl}/health`, { timeout: 15000 })
         .then(() => console.log('[KEEPALIVE] Internal ping OK'))

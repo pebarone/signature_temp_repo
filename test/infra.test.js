@@ -5,6 +5,7 @@ const path = require('path');
 const { openDatabase, MIGRATIONS } = require('../server/infra/db');
 const { createAdobeClient } = require('../server/infra/adobeClient');
 const { createTokenStore } = require('../server/infra/tokenStore');
+const { createOtcsClient } = require('../server/infra/otcsClient');
 const { atomicWriteFileSync, describeError } = require('../server/infra/util');
 const { computeConfig } = require('../server/config');
 const { PDF, makeLogger, tmpDir, httpError } = require('./support/fakes');
@@ -165,4 +166,111 @@ test('tokenStore: login URL e troca de code', async () => {
   assert.equal(sent.body.get('code'), 'the-code');
   assert.equal(sent.body.get('grant_type'), 'authorization_code');
   assert.equal(JSON.parse(fs.readFileSync(config.tokensFile, 'utf8')).refresh_token, 'r');
+});
+
+test('tokenStore: refresh e exchangeCode usam timeout (ADOBE_TIMEOUT_MS, padrão 60000)', async () => {
+  assert.equal(tokenConfig(tmpDir()).adobeTimeoutMs, 60000);
+  assert.equal(computeConfig({ DATA_DIR: tmpDir(), ADOBE_TIMEOUT_MS: '15000' }).adobeTimeoutMs, 15000);
+
+  const timeouts = [];
+  const http = {
+    post: async (url, body, opts) => {
+      timeouts.push(opts.timeout);
+      return { data: { access_token: 'a', refresh_token: 'r', expires_in: 3600 } };
+    }
+  };
+  const store = createTokenStore({ config: tokenConfig(tmpDir(), { adobeTimeoutMs: 12345 }), logger: makeLogger(), http });
+  await store.exchangeCode('c');
+  store.setToken('old', -10, 'r');
+  await store.ensureToken(); // refresh
+  assert.deepEqual(timeouts, [12345, 12345]);
+});
+
+test('tokenStore: refresh rejeitado/travado (timeout) limpa o inflight e o próximo ensureToken tenta de novo', async () => {
+  const pending = [];
+  const http = {
+    post: () => new Promise((resolve, reject) => pending.push({ resolve, reject }))
+  };
+  const store = createTokenStore({ config: tokenConfig(tmpDir()), logger: makeLogger(), http });
+  store.setToken('old', -10, 'r1');
+
+  // chamadas concorrentes compartilham o mesmo refresh em curso
+  const a = store.ensureToken();
+  const b = store.ensureToken();
+  assert.equal(pending.length, 1);
+  const timeoutErr = Object.assign(new Error('timeout of 60000ms exceeded'), { code: 'ECONNABORTED' });
+  pending[0].reject(timeoutErr); // o axios rejeita quando o timeout estoura
+  await assert.rejects(a, /timeout/);
+  await assert.rejects(b, /timeout/);
+
+  // inflight limpo: nova chamada dispara outro refresh (não reaproveita a promise rejeitada)
+  const c = store.ensureToken();
+  assert.equal(pending.length, 2);
+  pending[1].resolve({ data: { access_token: 'fresh', expires_in: 3600 } });
+  assert.equal(await c, 'fresh');
+});
+
+/* ---------- OTCS: 401 => novo login e uma repetição ---------- */
+
+function otcsWith(handler) {
+  const seen = []; // [método, ticket usado]
+  let logins = 0;
+  const call = (method) => async (url, ...rest) => {
+    const opts = rest[rest.length - 1];
+    seen.push([method, opts.headers.OTCSTicket]);
+    return handler(method, url, opts.headers.OTCSTicket);
+  };
+  const http = {
+    post: async (url, body, opts) => {
+      if (url.endsWith('/v1/auth')) { logins++; return { data: { ticket: `t${logins}`, validFor: 1800 } }; }
+      seen.push(['post', opts.headers.OTCSTicket]);
+      return handler('post', url, opts.headers.OTCSTicket);
+    },
+    get: call('get'),
+    put: call('put')
+  };
+  const client = createOtcsClient({ base: 'https://otcs.invalid/api', user: 'u', pass: 'p', http, now: () => 1000 });
+  return { client, seen, logins: () => logins };
+}
+
+const unauthorizedFor = (stale) => (method, url, ticket) => {
+  if (ticket === stale) throw httpError(401, 'ticket expired');
+  if (method === 'get' && url.includes('/nodes?where_name=')) return { data: { data: [] } };
+  return { data: method === 'get' ? PDF : { ok: true } };
+};
+
+test('otcs: 401 no downloadNode descarta o ticket, refaz o login e repete uma vez', async () => {
+  const { client, seen, logins } = otcsWith(unauthorizedFor('t1'));
+  assert.equal(await client.ensureTicket(), 't1');
+  assert.deepEqual(await client.downloadNode(1001), PDF);
+  assert.deepEqual(seen, [['get', 't1'], ['get', 't2']]);
+  assert.equal(logins(), 2);
+  // o ticket novo fica em cache
+  await client.downloadNode(1001);
+  assert.equal(logins(), 2);
+});
+
+test('otcs: 401 no uploadToFolder e no sendOnWorkflow também repetem uma vez com login novo', async () => {
+  const up = otcsWith(unauthorizedFor('t1'));
+  await up.client.ensureTicket();
+  assert.deepEqual(await up.client.uploadToFolder(2002, PDF, 'a.pdf'), { ok: true });
+  assert.deepEqual(up.seen, [['get', 't1'], ['get', 't2'], ['post', 't2']]);
+
+  const so = otcsWith(unauthorizedFor('t1'));
+  await so.client.ensureTicket();
+  assert.deepEqual(await so.client.sendOnWorkflow({ workflowId: 1, subworkflowId: 1, disposition: 'Firmado' }), { ok: true });
+  assert.deepEqual(so.seen, [['put', 't1'], ['put', 't2']]);
+  assert.equal(so.logins(), 2);
+});
+
+test('otcs: só repete uma vez (401 persistente propaga) e outros erros não repetem nem refazem o login', async () => {
+  const always401 = otcsWith(() => { throw httpError(401, 'nope'); });
+  await assert.rejects(() => always401.client.downloadNode(1), (e) => e.response.status === 401);
+  assert.equal(always401.seen.length, 2);
+  assert.equal(always401.logins(), 2);
+
+  const e500 = otcsWith(() => { throw httpError(500, 'boom'); });
+  await assert.rejects(() => e500.client.sendOnWorkflow({ workflowId: 1, subworkflowId: 1 }), (e) => e.response.status === 500);
+  assert.equal(e500.seen.length, 1);
+  assert.equal(e500.logins(), 1);
 });

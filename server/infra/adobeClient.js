@@ -17,6 +17,7 @@ function createAdobeClient({
   http = require('axios'),
   sleep = defaultSleep,
   download = {},
+  timeoutMs = REQUEST_TIMEOUT_MS,
   logger
 }) {
   const attempts = Math.max(1, download.attempts ?? 8);
@@ -32,7 +33,7 @@ function createAdobeClient({
     const rsp = await http.post(`${rest}/transientDocuments`, fd, {
       headers: await authHeaders(fd.getHeaders()),
       maxBodyLength: Infinity,
-      timeout: REQUEST_TIMEOUT_MS
+      timeout: timeoutMs
     });
     return rsp.data.transientDocumentId;
   }
@@ -44,14 +45,14 @@ function createAdobeClient({
       participantSetsInfo: emails.map((email) => ({ role: 'SIGNER', order: 1, memberInfos: [{ email }] })),
       signatureType: 'ESIGN',
       state: 'IN_PROCESS'
-    }, { headers: await authHeaders(), timeout: REQUEST_TIMEOUT_MS });
+    }, { headers: await authHeaders(), timeout: timeoutMs });
     return rsp.data; // { id }
   }
 
   async function getAgreement(id) {
     const rsp = await http.get(`${rest}/agreements/${encodeURIComponent(id)}`, {
       headers: await authHeaders(),
-      timeout: REQUEST_TIMEOUT_MS
+      timeout: timeoutMs
     });
     return rsp.data;
   }
@@ -60,7 +61,7 @@ function createAdobeClient({
   async function getAgreementEvents(id) {
     const rsp = await http.get(`${rest}/agreements/${encodeURIComponent(id)}/events`, {
       headers: await authHeaders(),
-      timeout: REQUEST_TIMEOUT_MS
+      timeout: timeoutMs
     });
     return rsp.data?.events || [];
   }
@@ -77,7 +78,7 @@ function createAdobeClient({
           responseType: 'arraybuffer',
           headers: await authHeaders(),
           maxContentLength: MAX_PDF_BYTES,
-          timeout: REQUEST_TIMEOUT_MS
+          timeout: timeoutMs
         });
         const buf = Buffer.from(rsp.data);
         if (!buf.length || buf.subarray(0, 5).toString('latin1') !== '%PDF-') {

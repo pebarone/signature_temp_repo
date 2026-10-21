@@ -9,6 +9,7 @@ const { atomicWriteFileSync, describeError } = require('./util');
 */
 function createTokenStore({ config, logger, http = require('axios'), now = () => Date.now() }) {
   const file = config.tokensFile;
+  const timeout = config.adobeTimeoutMs ?? 60 * 1000;
   let tok = { access_token: '', refresh_token: '', expires_at: 0 };
   let inflight = null;
 
@@ -66,7 +67,7 @@ function createTokenStore({ config, logger, http = require('axios'), now = () =>
           client_secret: config.clientSecret,
           refresh_token: tok.refresh_token
         }),
-        { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
+        { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, timeout }
       );
       setToken(rsp.data.access_token, rsp.data.expires_in, rsp.data.refresh_token);
       return tok.access_token;
@@ -96,7 +97,7 @@ function createTokenStore({ config, logger, http = require('axios'), now = () =>
         client_secret: config.clientSecret,
         redirect_uri: config.redirectUri
       }),
-      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
+      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, timeout }
     );
     setToken(r.data.access_token, r.data.expires_in, r.data.refresh_token);
   }

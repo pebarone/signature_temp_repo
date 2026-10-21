@@ -91,6 +91,7 @@ function computeConfig(env = process.env, { projectRoot = PROJECT_ROOT } = {}) {
     adobeApiBase: noSlash(str(env.ADOBE_API_BASE, 'https://api.eu1.adobesign.com')),
     adobeAuthBase: noSlash(str(env.ADOBE_AUTH_BASE, 'https://secure.eu1.adobesign.com')),
     adobeRefreshToken: str(env.ADOBE_REFRESH_TOKEN),
+    adobeTimeoutMs: Math.max(1000, int(env.ADOBE_TIMEOUT_MS, 60 * 1000)),
     adobeDownload: {
       attempts: Math.max(1, int(env.ADOBE_DOWNLOAD_ATTEMPTS, 8)),
       delayMs: int(env.ADOBE_DOWNLOAD_RETRY_DELAY_MS, 3000),
@@ -136,6 +137,10 @@ function computeConfig(env = process.env, { projectRoot = PROJECT_ROOT } = {}) {
   };
 }
 
+// Self-ping só no Render (evita hibernar); precisa de PUBLIC_URL e KEEPALIVE_INTERVAL_MS > 0
+const shouldKeepalive = (config) =>
+  !!(config.platform.isRender && config.publicUrl && config.keepaliveMs > 0);
+
 /*
   Valida o storage no startup: loga o erro e, se REQUIRE_PERSISTENT_STORAGE=true, encerra o processo.
 */
@@ -165,6 +170,7 @@ function getConfig() {
 
 module.exports = {
   computeConfig,
+  shouldKeepalive,
   checkStorage,
   getConfig,
   get config() { return getConfig(); },

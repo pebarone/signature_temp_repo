@@ -1,7 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const path = require('path');
-const { computeConfig, checkStorage, TMP_DATA_DIR } = require('../server/config');
+const { computeConfig, checkStorage, shouldKeepalive, TMP_DATA_DIR } = require('../server/config');
 const { makeLogger } = require('./support/fakes');
 
 const ROOT = '/srv/app';
@@ -123,4 +123,25 @@ test('config: padrões de polling, retenção e região Adobe', () => {
   assert.equal(c2.poll.intervalMs, 5000);
   assert.equal(c2.logRetentionDays, 7);
   assert.equal(c2.adobeApiBase, 'https://api.na4.adobesign.com');
+});
+
+test('keepalive: só no Render (RENDER=true) com PUBLIC_URL e KEEPALIVE_INTERVAL_MS > 0', () => {
+  const on = { RENDER: 'true', PUBLIC_URL: 'https://app.example' };
+  assert.equal(shouldKeepalive(cfg(on)), true);
+  assert.equal(shouldKeepalive(cfg({ ...on, NODE_ENV: 'production' })), true);
+  assert.equal(shouldKeepalive(cfg({ NODE_ENV: 'production', PUBLIC_URL: 'https://app.example' })), false, 'production fora do Render');
+  assert.equal(shouldKeepalive(cfg({ KUBERNETES_SERVICE_HOST: '10.0.0.1', NODE_ENV: 'production', PUBLIC_URL: 'https://app.example' })), false);
+  assert.equal(shouldKeepalive(cfg({ RENDER: 'true' })), false, 'sem PUBLIC_URL');
+  assert.equal(shouldKeepalive(cfg({ ...on, KEEPALIVE_INTERVAL_MS: '0' })), false);
+  assert.equal(cfg({}).keepaliveMs, 10 * 60 * 1000);
+});
+
+test('config: ADOBE_TIMEOUT_MS e RETRY_MAX_ATTEMPTS (padrões e limites)', () => {
+  assert.equal(cfg({}).adobeTimeoutMs, 60000);
+  assert.equal(cfg({ ADOBE_TIMEOUT_MS: '20000' }).adobeTimeoutMs, 20000);
+  assert.equal(cfg({ ADOBE_TIMEOUT_MS: '5' }).adobeTimeoutMs, 1000, 'mínimo de 1 s (mesma regra do OTCS_TIMEOUT_MS)');
+  assert.equal(cfg({}).backoff.maxAttempts, 10);
+  assert.equal(cfg({ RETRY_MAX_ATTEMPTS: '0' }).backoff.maxAttempts, 0);
+  assert.equal(cfg({ RETRY_MAX_ATTEMPTS: '3' }).backoff.maxAttempts, 3);
+  assert.equal(cfg({ RETRY_MAX_ATTEMPTS: 'x' }).backoff.maxAttempts, 10);
 });
