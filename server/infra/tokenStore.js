@@ -77,13 +77,14 @@ function createTokenStore({ config, logger, http = require('axios'), now = () =>
     }
   }
 
-  // URL de consentimento OAuth (scopes separados por "+", formato aceito pelo Adobe)
-  function buildLoginUrl() {
+  // URL de consentimento OAuth (scopes separados por "+", formato aceito pelo Adobe); `state` anti-CSRF
+  function buildLoginUrl(state) {
     return `${config.adobeAuthBase}/public/oauth/v2?` +
       'response_type=code' +
       `&client_id=${encodeURIComponent(config.clientId)}` +
       `&redirect_uri=${encodeURIComponent(config.redirectUri)}` +
-      `&scope=${(config.adobeScopes || []).join('+')}`;
+      `&scope=${(config.adobeScopes || []).join('+')}` +
+      (state ? `&state=${encodeURIComponent(state)}` : '');
   }
 
   // Troca o code do callback por access/refresh token e persiste

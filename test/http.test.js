@@ -257,8 +257,78 @@ test('/start: validações de entrada, login requerido e erro do Adobe', async (
   world.adobe.createAgreement = async () => { throw new Error('adobe is down'); };
   r = await post(world, '/start', startBody(world));
   assert.equal(r.status, 500);
-  assert.match((await r.json()).error, /adobe is down/);
+  assert.deepEqual(await r.json(), { error: 'Error al solicitar la firma.' });
+  assert.ok(world.logger.has('error', /\[START ERROR\].*adobe is down/), 'detalhe fica só no log');
   assert.equal(world.repo.list().length, 0);
+  await world.close();
+});
+
+test('/start: corpo de erro do Adobe/OTCS não vaza para o navegador (500 genérico, detalhes no log)', async () => {
+  const world = await buildWorld({ listen: true });
+  const leaky = (msg) => {
+    const e = new Error('Request failed with status code 502');
+    e.response = { status: 502, data: Buffer.from(msg) };
+    return e;
+  };
+  world.otcs.downloadNode = async () => { throw leaky('OTCS internal: host=10.1.2.3 secret=abc'); };
+  let r = await post(world, '/start', startBody(world));
+  assert.equal(r.status, 500);
+  let text = await r.text();
+  assert.deepEqual(JSON.parse(text), { error: 'Error al solicitar la firma.' });
+  assert.doesNotMatch(text, /10\.1\.2\.3|secret/);
+  assert.ok(world.logger.has('error', /\[START ERROR\].*HTTP 502.*host=10\.1\.2\.3/));
+
+  world.adobe.createTransientDocument = async () => {
+    const e = new Error('boom');
+    e.response = { status: 400, data: { code: 'INVALID_X', message: 'Adobe says: private detail' } };
+    throw e;
+  };
+  world.otcs.downloadNode = async () => Buffer.from('%PDF-1.4');
+  r = await post(world, '/start', startBody(world));
+  assert.equal(r.status, 500);
+  text = await r.text();
+  assert.deepEqual(JSON.parse(text), { error: 'Error al solicitar la firma.' });
+  assert.doesNotMatch(text, /private detail|INVALID_X/);
+  assert.ok(world.logger.has('error', /private detail/));
+  await world.close();
+});
+
+test('/start: duas requisições concorrentes iguais => só uma cria o acordo, a outra recebe o mesmo 409', async () => {
+  const world = await buildWorld();
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const download = world.otcs.downloadNode;
+  world.otcs.downloadNode = async (id) => { await gate; return download(id); };
+
+  const first = world.signatureService.start(startBody(world));
+  // mesma chave com e-mails em outra ordem: ainda é a mesma requisição
+  const second = world.signatureService.start(startBody(world, { userEmail1: 'two@example.com', userEmail2: 'one@example.com' }));
+  await assert.rejects(second, (e) => e.status === 409 && /ya he sido enviado recientemente/.test(e.body.error));
+  assert.equal(world.otcs.downloads.length, 0, 'a segunda nem chegou ao OTCS');
+
+  // outro documento ou outros destinatários não são bloqueados
+  const other = world.signatureService.start(startBody(world, { nodeId: 2002, userEmail2: 'other@example.com' }));
+  release();
+  const [a, b] = await Promise.all([first, other]);
+  assert.notEqual(a.id, b.id);
+  assert.equal(world.adobe.created.length, 2);
+  await Promise.all([a.sendOn, b.sendOn]);
+
+  // depois de concluída, a chave foi liberada e quem barra é o findRecent (mesmo 409)
+  await assert.rejects(world.signatureService.start(startBody(world)), (e) => e.status === 409);
+  await world.close();
+});
+
+test('/start: a chave em andamento é liberada em caso de erro (nova tentativa é permitida)', async () => {
+  const world = await buildWorld();
+  const download = world.otcs.downloadNode;
+  world.otcs.downloadNode = async () => { throw new Error('otcs down'); };
+  await assert.rejects(world.signatureService.start(startBody(world)), (e) => e.status === 500);
+
+  world.otcs.downloadNode = download;
+  const ok = await world.signatureService.start(startBody(world));
+  assert.ok(ok.id);
+  await ok.sendOn;
   await world.close();
 });
 
@@ -339,21 +409,61 @@ test('admin: reconcile manual consulta o Adobe quando ainda não há resultado f
   await world.close();
 });
 
-test('OAuth: /admin/login redireciona e /admin/callback troca o code', async () => {
+// Faz o login (Basic Auth) e devolve o state que foi para a URL do Adobe
+async function oauthLogin(world) {
+  const r = await fetch(`${world.baseUrl}/admin/login`, { redirect: 'manual', headers: ADMIN });
+  assert.equal(r.status, 302);
+  const url = new URL(r.headers.get('location'));
+  assert.match(url.origin + url.pathname, /^https:\/\/adobe\.invalid\/public\/oauth\/v2$/);
+  return url.searchParams.get('state');
+}
+
+test('OAuth: /admin/login exige Basic Auth, redireciona com state aleatório e /admin/callback troca o code', async () => {
   const world = await buildWorld({ listen: true });
   let r = await fetch(`${world.baseUrl}/admin/login`, { redirect: 'manual' });
-  assert.equal(r.status, 302);
-  assert.match(r.headers.get('location'), /^https:\/\/adobe\.invalid\/public\/oauth\/v2/);
+  assert.equal(r.status, 401);
+  assert.equal(r.headers.get('location'), null);
 
-  r = await fetch(`${world.baseUrl}/admin/callback?code=abc`);
+  const state = await oauthLogin(world);
+  assert.match(state, /^[0-9a-f]{48}$/);
+  assert.notEqual(await oauthLogin(world), state, 'um state novo a cada login');
+
+  // o callback segue sem Basic Auth (é o redirect do Adobe)
+  r = await fetch(`${world.baseUrl}/admin/callback?code=abc&state=${state}`);
   assert.equal(r.status, 200);
   assert.match(await r.text(), /Token saved/);
   assert.deepEqual(world.tokenStore.exchanged, ['abc']);
 
-  r = await fetch(`${world.baseUrl}/admin/callback?code=bad`);
+  r = await fetch(`${world.baseUrl}/admin/callback?code=bad&state=${await oauthLogin(world)}`);
   assert.equal(r.status, 500);
-  r = await fetch(`${world.baseUrl}/admin/callback`);
+  r = await fetch(`${world.baseUrl}/admin/callback?state=${await oauthLogin(world)}`);
   assert.equal(r.status, 400);
+  await world.close();
+});
+
+test('OAuth: callback sem state, com state desconhecido, reutilizado ou expirado => 400 sem trocar o code', async () => {
+  const world = await buildWorld({ listen: true });
+  const cb = async (qs) => (await fetch(`${world.baseUrl}/admin/callback?${qs}`)).status;
+
+  assert.equal(await cb('code=abc'), 400, 'sem state');
+  assert.equal(await cb('code=abc&state='), 400, 'state vazio');
+  assert.equal(await cb('code=abc&state=nao-emitido'), 400, 'state desconhecido');
+  assert.equal(await cb('code=abc&state=a&state=b'), 400, 'state repetido (array)');
+
+  const used = await oauthLogin(world);
+  assert.equal(await cb(`code=abc&state=${used}`), 200);
+  assert.equal(await cb(`code=abc&state=${used}`), 400, 'uso único');
+
+  const old = await oauthLogin(world);
+  world.clock.advance(10 * 60 * 1000 + 1); // TTL de 10 min (relógio injetado, sem sleep)
+  assert.equal(await cb(`code=abc&state=${old}`), 400, 'expirado');
+
+  const fresh = await oauthLogin(world);
+  world.clock.advance(9 * 60 * 1000);
+  assert.equal(await cb(`code=abc&state=${fresh}`), 200, 'dentro do TTL');
+
+  assert.deepEqual(world.tokenStore.exchanged, ['abc', 'abc'], 'o code só foi trocado com state válido');
+  assert.ok(world.logger.has('warn', /OAuth callback rejeitado/));
   await world.close();
 });
 

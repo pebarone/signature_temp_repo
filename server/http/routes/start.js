@@ -2,8 +2,8 @@
 // /auth (timestamp+HMAC para o front, protegido por Basic Auth) e POST /start (protegido por HMAC).
 const express = require('express');
 const { sign } = require('../middleware/hmac');
-const { ServiceError } = require('../../services/signatureService');
-const { oneLine } = require('../../infra/util');
+const { ServiceError, START_ERROR_MESSAGE } = require('../../services/signatureService');
+const { oneLine, describeError } = require('../../infra/util');
 
 function startRoutes({ config, logger, signatureService, basicAuth, verifySignature, now = () => Date.now() }) {
   const router = express.Router();
@@ -35,8 +35,8 @@ function startRoutes({ config, logger, signatureService, basicAuth, verifySignat
       res.json({ message: `Signature requested. ID: ${id}`, id });
     } catch (e) {
       if (e instanceof ServiceError) return res.status(e.status).json(e.body);
-      logger.error(`[START ERROR] ${e.message}`);
-      res.status(500).json({ error: e.message });
+      logger.error(`[START ERROR] ${describeError(e)}`);
+      res.status(500).json({ error: START_ERROR_MESSAGE });
     }
   });
 

@@ -33,7 +33,7 @@ function createApp({ config, logger, repo, reconciliation, signatureService, tok
 
   app.use(webhookRoutes({ config, logger, reconciliation }));
   app.use(startRoutes({ config, logger, signatureService, basicAuth, verifySignature, now }));
-  app.use(adminRoutes({ config, logger, repo, reconciliation, tokenStore, basicAuth }));
+  app.use(adminRoutes({ config, logger, repo, reconciliation, tokenStore, basicAuth, now }));
   app.use(logsRoutes({ logger, basicAuth }));
 
   // Endpoint desconhecido

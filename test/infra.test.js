@@ -157,10 +157,11 @@ test('tokenStore: login URL e troca de code', async () => {
     config, logger: makeLogger(),
     http: { post: async (url, body) => { sent = { url, body: new URLSearchParams(body) }; return { data: { access_token: 'a', refresh_token: 'r', expires_in: 60 } }; } }
   });
-  const url = store.buildLoginUrl();
+  const url = store.buildLoginUrl('st ate/1');
   assert.match(url, /^https:\/\/secure\.eu1\.adobesign\.com\/public\/oauth\/v2\?response_type=code&client_id=cid/);
   assert.match(url, /redirect_uri=https%3A%2F%2Fpublic\.invalid%2Fadmin%2Fcallback/);
   assert.match(url, /scope=agreement_send:account\+agreement_write:account/);
+  assert.match(url, /&state=st%20ate%2F1$/);
 
   await store.exchangeCode('the-code');
   assert.equal(sent.body.get('code'), 'the-code');

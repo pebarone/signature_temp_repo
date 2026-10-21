@@ -1,21 +1,43 @@
 // http/routes/admin.js
 // OAuth do Adobe (login/callback) e endpoints administrativos de reconciliação (Basic Auth).
+const crypto = require('crypto');
 const express = require('express');
 const { describeError } = require('../../infra/util');
 
-function adminRoutes({ config, logger, repo, reconciliation, tokenStore, basicAuth }) {
+const OAUTH_STATE_TTL_MS = 10 * 60 * 1000;
+
+function adminRoutes({ config, logger, repo, reconciliation, tokenStore, basicAuth, now = () => Date.now() }) {
   const router = express.Router();
 
-  // Login com Adobe Sign: redireciona para a página de consentimento
-  router.get('/admin/login', (_, res) => {
-    const url = tokenStore.buildLoginUrl();
+  // `state` do OAuth (anti-CSRF): em memória, uso único, expira em 10 min
+  const oauthStates = new Map(); // state -> expiração (ms)
+  function issueState() {
+    const t = now();
+    for (const [s, exp] of oauthStates) if (exp <= t) oauthStates.delete(s);
+    const state = crypto.randomBytes(24).toString('hex');
+    oauthStates.set(state, t + OAUTH_STATE_TTL_MS);
+    return state;
+  }
+  function consumeState(state) {
+    const exp = typeof state === 'string' ? oauthStates.get(state) : undefined;
+    oauthStates.delete(state);
+    return exp !== undefined && exp > now();
+  }
+
+  // Login com Adobe Sign: redireciona para a página de consentimento (protegido: só quem administra inicia)
+  router.get('/admin/login', basicAuth, (_, res) => {
+    const url = tokenStore.buildLoginUrl(issueState());
     logger.info('Adobe OAuth login iniciado');
     res.redirect(url);
   });
 
-  // Callback OAuth2: troca o code por tokens e salva
+  // Callback OAuth2 (redirect do Adobe, sem Basic Auth): valida o state, troca o code por tokens e salva
   router.get('/admin/callback', async (req, res) => {
-    const { code } = req.query;
+    const { code, state } = req.query;
+    if (!consumeState(state)) {
+      logger.warn('OAuth callback rejeitado: state ausente, desconhecido ou expirado');
+      return res.status(400).send('<pre>Invalid state</pre>');
+    }
     if (!code) return res.status(400).send('<pre>Missing code</pre>');
     try {
       await tokenStore.exchangeCode(String(code));

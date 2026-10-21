@@ -139,7 +139,7 @@ function makeOtcs(calls = []) {
 function makeTokenStore() {
   return {
     exchanged: [],
-    buildLoginUrl: () => 'https://adobe.invalid/public/oauth/v2?client_id=cid',
+    buildLoginUrl: (state) => `https://adobe.invalid/public/oauth/v2?client_id=cid&state=${state}`,
     async exchangeCode(code) {
       if (code === 'bad') throw new Error('invalid_grant');
       this.exchanged.push(code);
