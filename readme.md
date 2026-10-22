@@ -121,6 +121,7 @@ CANCEL_TASK_NAMES=Cancelar Flujo de Firma         # task of the cancellation wor
 CANCEL_FIELD_TARGET_WORKFLOW=ID Flujo a Cancelar  # label of the task form attribute with the ID of the flow to cancel (mandatory, numeric)
 CANCEL_FIELD_TARGET_SUBWORKFLOW=ID Subflujo a Cancelar  # label of the optional attribute with its sub-process (numeric)
 CANCEL_NOTIFY_SIGNERS=false           # true => Adobe notifies the signers of the cancellation (notifyOthers)
+CANCEL_SETTLE_TIMEOUT_MS=20000        # max wait (ms, min 1000) for a reconciliation already running on the agreement before cancelling; timeout => 503 RECONCILE_IN_PROGRESS
 
 # Storage (see below)
 DATA_DIR=                             # explicit data directory (OpenShift: the PVC mount, e.g. /data)
@@ -263,7 +264,9 @@ wrong step; `422` missing/invalid target attribute; `503` Adobe or OTCS unavaila
 (agreement cancelled, task not sent on: repeating is safe). Error bodies are `{ error, code, ... }`.
 
 Rules: the open agreement is looked up by `workflowId` (and the exact `subworkflowId`, if given) — never the agreement of
-another sub-process; the Adobe state is checked first (`CANCELLED`/`ABORTED` => idempotent, no new cancellation; `SIGNED` or
+another sub-process; a reconciliation already running on the agreement is awaited first (`CANCEL_SETTLE_TIMEOUT_MS`, else `503 RECONCILE_IN_PROGRESS`);
+the Adobe state is checked next (`CANCELLED`/`ABORTED` => idempotent, no new cancellation, except `CANCELLED` caused by a signer's
+rejection, which is `409 ALREADY_REJECTED` with the record untouched so the pipeline still delivers the `Rechazado`; `SIGNED` or
 other final state => `409`); a failure from Adobe is transient and marks nothing. After a confirmed cancellation the agreement
 is closed (`state=cancelled`, `sendon_done`, `cancel_requested_at`/`cancel_source`, event `CANCEL_REQUESTED`), so the
 `AGREEMENT_RECALLED` that Adobe sends next (webhook, polling or retry queue) **does not** produce a `Rechazado` on the original
@@ -330,7 +333,7 @@ it does not provide an atomic lock against other processes writing the same node
   and closes it without a disposition on the original flow. Idempotent: an agreement already `CANCELLED` on Adobe is not
   cancelled again; `SIGNED` or another final state => `409`; Adobe failure => `503` and nothing is marked (if the cancel call fails
   the agreement is read again: `CANCELLED`/`ABORTED` means Adobe applied it and only the response was lost, so it counts as
-  confirmed); unknown agreement => `404` with a hint to adopt it. Works regardless of `CANCEL_ENABLED`.
+  confirmed); `CANCELLED` because a signer rejected => `409 ALREADY_REJECTED` (record untouched; contract change: a rejected agreement whose `Rechazado` the pipeline already delivered used to answer `200 alreadyCancelled`); unknown agreement => `404` with a hint to adopt it. Works regardless of `CANCEL_ENABLED`.
 - `POST /admin/cancel-workflow/:workflowId` — same for the open agreement of a flow. Optional JSON `{ "subworkflowId", "comment" }`;
   several open agreements without `subworkflowId` => `409` `AMBIGUOUS` with the list and nothing is cancelled; none => `404`.
 - **Both `/admin/cancel*` routes leave the Content Server flow untouched.** They cancel on Adobe and close the agreement without a

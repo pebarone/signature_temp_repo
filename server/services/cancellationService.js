@@ -11,9 +11,11 @@ const { describeError } = require('../infra/util');
 const { locate } = require('../domain/workflowSteps');
 const { CANCEL_STATES, TARGET, classifyCancelState, selectCancelTarget } = require('../domain/cancellation');
 const { cancelRequestedPatch } = require('../domain/agreementState');
+const { KINDS, classifyAgreementStatus } = require('../domain/eventPolicy');
 const { ServiceError, fieldValue } = require('./signatureService');
 
 const MAX_COMMENT_LENGTH = 500;
+const DEFAULT_SETTLE_TIMEOUT_MS = 20000;
 const DEFAULT_COMMENT = 'Flujo cancelado desde Content Server.';
 const CANCEL_ERROR_MESSAGE = 'Error al cancelar el flujo.';
 const sendOnComment = (agreementId) => `Cancelación confirmada en Adobe Sign (acuerdo ${agreementId})`;
@@ -27,6 +29,8 @@ const adobeUnavailable = () =>
   fail(503, 'Adobe Sign no disponible; intente nuevamente.', { code: 'ADOBE_UNAVAILABLE' });
 const otcsUnavailable = () =>
   fail(503, 'Content Server no disponible; intente nuevamente.', { code: 'OTCS_UNAVAILABLE' });
+const reconcileInProgress = () =>
+  fail(503, 'Hay una reconciliación en curso para este acuerdo; intente nuevamente.', { code: 'RECONCILE_IN_PROGRESS' });
 const flowNotFound = () => fail(409, 'Flujo no encontrado.', { code: 'FLOW_NOT_FOUND' });
 const notRegistered = (id) => fail(404, `Acuerdo ${id} no registrado en el orquestador.`, {
   code: 'AGREEMENT_NOT_FOUND',
@@ -46,8 +50,12 @@ const summary = (r) => ({
 /*
   hold(id) -> release: reconciliation.hold. Enquanto o cancelamento de um acordo está em curso, a reconciliação desse
   acordo fica em espera (o AGREEMENT_RECALLED pode chegar antes de o acordo ser marcado como encerrado).
+  settle(id) -> Promise: reconciliation.settle. Resolve quando termina a reconciliação do acordo que já estava em curso
+  (ela passou da checagem do hold e poderia adotar o RECALLED do nosso próprio cancelamento); nunca rejeita.
 */
-function createCancellationService({ repo, adobe, otcs, logger, config, now = () => new Date(), hold = () => () => {} }) {
+function createCancellationService({
+  repo, adobe, otcs, logger, config, now = () => new Date(), hold = () => () => {}, settle = async () => {}
+}) {
   const inflight = new Set(); // acordos com cancelamento em curso (anti-corrida de dois pedidos iguais)
 
   // Marca o acordo como encerrado por pedido de cancelamento, junto com o evento no histórico (mesma transação).
@@ -79,6 +87,48 @@ function createCancellationService({ repo, adobe, otcs, logger, config, now = ()
     }
   }
 
+  // Espera a reconciliação em curso do acordo, no máximo cancel.settleTimeoutMs. false = estourou o prazo.
+  async function waitSettled(id) {
+    const limit = Number(config.cancel?.settleTimeoutMs) || DEFAULT_SETTLE_TIMEOUT_MS;
+    let timer;
+    const timeout = new Promise((resolve) => { timer = setTimeout(() => resolve(false), limit); });
+    try {
+      return await Promise.race([Promise.resolve(settle(id)).then(() => true, () => true), timeout]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /*
+    No Adobe v6 a recusa de um signatário também deixa o acordo CANCELLED; só o histórico distingue. Uma recusa não é
+    "já cancelado": o pipeline ainda precisa entregar o Rechazado ao fluxo original, então o pedido é recusado e o
+    registro fica intacto. Repetição de um cancelamento nosso (cancelRequestedAt gravado) não consulta o histórico.
+    Sem ler o histórico não dá para decidir: 503 transitório, nada marcado (caminho inicial, antes de qualquer PUT nosso).
+    afterPutError: o CANCELLED veio da reconsulta depois de um PUT nosso que falhou; o mais provável é que o NOSSO PUT
+    tenha sido aplicado (resposta perdida). Devolver 503 reabriria o eco (o RECALLED depois do release do hold geraria
+    Rechazado), então, com o histórico ilegível, vale a cancelação própria, salvo recusa já gravada no registro (webhook).
+  */
+  async function assertNotRejected(id, status, { afterPutError = false } = {}) {
+    if (status !== 'CANCELLED' || repo.get(id)?.cancelRequestedAt) return;
+    const rejected = () => {
+      logger.warn(`[${id}] cancelación: el acuerdo fue rechazado por un firmante; no se cancela y el pipeline entrega el Rechazado`);
+      return fail(409, 'El acuerdo fue rechazado por un firmante en Adobe Sign; no se puede cancelar.', {
+        code: 'ALREADY_REJECTED', agreementId: id, adobeStatus: status
+      });
+    };
+    let events;
+    try {
+      events = await adobe.getAgreementEvents(id);
+    } catch (e) {
+      logger.error(`[${id}] cancelación: no se pudo consultar el historial del acuerdo en Adobe: ${describeError(e)}`);
+      if (!afterPutError) throw adobeUnavailable();
+      if (repo.get(id)?.finalKind === KINDS.FINAL_REJECTED) throw rejected();
+      logger.warn(`[${id}] cancelación: historial no legible; se asume la cancelación propia (el PUT pudo aplicarse con la respuesta perdida)`);
+      return;
+    }
+    if (classifyAgreementStatus(status, events) === KINDS.FINAL_REJECTED) throw rejected();
+  }
+
   async function runCancel(id, { comment, source }) {
     let status;
     try {
@@ -105,6 +155,7 @@ function createCancellationService({ repo, adobe, otcs, logger, config, now = ()
 
     // Idempotente: já cancelado no Adobe (inclusive por uma chamada anterior cuja resposta se perdeu)
     const alreadyCancelled = verdict === CANCEL_STATES.ALREADY_CANCELLED;
+    if (alreadyCancelled) await assertNotRejected(id, status);
     let adobeStatus = alreadyCancelled ? status : 'CANCELLED';
     if (!alreadyCancelled) {
       try {
@@ -115,6 +166,7 @@ function createCancellationService({ repo, adobe, otcs, logger, config, now = ()
         // Sem a confirmação (reconsulta falha ou estado diferente) é transitório: nada é marcado; repetir reconsulta o estado.
         const confirmed = await cancelledAfterError(id);
         if (!confirmed) throw adobeUnavailable();
+        await assertNotRejected(id, confirmed, { afterPutError: true }); // o signatário pode ter recusado entre a consulta e o PUT
         adobeStatus = confirmed;
         logger.warn(
           `[${id}] cancelación: la respuesta de Adobe se perdió, pero Adobe confirma la cancelación (estado ${confirmed}); `
@@ -142,8 +194,11 @@ function createCancellationService({ repo, adobe, otcs, logger, config, now = ()
   /*
     Cancela UM acordo conhecido pelo orquestrador. Antes de pedir ao Adobe, consulta o estado:
       - em andamento: pede o cancelamento (falha do Adobe => 503 e nada é marcado);
-      - já CANCELLED/ABORTED: idempotente, não chama o cancelamento (e fecha o registro, se ainda aberto);
+      - já CANCELLED (recall)/ABORTED: idempotente, não chama o cancelamento (e fecha o registro, se ainda aberto);
+      - CANCELLED por recusa do signatário (histórico): 409 ALREADY_REJECTED, registro intacto;
       - SIGNED ou outro estado final: 409.
+    Antes de qualquer chamada ao Adobe, espera a reconciliação que já estava em curso (limite cancel.settleTimeoutMs;
+    estourou => 503 RECONCILE_IN_PROGRESS, nada consultado nem marcado).
     Depois do cancelamento confirmado, o acordo vira "concluído" para o pipeline (sem SendOn nem PDF).
   */
   async function cancelAgreement(agreementId, { comment, source = 'admin' } = {}) {
@@ -156,6 +211,10 @@ function createCancellationService({ repo, adobe, otcs, logger, config, now = ()
     inflight.add(id);
     const release = hold(id);
     try {
+      if (!(await waitSettled(id))) {
+        logger.warn(`[${id}] cancelación: la reconciliación en curso no terminó a tiempo; no se consulta ni se cancela en Adobe`);
+        throw reconcileInProgress();
+      }
       return await runCancel(id, { comment: cleanComment(comment), source });
     } finally {
       release();

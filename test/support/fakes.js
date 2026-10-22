@@ -440,7 +440,7 @@ async function buildWorld({
     onCreated: (id, ctx) => (ctx?.existing ? reconciliation.resumeStart(id) : reconciliation.reconcile(id))
   });
   const cancellation = createCancellationService({
-    repo, adobe, otcs, logger, config, now: clock.now, hold: reconciliation.hold
+    repo, adobe, otcs, logger, config, now: clock.now, hold: reconciliation.hold, settle: reconciliation.settle
   });
   const poller = createPoller({ repo, adobe, processor: reconciliation, config, logger, now: clock.now });
   tokenStore = tokenStore || makeTokenStore();

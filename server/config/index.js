@@ -213,7 +213,9 @@ function computeConfig(env = process.env, { projectRoot = PROJECT_ROOT } = {}) {
         targetSubworkflow: str(env.CANCEL_FIELD_TARGET_SUBWORKFLOW, 'ID Subflujo a Cancelar')
       },
       // true => o Adobe avisa os signatários do cancelamento (agreementCancellationInfo.notifyOthers). Padrão: não avisa.
-      notifySigners: bool(env.CANCEL_NOTIFY_SIGNERS, false)
+      notifySigners: bool(env.CANCEL_NOTIFY_SIGNERS, false),
+      // Espera máxima pela reconciliação do acordo que já estava em curso antes de cancelar (ms); estourou => 503
+      settleTimeoutMs: Math.max(1000, int(env.CANCEL_SETTLE_TIMEOUT_MS, 20 * 1000))
     }
   };
 }

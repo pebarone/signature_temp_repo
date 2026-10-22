@@ -122,16 +122,18 @@ test('config: cancelamento desligado por padrão, nomes provisórios e variávei
     enabled: false,
     taskNames: ['Cancelar Flujo de Firma'],
     fields: { targetWorkflow: 'ID Flujo a Cancelar', targetSubworkflow: 'ID Subflujo a Cancelar' },
-    notifySigners: false
+    notifySigners: false,
+    settleTimeoutMs: 20000
   });
   const c = computeConfig({
     CANCEL_ENABLED: 'true', CANCEL_TASK_NAMES: 'Cancelar A, Cancelar B', CANCEL_FIELD_TARGET_WORKFLOW: 'Fluxo',
-    CANCEL_FIELD_TARGET_SUBWORKFLOW: 'Subfluxo', CANCEL_NOTIFY_SIGNERS: '1'
+    CANCEL_FIELD_TARGET_SUBWORKFLOW: 'Subfluxo', CANCEL_NOTIFY_SIGNERS: '1', CANCEL_SETTLE_TIMEOUT_MS: '45000'
   }).cancel;
   assert.deepEqual(c, {
     enabled: true, taskNames: ['Cancelar A', 'Cancelar B'],
-    fields: { targetWorkflow: 'Fluxo', targetSubworkflow: 'Subfluxo' }, notifySigners: true
+    fields: { targetWorkflow: 'Fluxo', targetSubworkflow: 'Subfluxo' }, notifySigners: true, settleTimeoutMs: 45000
   });
+  assert.equal(computeConfig({ CANCEL_SETTLE_TIMEOUT_MS: '10' }).cancel.settleTimeoutMs, 1000, 'mínimo de 1 s');
 });
 
 /* ---------- clientes ---------- */
@@ -338,6 +340,8 @@ test('já CANCELLED no Adobe: idempotente, não chama o cancelamento e fecha o r
     assert.deepEqual([again.cancelled, again.alreadyCancelled, again.marked], [true, true, false]);
     assert.equal(world.repo.listEvents('AG-1').length, 1);
     assert.equal(world.adobe.cancelled.length, 0);
+    // o histórico só é lido na 1ª vez (CANCELLED); a repetição de um cancelamento nosso (cancelRequestedAt) não o consulta
+    assert.equal(world.calls.filter((c) => c[0] === 'adobe.getAgreementEvents').length, status === 'CANCELLED' ? 1 : 0, status);
     await world.close();
   }
 });
@@ -350,6 +354,7 @@ test('cancelamento repetido depois do sucesso: o Adobe é reconsultado, nada é 
   assert.deepEqual([again.alreadyCancelled, again.marked], [true, false]);
   assert.equal(world.adobe.cancelled.length, 1);
   assert.equal(world.calls.filter((c) => c[0] === 'adobe.getAgreement').length, 2);
+  assert.ok(!world.calls.some((c) => c[0] === 'adobe.getAgreementEvents'), 'a repetição não consulta o histórico');
   await world.close();
 });
 
@@ -526,6 +531,277 @@ test('dois pedidos simultâneos para o mesmo acordo: o segundo recebe 409 IN_PRO
   unblock();
   assert.equal((await first).cancelled, true);
   assert.equal(world.adobe.cancelled.length, 1);
+  await world.close();
+});
+
+/* ---------- recusa do signatário (CANCELLED no Adobe) ---------- */
+
+// Registro de um acordo que NÃO pode ter sido tocado pelo cancelamento
+function assertUntouched(world, id = 'AG-1') {
+  const rec = world.repo.get(id);
+  assert.deepEqual([rec.state, rec.sendonDone, rec.cancelRequestedAt, rec.cancelSource], ['pending', false, null, null]);
+  assert.equal(world.repo.listEvents(id).length, 0, 'sem evento CANCEL_REQUESTED');
+}
+const rejectedInAdobe = (world, id = 'AG-1') => {
+  world.adobe.agreements[id].status = 'CANCELLED';
+  world.adobe.events[id] = [{ type: 'ACTION_REJECTED' }];
+};
+
+test('recusa do signatário com o Rechazado ainda pendente: 409 ALREADY_REJECTED, registro intacto e o pipeline entrega o Rechazado', async () => {
+  const world = await buildWorld();
+  open(world, 'AG-1', { startSendonDone: true, finalKind: 'final_rejected', sendonDone: false });
+  rejectedInAdobe(world);
+
+  for (const run of [() => world.cancellation.cancelWorkflow('3003'), () => world.cancellation.cancelAgreement('AG-1')]) {
+    const err = await failure(run());
+    assert.deepEqual([err.status, err.body.code, err.body.agreementId, err.body.adobeStatus], [409, 'ALREADY_REJECTED', 'AG-1', 'CANCELLED']);
+    assert.match(err.body.error, /rechazado por un firmante/);
+    const rec = world.repo.get('AG-1');
+    assert.deepEqual([rec.finalKind, rec.sendonDone, rec.cancelRequestedAt, rec.state], ['final_rejected', false, null, 'pending']);
+    assert.equal(world.repo.listEvents('AG-1').length, 0);
+  }
+  assert.equal(world.adobe.cancelled.length, 0);
+  assert.ok(world.logger.has('warn', /rechazado por un firmante; no se cancela/));
+
+  // o hold foi liberado e o pipeline segue: o Rechazado chega ao fluxo original
+  await world.reconciliation.runQueue();
+  assert.deepEqual(world.otcs.dispositionCalls().map((s) => [s.workflowId, s.disposition]), [[3003, 'Rechazado']]);
+  assert.equal(world.repo.get('AG-1').sendonDone, true);
+  await world.close();
+});
+
+test('recusa ainda não registrada pelo pipeline (sem finalKind): 409 ALREADY_REJECTED e nada é marcado', async () => {
+  const world = await buildWorld();
+  open(world, 'AG-1', { startSendonDone: true });
+  rejectedInAdobe(world);
+
+  const err = await failure(world.cancellation.cancelWorkflow('3003'));
+  assert.deepEqual([err.status, err.body.code], [409, 'ALREADY_REJECTED']);
+  assertUntouched(world);
+  assert.equal(world.adobe.cancelled.length, 0);
+  await world.close();
+});
+
+test('CANCELLED sem poder ler o histórico: 503 ADOBE_UNAVAILABLE, nada marcado; com o histórico de volta (recall) cancela de forma idempotente', async () => {
+  const world = await buildWorld();
+  open(world, 'AG-1');
+  world.adobe.agreements['AG-1'].status = 'CANCELLED';
+  world.adobe.eventsError = httpError(500, 'events down');
+
+  const err = await failure(world.cancellation.cancelWorkflow('3003'));
+  assert.deepEqual([err.status, err.body.code], [503, 'ADOBE_UNAVAILABLE']);
+  assert.ok(world.logger.has('error', /no se pudo consultar el historial del acuerdo/));
+  assertUntouched(world);
+  assert.notEqual((await world.reconciliation.reconcile('AG-1')).status, 'held', 'o hold foi liberado');
+
+  world.adobe.eventsError = null; // sem evento de recusa: foi recall
+  const out = await world.cancellation.cancelWorkflow('3003');
+  assert.deepEqual([out.cancelled, out.alreadyCancelled, out.marked], [true, true, true]);
+  await world.close();
+});
+
+test('recusa entre o GET e o PUT (o PUT falha e a reconsulta mostra CANCELLED por recusa): 409 ALREADY_REJECTED e nada é marcado', async () => {
+  const world = await buildWorld();
+  open(world, 'AG-1', { startSendonDone: true });
+  world.adobe.cancelFailures = 1; // o Adobe recusa o PUT porque o acordo já terminou
+  const realCancel = world.adobe.cancelAgreement;
+  world.adobe.cancelAgreement = async (id, o) => {
+    rejectedInAdobe(world, id); // o signatário recusa depois do GET e antes da reconsulta
+    return realCancel(id, o);
+  };
+
+  const err = await failure(world.cancellation.cancelWorkflow('3003'));
+  assert.deepEqual([err.status, err.body.code, err.body.adobeStatus], [409, 'ALREADY_REJECTED', 'CANCELLED']);
+  assert.equal(world.adobe.cancelled.length, 0);
+  assertUntouched(world);
+
+  await world.close();
+});
+
+test('PUT falha, a reconsulta mostra CANCELLED e o histórico é ilegível: vale a cancelação própria (200), sem eco; com recusa já gravada: 409', async () => {
+  const world = await buildWorld();
+  open(world, 'AG-1', { startSendonDone: true });
+  open(world, 'AG-2', { workflowId: '4004', subworkflowId: '4004', startSendonDone: true, finalKind: 'final_rejected' });
+  const realCancel = world.adobe.cancelAgreement;
+  world.adobe.cancelAgreement = async (id, o) => {
+    world.adobe.agreements[id].status = 'CANCELLED'; // o PUT foi aplicado (ou o acordo já terminou) e a resposta se perdeu
+    world.adobe.eventsError = httpError(500, 'events down');
+    return realCancel(id, o);
+  };
+
+  // recusa já gravada por webhook: 409, nada marcado
+  world.adobe.cancelFailures = 1;
+  const rejected = await failure(world.cancellation.cancelAgreement('AG-2'));
+  assert.deepEqual([rejected.status, rejected.body.code], [409, 'ALREADY_REJECTED']);
+  const rec2 = world.repo.get('AG-2');
+  assert.deepEqual([rec2.finalKind, rec2.sendonDone, rec2.cancelRequestedAt, rec2.state], ['final_rejected', false, null, 'pending']);
+  assert.equal(world.repo.listEvents('AG-2').length, 0);
+
+  // sem recusa gravada: cancelação confirmada, com aviso
+  world.adobe.cancelFailures = 1;
+  const out = await world.cancellation.cancelAgreement('AG-1');
+  assert.deepEqual([out.cancelled, out.alreadyCancelled, out.marked, out.adobeStatus], [true, false, true, 'CANCELLED']);
+  assert.ok(world.logger.has('warn', /historial no legible; se asume la cancelación propia/));
+  const rec = world.repo.get('AG-1');
+  assert.deepEqual([rec.state, rec.sendonDone, rec.disposition], ['cancelled', true, null]);
+
+  // o eco do RECALLED e a fila não geram disposição (histórico legível: só a marcação impede o Rechazado)
+  world.adobe.eventsError = null;
+  world.adobe.events['AG-1'] = [{ type: 'RECALLED' }];
+  assert.equal(recalled(world, 'AG-1').processing, undefined);
+  await world.reconciliation.runQueue();
+  assert.ok(!world.otcs.sendons.some((s) => s.workflowId === 3003), 'nada no fluxo cancelado');
+  await world.close();
+});
+
+test('POST /admin/cancel/:id de acordo recusado cujo Rechazado já foi entregue: 409 ALREADY_REJECTED (antes era 200 alreadyCancelled)', async () => {
+  const world = await buildWorld({ listen: true });
+  open(world, 'AG-1', { startSendonDone: true, state: 'completed', finalKind: 'final_rejected', sendonDone: true });
+  rejectedInAdobe(world);
+
+  const r = await post(world, '/admin/cancel/AG-1', {}, ADMIN);
+  assert.equal(r.status, 409);
+  const body = await r.json();
+  assert.deepEqual([body.code, body.agreementId, body.adobeStatus], ['ALREADY_REJECTED', 'AG-1', 'CANCELLED']);
+  const rec = world.repo.get('AG-1');
+  assert.deepEqual([rec.state, rec.cancelRequestedAt, rec.finalKind], ['completed', null, 'final_rejected']);
+  assert.equal(world.repo.listEvents('AG-1').length, 0);
+  assert.equal(world.adobe.cancelled.length, 0);
+  await world.close();
+});
+
+/* ---------- espera pela reconciliação em curso ---------- */
+
+// A primeira leitura do Adobe (a da reconciliação) fica presa até `open()`; devolve o estado do Adobe NESSE momento
+function gateFirstRead(world) {
+  const realGet = world.adobe.getAgreement;
+  let first = true;
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  world.adobe.getAgreement = async (id) => {
+    if (!first) return realGet(id);
+    first = false;
+    world.calls.push(['adobe.getAgreement', id]);
+    await gate;
+    return world.adobe.agreements[id];
+  };
+  return { open: () => { world.calls.push(['test.gateOpened']); release(); } };
+}
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const reads = (world) => world.calls.filter((c) => c[0] === 'adobe.getAgreement').length;
+
+test('reconciliação já em curso: o cancelamento espera, só então consulta/cancela o Adobe e nenhum Rechazado sai', async () => {
+  const world = await buildWorld();
+  open(world, 'AG-1', { startSendonDone: true });
+  const gate = gateFirstRead(world);
+
+  const running = world.reconciliation.reconcile('AG-1', { refresh: true, force: true, manual: true });
+  await waitFor(() => reads(world) === 1);
+  const cancelling = world.cancellation.cancelAgreement('AG-1');
+  await sleep(50);
+  assert.equal(reads(world), 1, 'o cancelamento ainda não consultou o Adobe');
+  assert.equal(world.adobe.cancelled.length, 0);
+
+  gate.open();
+  const out = await cancelling;
+  assert.equal((await running).status, 'no_final');
+  assert.deepEqual([out.cancelled, out.alreadyCancelled, out.marked], [true, false, true]);
+
+  const names = world.calls.map((c) => c[0]);
+  assert.ok(names.indexOf('test.gateOpened') < names.lastIndexOf('adobe.getAgreement'), 'a consulta do cancelamento veio depois');
+  assert.ok(names.indexOf('test.gateOpened') < names.indexOf('adobe.cancelAgreement'));
+  assert.equal(world.otcs.sendons.length, 0, 'nenhum Rechazado no fluxo original');
+  const rec = world.repo.get('AG-1');
+  assert.deepEqual([rec.state, rec.sendonDone, rec.disposition], ['cancelled', true, null]);
+  await world.close();
+});
+
+test('reconciliação em curso que conclui por outro caminho: recall já entregue => idempotente sem marcar; assinado => 409 ALREADY_SIGNED', async () => {
+  // recall feito direto no Adobe: a reconciliação entrega o Rechazado antes de o cancelamento olhar
+  let world = await buildWorld();
+  open(world, 'AG-1', { startSendonDone: true });
+  let gate = gateFirstRead(world);
+  let running = world.reconciliation.reconcile('AG-1', { refresh: true, force: true, manual: true });
+  await waitFor(() => reads(world) === 1);
+  let cancelling = world.cancellation.cancelAgreement('AG-1');
+  await sleep(20);
+  world.adobe.agreements['AG-1'].status = 'CANCELLED';
+  world.adobe.events['AG-1'] = [{ type: 'RECALLED' }];
+  gate.open();
+  const out = await cancelling;
+  assert.equal((await running).status, 'completed');
+  assert.deepEqual([out.cancelled, out.alreadyCancelled, out.marked], [true, true, false]);
+  assert.deepEqual(world.otcs.dispositionCalls().map((s) => s.disposition), ['Rechazado']);
+  assert.equal(world.adobe.cancelled.length, 0);
+  assert.equal(world.repo.get('AG-1').cancelRequestedAt, null);
+  await world.close();
+
+  // assinado enquanto a reconciliação rodava
+  world = await buildWorld();
+  open(world, 'AG-1', { startSendonDone: true });
+  gate = gateFirstRead(world);
+  running = world.reconciliation.reconcile('AG-1', { refresh: true, force: true, manual: true });
+  await waitFor(() => reads(world) === 1);
+  cancelling = world.cancellation.cancelAgreement('AG-1');
+  await sleep(20);
+  world.adobe.agreements['AG-1'].status = 'SIGNED';
+  gate.open();
+  const err = await failure(cancelling);
+  assert.equal((await running).status, 'completed');
+  assert.deepEqual([err.status, err.body.code], [409, 'ALREADY_SIGNED']);
+  assert.deepEqual(world.otcs.dispositionCalls().map((s) => s.disposition), ['Firmado']);
+  assert.equal(world.adobe.cancelled.length, 0);
+  await world.close();
+});
+
+test('settle também espera a reconciliação enfileirada (coalescida): o 2º reconcile devolve held e nenhum Rechazado sai', async () => {
+  const world = await buildWorld();
+  open(world, 'AG-1', { startSendonDone: true });
+  const gate = gateFirstRead(world);
+
+  const first = world.reconciliation.reconcile('AG-1', { refresh: true, force: true, manual: true });
+  await waitFor(() => reads(world) === 1);
+  const second = world.reconciliation.reconcile('AG-1', { refresh: true, force: true, manual: true }); // fica na fila
+  const cancelling = world.cancellation.cancelAgreement('AG-1');
+  await sleep(50);
+  assert.equal(reads(world), 1);
+  assert.equal(world.adobe.cancelled.length, 0);
+
+  gate.open();
+  const out = await cancelling;
+  assert.equal((await first).status, 'no_final');
+  assert.equal((await second).status, 'held', 'a execução enfileirada começou depois do hold');
+  assert.equal(out.cancelled, true);
+  assert.equal(world.otcs.sendons.length, 0);
+  assert.equal(world.repo.get('AG-1').state, 'cancelled');
+  await world.close();
+});
+
+test('reconciliação presa além de CANCEL_SETTLE_TIMEOUT_MS: 503 RECONCILE_IN_PROGRESS sem tocar o Adobe, hold liberado e novo cancelamento funciona', async () => {
+  const world = await buildWorld();
+  open(world, 'AG-1', { startSendonDone: true });
+  world.config.cancel.settleTimeoutMs = 40; // o mínimo de 1000 ms vale só para a variável de ambiente
+  const gate = gateFirstRead(world);
+
+  const running = world.reconciliation.reconcile('AG-1', { refresh: true, force: true, manual: true });
+  await waitFor(() => reads(world) === 1);
+
+  const err = await failure(world.cancellation.cancelAgreement('AG-1'));
+  assert.deepEqual([err.status, err.body.code], [503, 'RECONCILE_IN_PROGRESS']);
+  assert.match(err.body.error, /reconciliación en curso/);
+  assert.equal(reads(world), 1, 'nenhuma consulta do cancelamento ao Adobe');
+  assert.ok(!world.calls.some((c) => c[0] === 'adobe.cancelAgreement'));
+  assertUntouched(world);
+
+  // o inflight também foi liberado: outro pedido recebe a mesma resposta (e não IN_PROGRESS)
+  assert.equal((await failure(world.cancellation.cancelAgreement('AG-1'))).body.code, 'RECONCILE_IN_PROGRESS');
+
+  gate.open();
+  await running;
+  assert.notEqual((await world.reconciliation.reconcile('AG-1')).status, 'held', 'o hold foi liberado');
+  const out = await world.cancellation.cancelAgreement('AG-1');
+  assert.deepEqual([out.cancelled, out.alreadyCancelled, out.marked], [true, false, true]);
+  assert.equal(world.otcs.sendons.length, 0);
   await world.close();
 });
 

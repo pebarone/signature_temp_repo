@@ -77,6 +77,16 @@ function createReconciliationService({
     return () => { held.delete(id); };
   }
 
+  /*
+    Espera a reconciliação do acordo que já está em curso (e a enfileirada atrás dela) terminar. O cancelamento a usa
+    logo depois do hold: uma execução que passou da checagem do hold continua e poderia adotar o RECALLED do próprio
+    cancelamento. As que começarem depois do hold devolvem 'held'. Nunca rejeita.
+  */
+  function settle(id) {
+    id = String(id);
+    return Promise.all([running.get(id), queued.get(id)].filter(Boolean)).then(() => {}, () => {});
+  }
+
   /* ---------- helpers de estado ---------- */
 
   function markAttention(id, reason, kind = ATTENTION_KINDS.PERMANENT) {
@@ -946,7 +956,7 @@ function createReconciliationService({
   }
 
   return {
-    handleEvent, handleStatus, applyAdobeStatus, reconcile, resumeStart, runQueue, reopenStale, adopt, hold, stop
+    handleEvent, handleStatus, applyAdobeStatus, reconcile, resumeStart, runQueue, reopenStale, adopt, hold, settle, stop
   };
 }
 

@@ -42,7 +42,7 @@ function start() {
     repo, adobe, otcs, logger, config, onCreated: (id, ctx) => (ctx?.existing ? reconciliation.resumeStart(id) : reconciliation.reconcile(id))
   });
   const cancellationService = createCancellationService({
-    repo, adobe, otcs, logger, config, hold: reconciliation.hold
+    repo, adobe, otcs, logger, config, hold: reconciliation.hold, settle: reconciliation.settle
   });
   const poller = createPoller({ repo, adobe, processor: reconciliation, config, logger });
 
