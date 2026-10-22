@@ -1,0 +1,601 @@
+[LL_WEBREPORT_EXCLUDEHTML /]
+[// Cancelar Flujo de Firma (WebReport del workflow de cancelacion; QA/PROD: IDs por asignar al publicar). Ver webreports/cancelacion/README.md y webreports/README.md. /]
+[// Modelo: webreports/firma-flujo-puro/Requisicion de Firma.html (misma estructura, mismo ramo reasignar, mismo estilo). /]
+[// Ramo reasignar: la propia pagina lo pide (mismo origen, sesion del usuario) para mover la tarea al usuario de integracion. /]
+[// La URL solo trae los IDs de la tarea (workid, subworkid, taskid). El destino es fijo en este ramo; la URL no lo elige. /]
+[LL_WEBREPORT_IF "[LL_REPTAG_&ACCION /]" == "reasignar" /]
+[// USUARIO DE INTEGRACION POR AMBIENTE: 11742766 = QA (AdminKeralty). En PROD cambiar este numero (ver webreports/cancelacion/README.md). /]
+[LL_REPTAG_{'[LL_REPTAG_&WORKID /]','[LL_REPTAG_&SUBWORKID /]','[LL_REPTAG_&TASKID /]'} WFTASKACTION:REASSIGN:11742766 /]
+REASIGNADO_OK
+[LL_WEBREPORT_ELSE /]
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="light">
+  <title>Cancelar flujo de firma</title>
+  <style>
+    :root {
+      --fondo: #f3f5f8;
+      --tarjeta: #ffffff;
+      --texto: #1d2939;
+      --texto-suave: #5b6575;
+      --borde: #e4e7ec;
+      --acento: #0f766e;
+      --acento-hover: #115e59;
+      --ok: #067647;
+      --ok-suave: #e7f6ee;
+      --error: #b42318;
+      --error-hover: #912018;
+      --error-suave: #fdecea;
+      --aviso: #b54708;
+      --aviso-suave: #fef0c7;
+      --pendiente: #7a8494;
+      --radio: 12px;
+    }
+    *, *::before, *::after { box-sizing: border-box; }
+    [hidden] { display: none !important; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 16px;
+      background: var(--fondo);
+      color: var(--texto);
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      font-size: 16px;
+      line-height: 1.5;
+    }
+    .tarjeta {
+      width: 100%;
+      max-width: 520px;
+      padding: 32px;
+      background: var(--tarjeta);
+      border: 1px solid var(--borde);
+      border-radius: var(--radio);
+      box-shadow: 0 1px 2px rgba(16, 24, 40, 0.06);
+    }
+    .titulo { margin: 0 0 16px; font-size: 22px; font-weight: 600; line-height: 1.3; }
+    .seccion {
+      margin: 20px 0 8px;
+      font-size: 13px;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: var(--texto-suave);
+    }
+    .documento {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: baseline;
+      gap: 4px 12px;
+      padding: 12px 14px;
+      background: #f8fafc;
+      border: 1px solid var(--borde);
+      border-radius: 10px;
+    }
+    .documento-nombre { flex: 1 1 200px; min-width: 0; font-weight: 600; overflow-wrap: anywhere; }
+    .firmantes { margin: 0; padding: 0; list-style: none; }
+    .firmantes li {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px 12px;
+      padding: 8px 0;
+      border-top: 1px solid var(--borde);
+      font-size: 15px;
+    }
+    .firmantes li:first-child { border-top: 0; }
+    .firmante-etiqueta { min-width: 80px; color: var(--texto-suave); }
+    .firmante-correo { flex: 1 1 180px; min-width: 0; overflow-wrap: anywhere; }
+    .aviso-caja {
+      margin: 20px 0 0;
+      padding: 12px 14px;
+      background: var(--aviso-suave);
+      border: 1px solid #f5d08a;
+      border-radius: 10px;
+      color: #7a2e0e;
+      font-size: 15px;
+    }
+    .aviso-caja strong { display: block; margin-bottom: 2px; }
+    .pasos { margin: 24px 0 0; padding: 0; list-style: none; display: grid; gap: 14px; }
+    .paso { display: flex; align-items: center; gap: 12px; color: var(--texto-suave); }
+    .paso[data-estado="activo"], .paso[data-estado="hecho"] { color: var(--texto); }
+    .paso[data-estado="activo"] { font-weight: 600; }
+    .paso[data-estado="error"] { color: var(--error); font-weight: 600; }
+    .paso[data-estado="aviso"] { color: var(--aviso); font-weight: 600; }
+    .paso-icono {
+      display: inline-flex;
+      flex: 0 0 22px;
+      align-items: center;
+      justify-content: center;
+      width: 22px;
+      height: 22px;
+      border: 2px solid var(--pendiente);
+      border-radius: 50%;
+    }
+    .paso[data-estado="activo"] .paso-icono {
+      border-color: #d0d5dd;
+      border-top-color: var(--acento);
+      animation: girar 0.8s linear infinite;
+    }
+    .paso[data-estado="hecho"] .paso-icono { background: var(--acento); border-color: var(--acento); }
+    .paso[data-estado="hecho"] .paso-icono::after {
+      content: "";
+      width: 5px;
+      height: 9px;
+      margin-top: -2px;
+      border: solid #fff;
+      border-width: 0 2px 2px 0;
+      transform: rotate(45deg);
+    }
+    .paso[data-estado="error"] .paso-icono { background: var(--error); border-color: var(--error); color: #fff; }
+    .paso[data-estado="error"] .paso-icono::before { content: "!"; font-size: 14px; font-weight: 700; line-height: 1; }
+    .paso[data-estado="aviso"] .paso-icono { background: var(--aviso); border-color: var(--aviso); color: #fff; }
+    .paso[data-estado="aviso"] .paso-icono::before { content: "!"; font-size: 14px; font-weight: 700; line-height: 1; }
+    @keyframes girar { to { transform: rotate(360deg); } }
+    .resultado { display: flex; justify-content: center; margin-top: 24px; }
+    .insignia {
+      width: 56px;
+      height: 56px;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .insignia.ok { background: var(--ok-suave); }
+    .insignia.ok::after {
+      content: "";
+      width: 14px;
+      height: 26px;
+      margin-top: -5px;
+      border: solid var(--ok);
+      border-width: 0 4px 4px 0;
+      transform: rotate(45deg) scale(0);
+      animation: marcar 0.45s 0.1s cubic-bezier(0.2, 0.8, 0.2, 1) forwards;
+    }
+    @keyframes marcar { to { transform: rotate(45deg) scale(1); } }
+    .insignia.error { background: var(--error-suave); color: var(--error); font-size: 30px; font-weight: 700; line-height: 1; }
+    .insignia.error::before { content: "!"; }
+    .insignia.aviso { background: var(--aviso-suave); color: var(--aviso); font-size: 30px; font-weight: 700; line-height: 1; }
+    .insignia.aviso::before { content: "!"; }
+    .estado { min-height: 1.5em; margin: 16px 0 0; text-align: center; font-weight: 600; overflow-wrap: anywhere; }
+    .estado.ok { color: var(--ok); }
+    .estado.error { color: var(--error); }
+    .estado.aviso { color: var(--aviso); }
+    .acuerdo { margin: 6px 0 0; text-align: center; font-size: 13px; color: var(--texto-suave); overflow-wrap: anywhere; }
+    .lista-acuerdos { margin: 12px 0 0; padding: 0; list-style: none; font-size: 13px; color: var(--texto-suave); }
+    .lista-acuerdos li { padding: 6px 0; border-top: 1px solid var(--borde); overflow-wrap: anywhere; }
+    .lista-acuerdos li:first-child { border-top: 0; }
+    .acciones { display: grid; gap: 8px; margin-top: 24px; }
+    .btn {
+      min-height: 44px;
+      padding: 12px 20px;
+      border: 0;
+      border-radius: 10px;
+      background: var(--acento);
+      color: #fff;
+      font: inherit;
+      font-size: 16px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .btn:hover { background: var(--acento-hover); }
+    .btn.peligro { background: var(--error); }
+    .btn.peligro:hover { background: var(--error-hover); }
+    .btn:focus-visible, a:focus-visible { outline: 3px solid var(--acento); outline-offset: 2px; }
+    .btn:disabled { opacity: 0.6; cursor: progress; }
+    @media (max-width: 400px) {
+      .tarjeta { padding: 24px 20px; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="tarjeta">
+    <h1 class="titulo">Cancelar flujo de firma</h1>
+
+    <h2 class="seccion">Flujo a cancelar</h2>
+    <ul class="firmantes" id="destino">
+      <li><span class="firmante-etiqueta">Flujo</span><span class="firmante-correo" id="destino-flujo"></span></li>
+      <li><span class="firmante-etiqueta">Subflujo</span><span class="firmante-correo" id="destino-subflujo"></span></li>
+    </ul>
+
+    <div id="vista-confirmar" hidden>
+      <div class="aviso-caja" role="note">
+        <strong>Atención</strong>
+        Al cancelar se pierde cualquier firma parcial: si algún firmante ya firmó, su firma se descarta y el documento no se podrá recuperar con esa firma.
+        Confirme que este es el flujo correcto antes de continuar.
+      </div>
+    </div>
+
+    <ol class="pasos" id="pasos" hidden>
+      <li class="paso" id="paso-asignar" data-estado="pendiente" hidden><span class="paso-icono" aria-hidden="true"></span><span>Asignando la tarea</span></li>
+      <li class="paso" id="paso-cancelar" data-estado="pendiente"><span class="paso-icono" aria-hidden="true"></span><span>Cancelando en Adobe Sign</span></li>
+      <li class="paso" id="paso-listo" data-estado="pendiente"><span class="paso-icono" aria-hidden="true"></span><span>Listo</span></li>
+    </ol>
+
+    <div class="resultado" id="resultado" hidden><span class="insignia" id="insignia" aria-hidden="true"></span></div>
+
+    <p class="estado" id="estado" role="status" aria-live="polite"></p>
+    <p class="acuerdo" id="acuerdo" hidden></p>
+    <ul class="lista-acuerdos" id="lista-acuerdos" hidden></ul>
+
+    <div class="acciones">
+      <button class="btn peligro" type="button" id="btn-cancelar" hidden>Cancelar flujo</button>
+      <button class="btn" type="button" id="btn-reintentar" hidden>Reintentar</button>
+    </div>
+  </main>
+
+  <!-- Datos del flujo en OTCS. Van en textarea (contenido RCDATA: el HTML no interpreta etiquetas) y el script lee el valor como texto literal. -->
+  <div hidden>
+    <textarea id="dato-flujo" hidden readonly>[LL_REPTAG_&SUBWORKID WFATTR:"ID Flujo a Cancelar":DISPLAY /]</textarea>
+    <textarea id="dato-subflujo" hidden readonly>[LL_REPTAG_&SUBWORKID WFATTR:"ID Subflujo a Cancelar":DISPLAY /]</textarea>
+  </div>
+
+<script>
+'use strict';
+(() => {
+  /* ============================================================
+     CONFIGURACION POR AMBIENTE (unico bloque a cambiar al publicar)
+     Valores que cambian por ambiente:
+       - SERVER_URL, BASIC_USER, BASIC_PASS y REPORT_ID (aqui abajo);
+       - REPORT_ID: ID de ESTE WebReport en el ambiente (QA: por asignar al publicarlo). WebReports no tiene una tag
+         para el ID del propio reporte (la tag REPORTID no existe);
+       - usuario de integracion (11742766 en QA, AdminKeralty): NO va en este script.
+         Esta fijado en la linea WFTASKACTION:REASSIGN del ramo reasignar del WebReport,
+         con su comentario. Cambiarlo ahi al publicar en PROD.
+     QA: orquestador en Render. PROD: Route de OpenShift.
+     BASIC_USER / BASIC_PASS son placeholders: el valor real entra
+     solo en el WebReport publicado, nunca en este archivo.
+     ============================================================ */
+  const SERVER_URL = 'https://signature-orchestrator-api-2gim.onrender.com';
+  const BASIC_USER = 'ADOBE-LOGS';
+  const BASIC_PASS = 'ADOBE-LOGS-PASS';
+  const REPORT_ID = 'REPORT_ID_POR_ASIGNAR';
+  /* ============================ fin de la configuracion ============================ */
+
+  /* Valores de OTCS. WORKFLOW_ID / SUBWORKFLOW_ID son los del workflow de CANCELACION (la tarea donde corre este WebReport).
+     El flujo a cancelar (ID Flujo a Cancelar / ID Subflujo a Cancelar) se lee de textarea ocultos y solo se MUESTRA para
+     confirmarlo: el servidor lo vuelve a leer del formulario de la tarea y no recibe este valor del navegador. */
+  const WORKFLOW_ID = '[LL_REPTAG_&WORKID /]';
+  const SUBWORKFLOW_ID = '[LL_REPTAG_&SUBWORKID /]';
+  const DESTINO_FLUJO_RAW = valorDe('dato-flujo');
+  const DESTINO_SUBFLUJO_RAW = valorDe('dato-subflujo');
+
+  /* Marca que devuelve el ramo reasignar. Se arma en JS para no aparecer en la pagina normal. */
+  const MARCA_REASIGNADO = 'REASIGNADO' + '_OK';
+  const MSG_ASIGNAR = 'No fue posible asignar la tarea. Intente de nuevo.';
+  const CABECERAS = { 'Content-Type': 'application/json', 'ngrok-skip-browser-warning': 'true' };
+  const OTCS_URL = '[LL_REPTAG_URLPREFIXFULL /]'.replace(/\/+$/, '');
+  const ORDEN_PASOS = ['asignar', 'cancelar', 'listo'];
+  const TEXTO_PASO = { asignar: 'Asignando la tarea...', cancelar: 'Cancelando en Adobe Sign...' };
+
+  /* Respuestas del servidor: texto para el usuario, ayuda y si Reintentar tiene sentido.
+     Los codigos transitorios (503, IN_PROGRESS) se pueden repetir sin riesgo: el servidor es idempotente. */
+  const CODIGOS = {
+    AGREEMENT_NOT_FOUND: {
+      mensaje: 'No se encontró un acuerdo de firma para este flujo.',
+      detalle: 'Revise el ID del flujo. Si el flujo se envió con el orquestador anterior, pida a soporte que adopte el acuerdo (POST /admin/adopt/{ID del acuerdo}) y presione "Reintentar".',
+      reintento: true
+    },
+    AGREEMENT_NOT_FOUND_IN_ADOBE: { mensaje: 'El acuerdo ya no existe en Adobe Sign; no hay nada que cancelar.', reintento: false },
+    AMBIGUOUS: {
+      mensaje: 'El flujo tiene más de un acuerdo de firma abierto. No se canceló ninguno.',
+      detalle: 'Indique el subflujo en el atributo "ID Subflujo a Cancelar" del flujo de cancelación y vuelva a abrir esta página.',
+      reintento: false
+    },
+    AGREEMENT_CLOSED: { mensaje: 'El acuerdo más reciente de este flujo ya concluyó; no hay nada que cancelar.', reintento: false },
+    ALREADY_SIGNED: { mensaje: 'El acuerdo ya fue firmado por todos en Adobe Sign; no se puede cancelar.', reintento: false },
+    ALREADY_REJECTED: { mensaje: 'Un firmante ya rechazó el acuerdo en Adobe Sign; no se puede cancelar. El flujo original recibirá el rechazo.', reintento: false },
+    NOT_CANCELABLE: { mensaje: 'El acuerdo está en un estado en el que Adobe Sign no permite cancelarlo.', reintento: false },
+    IN_PROGRESS: { mensaje: 'Ya hay una cancelación en curso para este acuerdo. Espere unos segundos y reintente.', reintento: true },
+    NOT_AT_CANCEL_STEP: { mensaje: 'El flujo de cancelación no está en el paso "Cancelar Flujo de Firma" (quizá ya se completó).', reintento: false },
+    FLOW_NOT_FOUND: { mensaje: 'No se encontró el flujo de cancelación en Content Server.', reintento: false },
+    MISSING_TARGET: { mensaje: 'El flujo de cancelación no tiene el ID del flujo a cancelar. Complete el atributo "ID Flujo a Cancelar".', reintento: false },
+    INVALID_TARGET: { mensaje: 'El ID del subflujo a cancelar no es válido. Corrija el atributo "ID Subflujo a Cancelar".', reintento: false },
+    ADOBE_UNAVAILABLE: { mensaje: 'Adobe Sign no está disponible por ahora. No se modificó nada; intente nuevamente.', reintento: true },
+    OTCS_UNAVAILABLE: { mensaje: 'Content Server no está disponible por ahora. No se modificó nada; intente nuevamente.', reintento: true },
+    RECONCILE_IN_PROGRESS: { mensaje: 'El acuerdo se está sincronizando con Adobe Sign. No se modificó nada; intente nuevamente en unos segundos.', reintento: true },
+    SENDON_FAILED: {
+      mensaje: 'El acuerdo ya fue cancelado en Adobe Sign, pero no se pudo continuar el flujo de cancelación.',
+      detalle: 'Repetir es seguro: presione "Reintentar" para continuar sin volver a cancelar.',
+      reintento: true
+    },
+    REASSIGN_REQUIRED: { mensaje: MSG_ASIGNAR, reintento: true }
+  };
+
+  /* Unico estado de la pagina. */
+  const state = {
+    ocupado: false, intentado: false, paso: 'cancelar', acuerdoId: null, yaCancelado: false, handoff: null,
+    destinoFlujo: '', destinoSubflujo: ''
+  };
+
+  /* ---------- Utilidades ---------- */
+
+  /* Texto literal de un textarea oculto. */
+  function valorDe(id) {
+    const el = document.getElementById(id);
+    return el ? el.value.trim() : '';
+  }
+
+  function esDigitos(v) {
+    return /^\d+$/.test(String(v));
+  }
+
+  function mensajeDeError(data) {
+    if (typeof data.error === 'string') return data.error;
+    if (data.error && typeof data.error.message === 'string') return data.error.message;
+    return typeof data.message === 'string' ? data.message : '';
+  }
+
+  const reasignaRequerido = (r) => !r.ok && r.data.code === 'REASSIGN_REQUIRED';
+
+  /* Resumen legible de un acuerdo que devuelve el servidor (AMBIGUOUS / AGREEMENT_CLOSED). */
+  function lineaAcuerdo(a) {
+    const partes = ['Acuerdo ' + String(a.id || '?')];
+    if (a.subworkflowId) partes.push('subflujo ' + a.subworkflowId);
+    if (a.nodeId) partes.push('documento ' + a.nodeId);
+    if (a.state) partes.push('estado ' + a.state);
+    if (a.createdAt) partes.push('creado ' + a.createdAt);
+    return partes.join(', ');
+  }
+
+  /* Error de una respuesta del servidor, con el texto de CODIGOS cuando el codigo se conoce.
+     err.sinReintento: Reintentar no cambiaria nada. err.detalle: linea de ayuda. err.acuerdos: lista a mostrar. */
+  function errorServidor(r, porDefecto) {
+    const data = r.data;
+    const codigo = typeof data.code === 'string' ? data.code : '';
+    const def = CODIGOS[codigo];
+    const err = new Error(def ? def.mensaje : (mensajeDeError(data) || porDefecto));
+    err.codigo = codigo;
+    if (def) {
+      err.sinReintento = !def.reintento;
+      if (def.detalle) err.detalle = def.detalle;
+    } else if (r.status === 404) {
+      err.message = 'La cancelación de flujos no está habilitada en el servidor.';
+      err.sinReintento = true;
+    }
+    if (codigo === 'NOT_CANCELABLE' && data.adobeStatus) {
+      err.detalle = 'Estado en Adobe Sign: ' + String(data.adobeStatus);
+    } else if (codigo === 'SENDON_FAILED' && data.id) {
+      err.detalle = 'ID del acuerdo: ' + String(data.id) + '. ' + def.detalle;
+    } else if (codigo === 'AGREEMENT_CLOSED' && data.agreement && typeof data.agreement === 'object') {
+      err.acuerdos = [data.agreement];
+    } else if (codigo === 'AMBIGUOUS' && Array.isArray(data.agreements)) {
+      err.acuerdos = data.agreements.filter((a) => a && typeof a === 'object');
+    }
+    return err;
+  }
+
+  /* ---------- Interfaz ---------- */
+
+  function setEstado(texto, tipo) {
+    const el = document.getElementById('estado');
+    el.textContent = texto;
+    el.className = tipo ? 'estado ' + tipo : 'estado';
+  }
+
+  function pintarPaso(nombre, estado) {
+    document.getElementById('paso-' + nombre).setAttribute('data-estado', estado);
+  }
+
+  /* Marca el paso activo; los anteriores quedan hechos y los siguientes pendientes. */
+  function pasoActivo(nombre) {
+    state.paso = nombre;
+    const idx = ORDEN_PASOS.indexOf(nombre);
+    ORDEN_PASOS.forEach((p, i) => {
+      if (i < idx) pintarPaso(p, 'hecho');
+      else if (i === idx) pintarPaso(p, 'activo');
+      else pintarPaso(p, 'pendiente');
+    });
+    setEstado(TEXTO_PASO[nombre], '');
+  }
+
+  function mostrarInsignia(tipo) {
+    document.getElementById('resultado').hidden = !tipo;
+    document.getElementById('insignia').className = tipo ? 'insignia ' + tipo : 'insignia';
+  }
+
+  function reiniciarVista() {
+    mostrarInsignia(null);
+    document.getElementById('acuerdo').hidden = true;
+    document.getElementById('lista-acuerdos').hidden = true;
+    document.getElementById('btn-reintentar').hidden = true;
+    document.getElementById('btn-cancelar').hidden = true;
+    document.getElementById('vista-confirmar').hidden = true;
+    setEstado('', '');
+  }
+
+  function pintarDatos() {
+    document.getElementById('destino-flujo').textContent = state.destinoFlujo || 'Sin dato';
+    document.getElementById('destino-subflujo').textContent = state.destinoSubflujo || 'No indicado (se usa el flujo completo)';
+  }
+
+  /* Linea secundaria bajo el estado (ID del acuerdo, ayuda del error). */
+  function mostrarDetalle(texto) {
+    const el = document.getElementById('acuerdo');
+    el.textContent = texto;
+    el.hidden = false;
+  }
+
+  function mostrarAcuerdos(lista) {
+    const ul = document.getElementById('lista-acuerdos');
+    ul.textContent = '';
+    lista.forEach((a) => {
+      const li = document.createElement('li');
+      li.textContent = lineaAcuerdo(a);
+      ul.appendChild(li);
+    });
+    ul.hidden = lista.length === 0;
+  }
+
+  function mostrarExito() {
+    ORDEN_PASOS.forEach((p) => pintarPaso(p, 'hecho'));
+    mostrarInsignia('ok');
+    setEstado(
+      state.yaCancelado
+        ? 'El acuerdo ya estaba cancelado en Adobe Sign. El flujo de cancelación continúa.'
+        : 'Flujo cancelado en Adobe Sign. El flujo de cancelación continúa.',
+      'ok'
+    );
+    mostrarDetalle((state.acuerdoId ? 'ID del acuerdo: ' + state.acuerdoId + '. ' : '') + 'Puede cerrar esta ventana.');
+  }
+
+  /* Los errores de datos no se reintentan: repetir la misma validacion no cambia nada.
+     Los transitorios (503, IN_PROGRESS, SENDON_FAILED, red) dejan Reintentar. */
+  function mostrarError(err) {
+    console.error('[cancelar]', err);
+    document.getElementById('pasos').hidden = !state.intentado;
+    if (!err.sinReintento) pintarPaso(state.paso, 'error');
+    mostrarInsignia('error');
+    setEstado(err.message || 'No se pudo cancelar el flujo.', 'error');
+    if (err.detalle) mostrarDetalle(err.detalle);
+    if (err.acuerdos) mostrarAcuerdos(err.acuerdos);
+    document.getElementById('btn-reintentar').hidden = Boolean(err.sinReintento);
+  }
+
+  /* ---------- Red ---------- */
+
+  async function postJson(url, cuerpo, cabeceras) {
+    let resp;
+    try {
+      resp = await fetch(url, { method: 'POST', headers: cabeceras, body: JSON.stringify(cuerpo) });
+    } catch (_) {
+      const err = new Error('No se pudo conectar con el servidor de firmas.');
+      err.sinRed = true;
+      throw err;
+    }
+    const data = await resp.json().catch(() => ({}));
+    return { ok: resp.ok, status: resp.status, data: data && typeof data === 'object' ? data : {} };
+  }
+
+  /* Campos del pedido. Son los mismos en /auth y en /cancel (la firma los cubre): solo el workflow de cancelacion.
+     El flujo a cancelar NO viaja: el servidor lo lee del formulario de la tarea. */
+  function camposCancelacion() {
+    return { workflowId: WORKFLOW_ID, subworkflowId: SUBWORKFLOW_ID };
+  }
+
+  async function obtenerFirma(campos) {
+    const cabeceras = { ...CABECERAS, Authorization: 'Basic ' + btoa(BASIC_USER + ':' + BASIC_PASS) };
+    const r = await postJson(SERVER_URL + '/auth', campos, cabeceras);
+    if (!r.ok || !r.data.signature) {
+      throw new Error('No se pudieron obtener las credenciales de autenticación.');
+    }
+    return { timestamp: r.data.timestamp, nonce: r.data.nonce, signature: r.data.signature };
+  }
+
+  /* /auth + /cancel. Devuelve la respuesta de /cancel tal cual (ok, status, data). Cada pedido usa un /auth nuevo (nonce de un solo uso). */
+  async function iniciar() {
+    const campos = camposCancelacion();
+    const firma = await obtenerFirma(campos);
+    return postJson(SERVER_URL + '/cancel', { ...campos, ...firma }, CABECERAS);
+  }
+
+  /* Reasigna la tarea al usuario de integracion fijado en el ramo reasignar del WebReport.
+     La URL solo lleva los IDs de la tarea: el destino no lo elige la URL. */
+  async function reasignar() {
+    const h = state.handoff || {};
+    if (![h.workflowId, h.subworkflowId, h.taskId, REPORT_ID].every(esDigitos)) {
+      throw new Error('Datos de reasignación inválidos.');
+    }
+    const params = new URLSearchParams({
+      func: 'll',
+      objAction: 'RunReport',
+      objId: REPORT_ID,
+      workid: h.workflowId,
+      subworkid: h.subworkflowId,
+      taskid: h.taskId,
+      accion: 'reasignar'
+    });
+    let resp;
+    try {
+      resp = await fetch(OTCS_URL + '?' + params.toString(), { credentials: 'same-origin', cache: 'no-store' });
+    } catch (_) {
+      throw new Error('No se pudo reasignar la tarea: sin conexión con OpenText.');
+    }
+    const texto = await resp.text().catch(() => '');
+    if (!resp.ok || !texto.includes(MARCA_REASIGNADO)) {
+      throw new Error('No se pudo asignar la tarea. Verifique su sesión en OpenText y reintente.');
+    }
+  }
+
+  /* Cancelacion. Si el servidor exige reasignar antes (REASSIGN_REQUIRED: la tarea sigue con el usuario),
+     reasigna y repite /auth + /cancel una sola vez. Como en el /start, el servidor valida antes lo que puede.
+     /cancel hace el SendOn de la tarea al terminar: no hay una segunda confirmacion de asignacion. */
+  async function cancelar() {
+    let r = await iniciar();
+    if (reasignaRequerido(r) && r.data.handoff) {
+      state.handoff = r.data.handoff;
+      document.getElementById('paso-asignar').hidden = false;
+      pasoActivo('asignar');
+      await reasignar();
+      pasoActivo('cancelar');
+      r = await iniciar();
+      if (reasignaRequerido(r)) throw new Error(MSG_ASIGNAR);
+    }
+    if (!r.ok) throw errorServidor(r, 'No se pudo cancelar el flujo.');
+    state.acuerdoId = r.data.id || null;
+    state.yaCancelado = r.data.alreadyCancelled === true;
+  }
+
+  /* Valida lo que la pagina leyo del formulario. El servidor valida de nuevo con los atributos de OTCS. */
+  function validarDestino() {
+    const fallo = (msg) => Object.assign(new Error(msg), { sinReintento: true });
+    const flujo = DESTINO_FLUJO_RAW;
+    const sub = DESTINO_SUBFLUJO_RAW;
+    /* El WebReport muestra "?" cuando un atributo esta vacio. */
+    if (!esDigitos(flujo)) throw fallo(CODIGOS.MISSING_TARGET.mensaje);
+    if (sub && sub !== '?' && !esDigitos(sub)) throw fallo(CODIGOS.INVALID_TARGET.mensaje);
+    state.destinoFlujo = flujo;
+    state.destinoSubflujo = esDigitos(sub) ? sub : '';
+  }
+
+  /* Cancelacion completa. Reintentar la vuelve a ejecutar desde /auth. */
+  async function ejecutar() {
+    if (state.ocupado) return;
+    state.ocupado = true;
+    state.intentado = true;
+    reiniciarVista();
+    document.getElementById('pasos').hidden = false;
+    try {
+      pasoActivo('cancelar');
+      await cancelar();
+      mostrarExito();
+    } catch (err) {
+      mostrarError(err);
+    } finally {
+      state.ocupado = false;
+    }
+  }
+
+  /* Al abrir: solo muestra el flujo a cancelar y pide confirmacion. No llama al servidor. */
+  function iniciarVista() {
+    try {
+      validarDestino();
+    } catch (err) {
+      pintarDatos();
+      mostrarError(err);
+      return;
+    }
+    pintarDatos();
+    document.getElementById('vista-confirmar').hidden = false;
+    document.getElementById('btn-cancelar').hidden = false;
+  }
+
+  document.getElementById('btn-cancelar').addEventListener('click', ejecutar);
+  document.getElementById('btn-reintentar').addEventListener('click', ejecutar);
+  window.addEventListener('load', iniciarVista);
+})();
+</script>
+</body>
+</html>
+[LL_WEBREPORT_ENDIF /]

@@ -1,9 +1,9 @@
 [LL_WEBREPORT_EXCLUDEHTML /]
-[// Requisicion de Firma (WebReport 650835, flujo puro: WORKID = SUBWORKID). Ver webreports/README.md. /]
+[// Requisicion de Firma (WebReport 650835, flujo puro: WORKID = SUBWORKID). Ver webreports/firma-flujo-puro/README.md y webreports/README.md. /]
 [// Ramo reasignar: la propia pagina lo pide (mismo origen, sesion del usuario) para mover la tarea al usuario de integracion. /]
 [// La URL solo trae los IDs de la tarea (workid, subworkid, taskid). El destino es fijo en este ramo; la URL no lo elige. /]
 [LL_WEBREPORT_IF "[LL_REPTAG_&ACCION /]" == "reasignar" /]
-[// USUARIO DE INTEGRACION POR AMBIENTE: 11742766 = QA (AdminKeralty). En PROD cambiar este numero (ver webreports/README.md). /]
+[// USUARIO DE INTEGRACION POR AMBIENTE: 11742766 = QA (AdminKeralty). En PROD cambiar este numero (ver webreports/firma-flujo-puro/README.md). /]
 [LL_REPTAG_{'[LL_REPTAG_&WORKID /]','[LL_REPTAG_&SUBWORKID /]','[LL_REPTAG_&TASKID /]'} WFTASKACTION:REASSIGN:11742766 /]
 REASIGNADO_OK
 [LL_WEBREPORT_ELSE /]

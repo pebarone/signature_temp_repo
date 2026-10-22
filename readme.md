@@ -176,8 +176,8 @@ python3, make and g++ to compile.
 
 ## 🔏 `/auth` and `/start` (WebReport)
 
-Two WebReports call these endpoints from the browser (see [`webreports/README.md`](webreports/README.md): which node to
-replace per environment, the rollout order and the QA checklist). Protocol **v2**:
+The WebReports call these endpoints from the browser: one per flow, in [`webreports/`](webreports/README.md) (pure-flow signing, hiring sub-flow signing
+and cancellation, each with its own README: which node to replace per environment and the QA checklist; the index has the shared protocol and the rollout order). Protocol **v2**:
 
 1. `POST /auth` (Basic Auth: `START_AUTH_USER`/`START_AUTH_PASS`, or `LOG_USER`/`LOG_PASS`) with JSON
    `{workflowId, subworkflowId, nodeId, attachId, docName, userEmail1, userEmail2}` returns
@@ -395,8 +395,10 @@ it does not provide an atomic lock against other processes writing the same node
 ├── .env                  # Environment variables (not committed)
 ├── package.json
 ├── readme.md
-├── template.html         # WebReport "Requisicion de Firma" (pure flow): POST /auth + POST /start (v2)
-├── webreports/           # WebReport of the hiring sub-flow + README (rollout, per-environment changes, QA checklist)
+├── webreports/           # WebReports, one folder per flow, each with its README (index + shared protocol, rollout, QA checklists)
+│   ├── firma-flujo-puro/     # "Requisicion de Firma" (pure flow): POST /auth + POST /start (v2)
+│   ├── firma-contratacion/   # "Requisicion de Firma_Contratacion" (hiring sub-flow)
+│   └── cancelacion/          # "Cancelar Flujo de Firma": POST /auth + POST /cancel
 ├── static/               # logs viewer (logs.html/js/css)
 ├── docs/                 # design notes (DESIGN_TICKET_2026062210004476.md, DESIGN_TICKET_2026060410003715.md) and flow rules (REGLAS_DEL_FLUJO.md)
 ├── deploy/openshift/     # PVC + README (example)

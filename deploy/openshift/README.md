@@ -221,7 +221,7 @@ oc create secret generic signature-orchestrator-env \
 
 - Para não deixar senhas no histórico do shell, prefira `--from-env-file=<arquivo-fora-do-repo>` (linhas `CHAVE=valor`) e apague o arquivo depois.
 - `START_AUTH_USER` e `START_AUTH_PASS` são opcionais (as duas ou nenhuma): Basic Auth próprio do `POST /auth`, a credencial
-  embutida no WebReport (ver `webreports/README.md`). Sem elas vale `LOG_USER`/`LOG_PASS`. Acrescente-as com `--from-literal`.
+  embutida no WebReport (ver `webreports/README.md` e o README da pasta de cada WebReport). Sem elas vale `LOG_USER`/`LOG_PASS`. Acrescente-as com `--from-literal`.
 - `ADOBE_REFRESH_TOKEN` é opcional: acrescente `--from-literal=ADOBE_REFRESH_TOKEN='<...>'` somente se for semear o token (ver seção 3).
 - Se o Secret já existir, atualize-o com `oc create secret generic ... --dry-run=client -o yaml | oc apply -f -`.
 

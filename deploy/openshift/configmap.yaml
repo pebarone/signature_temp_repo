@@ -76,7 +76,7 @@ data:
   START_FIELD_EMAILS: "Email Firmante 1,Email Firmante 2"
   # Origens com CORS em /auth e /start (lista). Vazio => a origem de OTCS_BASE. Em PROD, a do OTCS de produção
   CORS_ORIGINS: "https://otcs.g115.opentext.cloud"
-  # SÓ durante a migração dos WebReports (ver webreports/README.md): ligar "true" no deploy, publicar os WebReports novos,
+  # SÓ durante a migração dos WebReports (ver webreports/README.md, índice dos WebReports por fluxo): ligar "true" no deploy, publicar os WebReports novos,
   # testar e voltar para "false". Aceitam GET /auth + assinatura v1 e o GET /start antigo (sempre validados contra o OTCS)
   START_LEGACY_SIGNATURE: "false"
   START_LEGACY_GET_ENABLED: "false"
