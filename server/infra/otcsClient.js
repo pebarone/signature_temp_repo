@@ -133,12 +133,20 @@ function createOtcsClient({
     Tarefas do processo: GET /v2/workflows/status/processes/{id} => results.step_list.{current,completed,next}[].
     Normaliza para { current, completed, next } com itens { processId, subprocessId, taskId, name, status }.
   */
+  // assigneeIds: userIds dos responsáveis pela tarefa (task_assignees.assignee[].userId); null quando o OTCS não
+  // informa task_assignees (desconhecido) — [] significa "informado e sem responsável".
+  const toAssigneeIds = (ta) => {
+    if (!ta || typeof ta !== 'object') return null;
+    const list = Array.isArray(ta.assignee) ? ta.assignee : (ta.assignee ? [ta.assignee] : []);
+    return list.map((a) => Number(a?.userId)).filter((n) => Number.isFinite(n));
+  };
   const toStep = (s) => ({
     processId: Number(s.process_id),
     subprocessId: Number(s.subprocess_id),
     taskId: Number(s.task_id),
     name: String(s.task_name ?? ''),
-    status: s.task_status === undefined || s.task_status === null ? '' : String(s.task_status)
+    status: s.task_status === undefined || s.task_status === null ? '' : String(s.task_status),
+    assigneeIds: toAssigneeIds(s.task_assignees)
   });
   const getProcessSteps = (processId) => withTicket(async (tck) => {
     const rsp = await http.get(`${base}/v2/workflows/status/processes/${encodeURIComponent(processId)}`, {
@@ -152,6 +160,51 @@ function createOtcsClient({
     }
     return out;
   });
+
+  /*
+    Atributos do workflow (processo): GET /v2/workflows/status/info?workid={id}.
+    => { [DisplayName]: valor (string; null => '') }. Não exige que a tarefa esteja atribuída ao usuário, mas para
+    SUB-workflows o OTCS só devolve os atributos do processo PAI: use apenas com subprocessId == processId.
+  */
+  const scalar = (v) => (v === undefined || v === null || typeof v === 'object' ? '' : String(v));
+  const getWorkflowAttributes = (processId) => withTicket(async (tck) => {
+    const rsp = await http.get(`${base}/v2/workflows/status/info`, {
+      params: { workid: processId },
+      headers: { OTCSTicket: tck },
+      timeout: timeoutMs
+    });
+    const attrs = rsp.data?.results?.Attributes || rsp.data?.Attributes || {};
+    const children = Array.isArray(attrs.Content?.RootSet?.Children) ? attrs.Content.RootSet.Children : [];
+    const stepValues = attrs.StepData?.AttrData?.Values?.[0] || {};
+    const mirror = attrs.Content?.RootSet?.ValueTemplate?.Values?.[0] || {};
+    // Valor: { Values: [v] } (AttrData) ou o próprio escalar/objeto do espelho (ValueTemplate)
+    const pick = (entry) => (entry && typeof entry === 'object' && Array.isArray(entry.Values) ? entry.Values[0] : entry);
+    const out = {};
+    for (const child of children) {
+      const label = child?.DisplayName;
+      if (!label || child.ID === undefined || child.ID === null) continue;
+      const key = String(child.ID);
+      out[label] = scalar(key in stepValues ? pick(stepValues[key]) : pick(mirror[key]));
+    }
+    return out;
+  });
+
+  // Usuário da sessão (o de integração): GET /v1/auth. Nunca muda para a mesma instância, então fica em cache.
+  let currentUser = null;
+  const getCurrentUser = () => {
+    if (currentUser) return currentUser;
+    const p = withTicket(async (tck) => {
+      const rsp = await http.get(`${base}/v1/auth`, { headers: { OTCSTicket: tck }, timeout: timeoutMs });
+      const d = rsp.data?.data || rsp.data || {};
+      const id = Number(d.id);
+      if (!Number.isFinite(id) || id <= 0) throw new Error('Respuesta inválida al consultar el usuario actual');
+      return { id, name: String(d.name ?? d.login_name ?? '') };
+    });
+    currentUser = p;
+    // Falha não fica em cache: a próxima chamada tenta de novo
+    p.catch(() => { if (currentUser === p) currentUser = null; });
+    return p;
+  };
 
   /*
     Formulário de uma tarefa: GET /v1/forms/processes/tasks/update?process_id=&subprocess_id=&task_id=.
@@ -196,7 +249,8 @@ function createOtcsClient({
   });
 
   return {
-    ensureTicket, downloadNode, uploadToFolder, addVersion, sendOnWorkflow, getProcessSteps, getTaskForm, updateTaskForm
+    ensureTicket, downloadNode, uploadToFolder, addVersion, sendOnWorkflow, getProcessSteps, getTaskForm, updateTaskForm,
+    getWorkflowAttributes, getCurrentUser
   };
 }
 

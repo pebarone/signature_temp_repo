@@ -193,6 +193,26 @@ flujo." (details only in the log). Missing `DocID`/`AttachID`/e-mails in the for
 => `409` "La tarea no está asignada al usuario de integración."; process `404` => `409` "Flujo no encontrado."; network
 error/timeout/5xx => `503` "Content Server no disponible; intente nuevamente.".
 
+**Order: send, confirm, then the page reassigns.** The WebReport calls `/start` first and only after it confirms the
+agreement does the page itself (in the user's own OTCS session) run `WFTASKACTION:REASSIGN` to the integration user, so a
+failed send or a closed page leaves the task in the user's inbox for a retry. The server therefore accepts the start task
+while it is still assigned to the human user (`task_assignees` of `/v2/workflows/status/processes/{id}` compared with
+`GET /v1/auth`):
+
+- assigned to the integration user: the form is read, as before (the old WebReport, which reassigns at render time, keeps working);
+- still with the human user, **standalone flow** (`subprocessId == processId`): `DocID`/`AttachID`/name/e-mails come from
+  `GET /v2/workflows/status/info?workid={id}` (same labels, validation and payload check);
+- still with the human user, **sub-workflow**: `409` `{ error: "La tarea debe asignarse al usuario de integración antes del envío.",
+  code: "REASSIGN_REQUIRED", handoff }` and nothing is created (`status/info` only returns the parent's attributes and the form
+  needs the task assigned to the integration user). The page must reassign first and call `/auth` + `/start` again.
+
+Every `200` carries `handoff: { workflowId, subworkflowId, taskId, integrationUserId, assigned }` (numbers): what the page
+reassigns when `assigned` is `false`. It is also returned with `existing: true` while the start task is still current (it is
+omitted once the task has advanced, and without `START_VERIFY_WORKFLOW`). While the task is not assigned to the integration
+user the background `SendOn` waits (no error log, normal retry backoff; when the attempts run out the agreement goes to
+`needs_attention` asking to reopen the page). Repeating `/start` after the REASSIGN (`existing: true`) resumes the start
+step immediately instead of waiting for the backoff.
+
 **Idempotency** (only with the validation): if there is already a non-final agreement (no final result and no disposition
 sent) for the same `workflowId` + resolved `subworkflowId` + `nodeId`, `/start` returns `200`
 `{ message: "Signature already requested. ID: ...", id, existing: true }` and creates nothing (page reload after a network
@@ -312,7 +332,7 @@ it does not provide an atomic lock against other processes writing the same node
 ## 🛡️ Security
 
 - No sensitive tokens are exposed on the frontend. The WebReport only holds the Basic credential of `/auth` (use `START_AUTH_*`, which does not open `/admin` or `/logs`); the HMAC key never leaves the server.
-- `/start` cannot be forged from the browser: the signature binds the request fields, expires in 2 min and its nonce is single use; the server re-reads the workflow in the OTCS and uses those values (the integration user must hold the start task).
+- `/start` cannot be forged from the browser: the signature binds the request fields, expires in 2 min and its nonce is single use; the server re-reads the workflow in the OTCS and uses those values (from the start task form when the integration user holds it, or from the workflow attributes while a standalone task is still with the user; the `SendOn` only happens once the integration user holds the task).
 - CORS is limited to `/auth` and `/start` and to the OTCS origin (`CORS_ORIGINS`).
 - Passwords and keys are read from the `.env` file.
 - Webhook filters out irrelevant events and only processes mapped agreements; events are deduplicated and failures are retried, never swallowed.

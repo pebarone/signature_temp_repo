@@ -25,11 +25,14 @@ function startRoutes({ config, logger, signatureService, startBasicAuth, verifyS
 
   async function runStart(fields, res, options) {
     try {
-      const { id, existing } = await signatureService.start(fields, options);
-      // `message` mantém a compatibilidade com o template.html
-      if (existing) return res.json({ message: `Signature already requested. ID: ${id}`, id, existing: true });
-      res.json({ message: `Signature requested. ID: ${id}`, id });
+      const { id, existing, handoff } = await signatureService.start(fields, options);
+      // `message` mantém a compatibilidade com o template.html. `handoff` (quando há) diz à página o que reatribuir
+      // ao usuário de integração depois do envio: { workflowId, subworkflowId, taskId, integrationUserId, assigned }.
+      const extra = handoff ? { handoff } : {};
+      if (existing) return res.json({ message: `Signature already requested. ID: ${id}`, id, existing: true, ...extra });
+      res.json({ message: `Signature requested. ID: ${id}`, id, ...extra });
     } catch (e) {
+      // Corpos de ServiceError são fixos e genéricos; o 409 REASSIGN_REQUIRED leva também { code, handoff }
       if (e instanceof ServiceError) return res.status(e.status).json(e.body);
       logger.error(`[START ERROR] ${describeError(e)}`);
       res.status(500).json({ error: START_ERROR_MESSAGE });

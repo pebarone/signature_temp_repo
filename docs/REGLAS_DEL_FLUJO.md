@@ -62,10 +62,37 @@ fora da integração), `sign_subprocess_id`/`sign_task_id` (tarefa de firma reso
 ## 4. Etapas
 
 ### 4.1 start — envio do pedido de firma
+- Ordem nova do WebReport: **enviar → confirmar → reatribuir**. A página chama o `/start` primeiro; só depois que ele
+  confirma o acordo no Adobe a própria página (na sessão do usuário humano) reatribui a tarefa ao usuário de integração
+  (`WFTASKACTION:REASSIGN`). Se o envio falha ou a página fecha, a tarefa continua na caixa do usuário e ele pode repetir.
+  O WebReport antigo (REASSIGN na renderização, depois `/start`) continua funcionando: tarefa já atribuída → caminho do
+  formulário → SendOn imediato.
 - O `/start` só cria o acordo (com `externalId`), grava o registro com `start_sendon_done=false` e dispara a etapa em
   background; responde sem esperá-la.
+- Origem dos atributos (`DocID`, `AttachID`, nome, e-mails), conforme quem está com a tarefa de início
+  (`task_assignees` de `status/processes/{id}` × `GET /v1/auth`):
+  - atribuída ao usuário de integração → formulário da tarefa (como sempre; 401/403 → `409`);
+  - com o usuário humano + **fluxo puro** (`subprocessId == processId`) → `GET /v2/workflows/status/info?workid={id}`
+    (rótulos = `START_FIELD_*`; o mesmo conjunto de validações 422/409);
+  - com o usuário humano + **sub-workflow** → `409` `REASSIGN_REQUIRED` (o `status/info` só devolve os atributos do
+    **pai**, e o formulário exige a tarefa no usuário de integração): a página reatribui antes e repete o `/start`
+    (com novo `/auth`: o nonce é de uso único).
+  - `task_assignees` ausente na resposta do OTCS → trata como atribuída (caminho antigo), sem consultar `GET /v1/auth`
+    (`handoff.integrationUserId` vem `null`; o SendOn é tentado direto).
+- A resposta do `/start` leva `handoff` = `{ workflowId, subworkflowId, taskId, integrationUserId, assigned }` (números):
+  o que a página deve reatribuir quando `assigned=false`. Também vem no `existing: true` enquanto a tarefa de início
+  ainda está `current`; com ela já avançada, `handoff` é omitido (nada a reatribuir). Sem `START_VERIFY_WORKFLOW`, não há `handoff`.
+- Repetir o `/start` (`existing: true`) com a etapa start ainda pendente retoma a reconciliação do acordo na hora
+  (`resumeStart`: ignora o backoff e reabre um `needs_attention` `retries_exhausted`), então o SendOn sai logo após o
+  REASSIGN da página. A reconciliação é serializada por acordo; repetir é seguro.
 - A etapa consulta `GET /v2/workflows/status/processes/{workflowId}` e localiza a tarefa por `START_TASK_NAMES`:
-  - `current` → (opcional: grava os atributos) → SendOn com `processId/subprocessId/taskId` resolvidos → `start_sendon_done=true`.
+  - `current` e atribuída ao usuário de integração → (opcional: grava os atributos) → SendOn com
+    `processId/subprocessId/taskId` resolvidos → `start_sendon_done=true`.
+  - `current` mas ainda atribuída ao usuário (a página não reatribuiu) → **não** tenta SendOn: estado transitório
+    "aguardando reatribuição" (`status: waiting_handoff`), sem log de erro; conta como tentativa da etapa start e
+    reagenda com o backoff normal (1 min, 2 min, 4 min…). Esgotado `RETRY_MAX_ATTEMPTS`, `needs_attention`
+    (`retries_exhausted`) com o motivo "la tarea de envío (N) sigue asignada al usuario; reabra la página para completar el
+    envío". Reabre sozinho após `ATTENTION_RETRY_HOURS` ou ao repetir o `/start` da página.
   - já `completed`, ou a tarefa de firma já está `current/completed` → só marca como feito (nada é enviado).
   - não encontrada / SendOn com erro → retry com backoff (o WebReport pode ainda estar ocupando a tarefa).
   - processo inexistente (404) → `needs_attention` permanente.

@@ -119,13 +119,21 @@ function seedAdobeForEvent(adobe, event, id, payload = {}) {
 // Nomes reais dos mapas de workflow (PROD/QA)
 const START_TASK_NAME = 'Enviar solicitud de firma (Empleado y/o Firmante 2)';
 const SIGN_TASK_NAME = 'Aguardar Firma';
+// Usuário de integração (OTCS_USER) do OTCS falso e um usuário humano qualquer (dono da tarefa antes do REASSIGN)
+const INTEGRATION_USER_ID = 11742766;
+const HUMAN_USER_ID = 279463;
 
 /*
   OTCS falso. `gate` (Promise) segura a escrita do PDF até ser liberada (teste de "200 rápido").
   Modelo de workflow em memória (`workflows`): processo -> tarefas { subprocessId, taskId, name, status }.
   `addWorkflow(processId, { subprocessId, stage })`: subprocessId diferente do processo simula um sub-fluxo.
   O SendOn da tarefa de início ativa "Aguardar Firma"; a disposição conclui a tarefa de firma.
-  Chamadas ao modelo (getProcessSteps/getTaskForm/updateTaskForm) vão para `modelCalls` (não poluem `calls`).
+  Chamadas ao modelo (getProcessSteps/getTaskForm/updateTaskForm/getWorkflowAttributes/getCurrentUser) vão para
+  `modelCalls` (não poluem `calls`).
+  Responsáveis: cada tarefa tem `assignees` (userIds; ausente = usuário de integração). `addWorkflow(..., { assignee })`
+  define o dono das tarefas e `assign(processId, taskId, userId)` reatribui (o REASSIGN da página). Com a tarefa fora do
+  usuário de integração, getTaskForm e sendOnWorkflow respondem 403, como no OTCS.
+  Atributos do workflow (status/info): `workflowAttributes[processId]` ({ rótulo: valor }); sem entrada, vêm de `formFields`.
 */
 function makeOtcs(calls = []) {
   const otcs = {
@@ -150,9 +158,13 @@ function makeOtcs(calls = []) {
     formFailure: null,       // se definido, getTaskForm lança
     customActions: ['Firmado', 'Rechazado'],
     formFields: {},          // rótulo -> { key, value } devolvido por getTaskForm
+    integrationUserId: INTEGRATION_USER_ID,
+    currentUserFailure: null, // se definido, getCurrentUser lança
+    workflowAttributes: {},  // processId -> { rótulo: valor } devolvido por getWorkflowAttributes
+    attributesFailure: null, // se definido, getWorkflowAttributes lança
     updateFormFailures: 0,
     updateFormCalls: [],
-    addWorkflow(processId, { subprocessId = processId, stage = 'sign' } = {}) {
+    addWorkflow(processId, { subprocessId = processId, stage = 'sign', assignee = null } = {}) {
       const sub = Number(subprocessId);
       const status = {
         start: ['current', 'next'],
@@ -168,7 +180,19 @@ function makeOtcs(calls = []) {
           { subprocessId: sub, taskId: 4, name: 'Firmado?', status: 'next' }
         ]
       };
+      if (assignee !== null) for (const t of otcs.workflows[String(processId)].tasks) t.assignees = [Number(assignee)];
       return otcs.workflows[String(processId)];
+    },
+    // REASSIGN da tarefa a outro usuário (a página faz isso na sessão do usuário humano)
+    assign(processId, taskId, userId) {
+      otcs.task(processId, taskId).assignees = [Number(userId)];
+    },
+    assignedToIntegration(t) {
+      return !t || !t.assignees || t.assignees.includes(otcs.integrationUserId);
+    },
+    // Responsáveis desconhecidos (task_assignees ausente) em todas as tarefas do workflow
+    unknownAssignees(processId) {
+      for (const t of otcs.workflows[String(processId)].tasks) t.assignees = null;
     },
     task(processId, taskId) {
       return otcs.workflows[String(processId)]?.tasks.find((t) => t.taskId === Number(taskId));
@@ -210,7 +234,9 @@ function makeOtcs(calls = []) {
       const out = { current: [], completed: [], next: [] };
       for (const t of wf.tasks) {
         out[t.status].push({
-          processId: wf.processId, subprocessId: t.subprocessId, taskId: t.taskId, name: t.name, status: t.status
+          processId: wf.processId, subprocessId: t.subprocessId, taskId: t.taskId, name: t.name, status: t.status,
+          // t.assignees === null simula um OTCS que não informa task_assignees (assigneeIds null)
+          assigneeIds: t.assignees === null ? null : [...(t.assignees || [otcs.integrationUserId])]
         });
       }
       return out;
@@ -218,7 +244,23 @@ function makeOtcs(calls = []) {
     async getTaskForm(processId, subprocessId, taskId) {
       otcs.modelCalls.push(['getTaskForm', Number(processId), Number(subprocessId), Number(taskId)]);
       if (otcs.formFailure) throw otcs.formFailure;
+      const t = (otcs.workflows[String(processId)]?.tasks || [])
+        .find((x) => x.taskId === Number(taskId) && x.subprocessId === Number(subprocessId));
+      if (!otcs.assignedToIntegration(t)) throw httpError(403, 'task not assigned to the integration user');
       return { title: 'Tarea', customActions: [...otcs.customActions], fields: otcs.formFields };
+    },
+    async getWorkflowAttributes(processId) {
+      otcs.modelCalls.push(['getWorkflowAttributes', Number(processId)]);
+      if (otcs.attributesFailure) throw otcs.attributesFailure;
+      if (!otcs.workflows[String(processId)]) throw httpError(404, 'process not found');
+      const explicit = otcs.workflowAttributes[String(processId)];
+      if (explicit) return { ...explicit };
+      return Object.fromEntries(Object.entries(otcs.formFields).map(([label, f]) => [label, f.value == null ? '' : String(f.value)]));
+    },
+    async getCurrentUser() {
+      otcs.modelCalls.push(['getCurrentUser']);
+      if (otcs.currentUserFailure) throw otcs.currentUserFailure;
+      return { id: otcs.integrationUserId, name: 'AdminKeralty' };
     },
     async updateTaskForm(processId, subprocessId, taskId, values) {
       otcs.modelCalls.push(['updateTaskForm', Number(processId), Number(subprocessId), Number(taskId)]);
@@ -246,6 +288,7 @@ function makeOtcs(calls = []) {
         if (task.status !== 'current' || Number(args.subworkflowId) !== task.subprocessId) {
           throw httpError(409, 'task is not current');
         }
+        if (!otcs.assignedToIntegration(task)) throw httpError(403, 'task not assigned to the integration user');
         task.status = 'completed';
         const next = otcs.task(args.workflowId, Number(args.taskId) + 1);
         if (next && next.status === 'next') next.status = 'current';
@@ -317,7 +360,8 @@ async function buildWorld({
     clearTimer: (t) => { if (t) t.cleared = true; }
   });
   const signatureService = createSignatureService({
-    repo, adobe, otcs, logger, config, now: clock.now, onCreated: (id) => reconciliation.reconcile(id)
+    repo, adobe, otcs, logger, config, now: clock.now,
+    onCreated: (id, ctx) => (ctx?.existing ? reconciliation.resumeStart(id) : reconciliation.reconcile(id))
   });
   const poller = createPoller({ repo, adobe, processor: reconciliation, config, logger, now: clock.now });
   tokenStore = tokenStore || makeTokenStore();
@@ -417,9 +461,10 @@ function startBodyV1(world, over = {}) {
 
 /*
   Formulário da tarefa de início no OTCS falso (atributos do workflow) + o workflow na tarefa de início.
-  Devolve o workflow. `fields` sobrescreve/remove (null) atributos pelo rótulo.
+  Devolve o workflow. `fields` sobrescreve/remove (null) atributos pelo rótulo; `assignee` (userId) é o dono das tarefas
+  (padrão: usuário de integração).
 */
-function seedStartFlow(world, { processId = '3003', subprocessId = '3004', stage = 'start', fields = {} } = {}) {
+function seedStartFlow(world, { processId = '3003', subprocessId = '3004', stage = 'start', fields = {}, assignee = null } = {}) {
   const base = {
     DocID: '1001',
     AttachID: '2002',
@@ -432,12 +477,12 @@ function seedStartFlow(world, { processId = '3003', subprocessId = '3004', stage
   for (const [label, value] of Object.entries(base)) {
     if (value !== null) world.otcs.formFields[label] = { key: `k_${label.replace(/\W/g, '')}`, value };
   }
-  return world.otcs.addWorkflow(processId, { subprocessId, stage });
+  return world.otcs.addWorkflow(processId, { subprocessId, stage, assignee });
 }
 
 const basicHeader = (user, pass) => 'Basic ' + Buffer.from(`${user}:${pass}`).toString('base64');
 
 module.exports = {
-  PDF, T0, START_TASK_NAME, SIGN_TASK_NAME, makeClock, makeLogger, makeAdobe, makeOtcs, makeTokenStore, httpError, tmpDir, buildWorld,
+  PDF, T0, START_TASK_NAME, SIGN_TASK_NAME, INTEGRATION_USER_ID, HUMAN_USER_ID, makeClock, makeLogger, makeAdobe, makeOtcs, makeTokenStore, httpError, tmpDir, buildWorld,
   seedAdobeForEvent, seedAgreement, webhookPayload, waitFor, startBody, startBodyV1, seedStartFlow, basicHeader
 };

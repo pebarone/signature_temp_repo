@@ -204,6 +204,19 @@ function createReconciliationService({
     return registerFailure(id, stage, e, { permanent: !allow4xx && state.isPermanentHttpError(e) });
   }
 
+  // Tarefa de início ainda atribuída ao usuário (não ao de integração): estado transitório "aguardando reatribuição".
+  // Conta como tentativa da etapa start (backoff e limite normais), mas sem log de erro; esgotadas as tentativas,
+  // needs_attention com o motivo explícito (reabre sozinho após ATTENTION_RETRY_HOURS ou ao repetir o /start).
+  function waitForHandoff(id, rec, t) {
+    const message = `la tarea de envío (${t.taskId}) sigue asignada al usuario; reabra la página para completar el envío`;
+    const { patch, delayMs, attention, attentionKind } = state.failurePatch(rec, 'start', message, now().getTime(), backoff);
+    repo.upsert(id, patch);
+    if (attention) return markAttention(id, attention, attentionKind);
+    logger.info(`[${id}] ${message} (intento ${patch.attempts}); próximo intento: ${patch.nextAttemptAt}`);
+    scheduleRetry(id, delayMs);
+    return { status: 'waiting_handoff', stage: 'start', attempts: patch.attempts };
+  }
+
   /*
     start: localiza a tarefa de início pelo nome e faz o SendOn. Já concluída (ou a tarefa de firma já ativa/concluída)
     => só marca como feito. `steps` evita uma segunda consulta quando o chamador já a fez.
@@ -220,6 +233,19 @@ function createReconciliationService({
 
     if (start.where === 'current') {
       const t = start.task;
+      // O WebReport só reatribui a tarefa ao usuário de integração DEPOIS do /start: enquanto ela está com o usuário
+      // humano não há SendOn possível (nem erro): espera a reatribuição com o backoff normal
+      // assigneeIds null = o OTCS não informou os responsáveis: segue como antes (tenta o SendOn), sem consultar o usuário
+      if (Array.isArray(t.assigneeIds)) {
+        let integrationUserId;
+        try {
+          integrationUserId = Number((await otcs.getCurrentUser())?.id);
+          if (!Number.isFinite(integrationUserId)) throw new Error('usuario de integración desconocido');
+        } catch (e) {
+          return { result: registerFailure(id, 'start', e) };
+        }
+        if (!t.assigneeIds.includes(integrationUserId)) return { result: waitForHandoff(id, rec, t) };
+      }
       await syncWorkflowAttributes(id, { located: start }); // antes do SendOn; nunca falha
       try {
         await otcs.sendOnWorkflow({
@@ -569,6 +595,19 @@ function createReconciliationService({
     return enqueue(String(id), { force: true, refresh: false, ...opts });
   }
 
+  /*
+    Retoma a etapa start de um acordo existente (o /start foi repetido, p.ex. depois de a página reatribuir a tarefa):
+    ignora o backoff e, se as tentativas já tinham esgotado (needs_attention retries_exhausted), reabre uma rodada nova.
+    Serializado por acordo como qualquer reconcile; seguro de repetir.
+  */
+  function resumeStart(id) {
+    id = String(id);
+    const rec = repo.get(id);
+    const reopen = !!rec && state.isStartPending(rec)
+      && rec.state === state.STATES.NEEDS_ATTENTION && rec.attentionKind === ATTENTION_KINDS.RETRIES_EXHAUSTED;
+    return reconcile(id, reopen ? { manual: true } : {});
+  }
+
   /* ---------- adoção de acordos desconhecidos ---------- */
 
   const isNotOurs = (id) => {
@@ -845,7 +884,7 @@ function createReconciliationService({
   }
 
   return {
-    handleEvent, handleStatus, applyAdobeStatus, reconcile, runQueue, reopenStale, adopt, stop
+    handleEvent, handleStatus, applyAdobeStatus, reconcile, resumeStart, runQueue, reopenStale, adopt, stop
   };
 }
 

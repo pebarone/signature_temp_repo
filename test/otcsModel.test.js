@@ -103,7 +103,10 @@ test('otcs.getProcessSteps: normaliza step_list (números como Number) e tolera 
     data: {
       results: {
         step_list: {
-          current: [{ process_id: '43693053', subprocess_id: '43701548', task_id: '3', task_name: 'Aguardar Firma', task_status: 'ontime' }],
+          current: [{
+            process_id: '43693053', subprocess_id: '43701548', task_id: '3', task_name: 'Aguardar Firma', task_status: 'ontime',
+            task_assignees: { assignee: [{ userId: 11742766, loginName: 'AdminKeralty' }, { userId: '279463' }], assigneeCount: 2 }
+          }],
           completed: [{ process_id: 43693053, subprocess_id: 43701548, task_id: 2, task_name: 'Enviar solicitud de firma (Empleado y/o Firmante 2)' }]
         }
       }
@@ -112,11 +115,78 @@ test('otcs.getProcessSteps: normaliza step_list (números como Number) e tolera 
   const steps = await client.getProcessSteps(43693053);
   assert.equal(seen[0].url, 'https://otcs.invalid/api/v2/workflows/status/processes/43693053');
   assert.deepEqual(steps.current, [
-    { processId: 43693053, subprocessId: 43701548, taskId: 3, name: 'Aguardar Firma', status: 'ontime' }
+    {
+      processId: 43693053, subprocessId: 43701548, taskId: 3, name: 'Aguardar Firma', status: 'ontime',
+      assigneeIds: [11742766, 279463]
+    }
   ]);
   assert.equal(steps.completed[0].taskId, 2);
   assert.equal(steps.completed[0].status, '');
+  // sem task_assignees: responsáveis desconhecidos (null); informado e vazio: []
+  assert.equal(steps.completed[0].assigneeIds, null);
   assert.deepEqual(steps.next, []);
+});
+
+test('otcs.getProcessSteps: assigneeIds vazio quando task_assignees informa nenhum responsável', async () => {
+  const { client } = otcsStub(() => ({
+    data: { results: { step_list: { current: [
+      { process_id: 1, subprocess_id: 1, task_id: 2, task_name: 'x', task_assignees: { assignee: [], assigneeCount: 0 } },
+      { process_id: 1, subprocess_id: 1, task_id: 3, task_name: 'y', task_assignees: { assignee: { userId: 7 }, assigneeCount: 1 } }
+    ] } } }
+  }));
+  const steps = await client.getProcessSteps(1);
+  assert.deepEqual(steps.current.map((s) => s.assigneeIds), [[], [7]]);
+});
+
+test('otcs.getWorkflowAttributes: status/info => { DisplayName: valor } (StepData; espelho ValueTemplate; null => "")', async () => {
+  const { client, seen } = otcsStub(() => ({
+    data: {
+      results: {
+        Attributes: {
+          Content: {
+            RootSet: {
+              Children: [
+                { ID: 11, DisplayName: 'DocID' },
+                { ID: 12, DisplayName: 'AttachID' },
+                { ID: 13, DisplayName: 'Email Firmante 2' },
+                { ID: 14, DisplayName: 'Nombre del Documento' },
+                { DisplayName: 'sem id' }
+              ],
+              ValueTemplate: { Values: [{ 14: { Values: ['espelho.pdf'] }, 11: { Values: ['0'] } }] }
+            }
+          },
+          StepData: { AttrData: { Values: [{ 11: { Values: [1001] }, 12: { Values: ['2002'] }, 13: { Values: [null] } }] } }
+        }
+      }
+    }
+  }));
+  const attrs = await client.getWorkflowAttributes(3003);
+  assert.equal(seen[0].url, 'https://otcs.invalid/api/v2/workflows/status/info');
+  assert.deepEqual(seen[0].opts.params, { workid: 3003 });
+  assert.equal(seen[0].opts.headers.OTCSTicket, 'tk');
+  assert.deepEqual(attrs, { DocID: '1001', AttachID: '2002', 'Email Firmante 2': '', 'Nombre del Documento': 'espelho.pdf' });
+
+  const empty = otcsStub(() => ({ data: {} }));
+  assert.deepEqual(await empty.client.getWorkflowAttributes(1), {});
+});
+
+test('otcs.getCurrentUser: GET /v1/auth => { id, name }, em cache; resposta inválida não fica em cache', async () => {
+  let n = 0;
+  let body = { data: { id: 11742766, name: 'AdminKeralty' } };
+  const { client, seen } = otcsStub(() => { n++; return { data: body }; });
+  assert.deepEqual(await client.getCurrentUser(), { id: 11742766, name: 'AdminKeralty' });
+  assert.deepEqual(await client.getCurrentUser(), { id: 11742766, name: 'AdminKeralty' });
+  assert.equal(n, 1, 'uma só consulta');
+  assert.equal(seen[0].url, 'https://otcs.invalid/api/v1/auth');
+  assert.equal(seen[0].opts.headers.OTCSTicket, 'tk');
+
+  // formato alternativo (id no topo) e falha sem cache
+  body = { id: 5, name: 'x' };
+  assert.deepEqual(await otcsStub(() => ({ data: body })).client.getCurrentUser(), { id: 5, name: 'x' });
+  const bad = otcsStub(() => ({ data: { data: {} } }));
+  await assert.rejects(() => bad.client.getCurrentUser());
+  await assert.rejects(() => bad.client.getCurrentUser());
+  assert.equal(bad.seen.length, 2, 'a falha não é guardada em cache');
 });
 
 test('otcs.getTaskForm: disposições (chaves) e atributos por rótulo (schema.title, fallback options.label)', async () => {

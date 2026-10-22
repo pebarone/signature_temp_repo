@@ -9,7 +9,8 @@ const { openDatabase, MIGRATIONS } = require('../server/infra/db');
 const { createAgreementRepository } = require('../server/infra/agreementRepository');
 const { canonicalStart, signStart } = require('../server/http/middleware/hmac');
 const {
-  buildWorld, startBody, startBodyV1, seedStartFlow, basicHeader, makeClock, waitFor, httpError, tmpDir
+  buildWorld, startBody, startBodyV1, seedStartFlow, basicHeader, makeClock, waitFor, httpError, tmpDir,
+  INTEGRATION_USER_ID, HUMAN_USER_ID
 } = require('./support/fakes');
 
 const OTCS_BASE = 'https://otcs.example.test/cs/cs/api';
@@ -458,7 +459,9 @@ test('/start verificado: segundo envio igual devolve o mesmo acordo (200, existi
   seedStartFlow(world);
   let r = await authThenStart(world);
   assert.equal(r.status, 200);
-  assert.deepEqual(await r.json(), { message: 'Signature requested. ID: AG-1', id: 'AG-1' });
+  // handoff: o que a página reatribui (tarefa já no usuário de integração => assigned: true)
+  const handoff = { workflowId: 3003, subworkflowId: 3004, taskId: 2, integrationUserId: INTEGRATION_USER_ID, assigned: true };
+  assert.deepEqual(await r.json(), { message: 'Signature requested. ID: AG-1', id: 'AG-1', handoff });
   assert.equal(world.adobe.created.length, 1);
 
   // enquanto a tarefa de início ainda está "current" (SendOn em background) ou já avançou: o mesmo resultado
@@ -467,7 +470,13 @@ test('/start verificado: segundo envio igual devolve o mesmo acordo (200, existi
     const downloads = world.otcs.downloads.length;
     r = await authThenStart(world);
     assert.equal(r.status, 200, `advance=${advance}`);
-    assert.deepEqual(await r.json(), { message: 'Signature already requested. ID: AG-1', id: 'AG-1', existing: true });
+    // com a tarefa de início já avançada o handoff some (nada a reatribuir); antes, volta com os mesmos ids
+    // (o SendOn em background pode ter terminado antes da segunda chamada: as duas respostas são válidas)
+    const body = await r.json();
+    if (advance) assert.equal('handoff' in body, false);
+    else if ('handoff' in body) assert.deepEqual(body.handoff, handoff);
+    delete body.handoff;
+    assert.deepEqual(body, { message: 'Signature already requested. ID: AG-1', id: 'AG-1', existing: true });
     assert.equal(world.adobe.created.length, 1);
     assert.equal(world.otcs.downloads.length, downloads, 'não baixou o PDF de novo');
   }
@@ -543,8 +552,199 @@ test('/start verificado: idempotência é por workflow + subprocesso + documento
   world.clock.advance(16 * 60 * 1000);
   const r = await authThenStart(world, { ...FIELDS, nodeId: '5555' });
   assert.equal(r.status, 200);
-  assert.deepEqual(await r.json(), { message: 'Signature requested. ID: AG-2', id: 'AG-2' });
+  assert.deepEqual(await r.json(), {
+    message: 'Signature requested. ID: AG-2',
+    id: 'AG-2',
+    handoff: { workflowId: 3003, subworkflowId: 3004, taskId: 2, integrationUserId: INTEGRATION_USER_ID, assigned: true }
+  });
   assert.equal(world.adobe.created.length, 2);
+  await world.close();
+});
+
+/* ---------- handoff: REASSIGN da página só depois do /start ---------- */
+
+// Fluxo puro (processo == subprocesso): o /start não exige a tarefa no usuário de integração
+const STANDALONE = { ...FIELDS, subworkflowId: '3003' };
+const handoffOf = (over = {}) => ({
+  workflowId: 3003, subworkflowId: 3003, taskId: 2, integrationUserId: INTEGRATION_USER_ID, assigned: false, ...over
+});
+const modelCalled = (world, name) => world.otcs.modelCalls.filter(([m]) => m === name).length;
+
+test('/start com a tarefa no usuário humano (fluxo puro): cria o acordo, devolve handoff e só envia depois do REASSIGN', async () => {
+  const world = await verifyWorld();
+  seedStartFlow(world, { subprocessId: '3003', assignee: HUMAN_USER_ID });
+
+  let r = await authThenStart(world, STANDALONE);
+  assert.equal(r.status, 200, await r.clone().text());
+  assert.deepEqual(await r.json(), { message: 'Signature requested. ID: AG-1', id: 'AG-1', handoff: handoffOf() });
+  // atributos lidos de status/info (a tarefa não está com o usuário de integração: sem formulário)
+  assert.equal(modelCalled(world, 'getWorkflowAttributes'), 1);
+  assert.equal(modelCalled(world, 'getTaskForm'), 0);
+  const rec = world.repo.get('AG-1');
+  assert.deepEqual([rec.nodeId, rec.attachId, rec.fileName, rec.workflowId, rec.subworkflowId, rec.taskId],
+    ['1001', '2002', 'contrato.pdf', '3003', '3003', 2]);
+  assert.deepEqual(rec.emails, ['one@example.com', 'two@example.com']);
+
+  // a reconciliação em background espera a reatribuição: nenhum SendOn, sem erro, sem needs_attention
+  await waitFor(() => world.repo.get('AG-1').attempts === 1);
+  assert.equal(world.otcs.sendons.length, 0);
+  assert.equal(world.repo.get('AG-1').state, 'pending');
+  assert.deepEqual(world.logger.lines.error, []);
+
+  // repetir o /start ainda sem REASSIGN: existing + handoff.assigned=false, continua sem SendOn
+  r = await authThenStart(world, STANDALONE);
+  assert.equal(r.status, 200);
+  assert.deepEqual(await r.json(), {
+    message: 'Signature already requested. ID: AG-1', id: 'AG-1', existing: true, handoff: handoffOf()
+  });
+  assert.equal(world.adobe.created.length, 1);
+  assert.equal(world.otcs.sendons.length, 0);
+
+  // a página reatribui; o segundo /start (existing) dispara o SendOn já, sem esperar o backoff
+  world.otcs.assign(3003, 2, INTEGRATION_USER_ID);
+  r = await authThenStart(world, STANDALONE);
+  assert.equal(r.status, 200);
+  const body = await r.json();
+  assert.equal(body.existing, true);
+  assert.deepEqual(body.handoff, handoffOf({ assigned: true }));
+  await waitFor(() => world.repo.get('AG-1').startSendonDone);
+  assert.equal(world.otcs.sendons.length, 1);
+  assert.equal(world.otcs.task(3003, 3).status, 'current', 'tarefa de firma ativa');
+  assert.equal(world.adobe.created.length, 1, 'um único acordo');
+
+  // depois do avanço da tarefa: existing sem handoff
+  r = await authThenStart(world, STANDALONE);
+  const after = await r.json();
+  assert.equal(after.existing, true);
+  assert.equal('handoff' in after, false);
+  assert.equal(world.otcs.sendons.length, 1);
+  await world.close();
+});
+
+test('/start com a tarefa no usuário de integração (fluxo puro): formulário como antes e handoff.assigned=true', async () => {
+  const world = await verifyWorld();
+  seedStartFlow(world, { subprocessId: '3003' });
+  const r = await authThenStart(world, STANDALONE);
+  assert.equal(r.status, 200);
+  assert.deepEqual(await r.json(), {
+    message: 'Signature requested. ID: AG-1', id: 'AG-1', handoff: handoffOf({ assigned: true })
+  });
+  assert.equal(modelCalled(world, 'getTaskForm'), 1);
+  assert.equal(modelCalled(world, 'getWorkflowAttributes'), 0);
+  await waitFor(() => world.repo.get('AG-1').startSendonDone);
+  assert.equal(world.otcs.sendons.length, 1, 'SendOn imediato');
+  await world.close();
+});
+
+test('/start com responsáveis desconhecidos (assigneeIds null): caminho do formulário, sem consultar o usuário de integração', async () => {
+  for (const subprocessId of ['3003', '3004']) { // fluxo puro e sub-workflow
+    const world = await verifyWorld();
+    seedStartFlow(world, { subprocessId });
+    world.otcs.unknownAssignees('3003');
+    world.otcs.currentUserFailure = httpError(500, 'não deve ser chamado');
+    const r = await authThenStart(world, { ...FIELDS, subworkflowId: subprocessId });
+    assert.equal(r.status, 200, await r.clone().text());
+    assert.deepEqual((await r.json()).handoff, handoffOf({ subworkflowId: Number(subprocessId), integrationUserId: null, assigned: true }));
+    assert.equal(modelCalled(world, 'getCurrentUser'), 0);
+    assert.equal(modelCalled(world, 'getTaskForm'), 1);
+    assert.equal(modelCalled(world, 'getWorkflowAttributes'), 0);
+    await waitFor(() => world.repo.get('AG-1').startSendonDone);
+    assert.equal(world.otcs.sendons.length, 1, 'SendOn imediato');
+    assert.deepEqual(world.logger.lines.error, []);
+    await world.close();
+  }
+});
+
+test('/start em sub-workflow: tarefa no usuário humano => 409 REASSIGN_REQUIRED com handoff, sem Adobe nem leitura de atributos', async () => {
+  const world = await verifyWorld();
+  seedStartFlow(world, { assignee: HUMAN_USER_ID }); // processo 3003, subprocesso 3004
+  const r = await authThenStart(world);
+  assert.equal(r.status, 409);
+  assert.deepEqual(await r.json(), {
+    error: 'La tarea debe asignarse al usuario de integración antes del envío.',
+    code: 'REASSIGN_REQUIRED',
+    handoff: handoffOf({ subworkflowId: 3004 })
+  });
+  assert.equal(world.adobe.created.length, 0);
+  assert.equal(world.adobe.calls.length, 0, 'nenhuma chamada ao Adobe nem ao download');
+  assert.equal(modelCalled(world, 'getWorkflowAttributes'), 0, 'status/info só traz os atributos do pai');
+  assert.equal(modelCalled(world, 'getTaskForm'), 0);
+
+  // depois do REASSIGN feito pela página, o /start segue o caminho do formulário
+  world.otcs.assign(3003, 2, INTEGRATION_USER_ID);
+  const ok = await authThenStart(world);
+  assert.equal(ok.status, 200);
+  assert.deepEqual((await ok.json()).handoff, handoffOf({ subworkflowId: 3004, assigned: true }));
+  assert.equal(modelCalled(world, 'getTaskForm'), 1);
+  assert.equal(modelCalled(world, 'getWorkflowAttributes'), 0);
+  await waitFor(() => world.repo.get('AG-1').startSendonDone);
+  await world.close();
+});
+
+test('/start pelo caminho dos atributos: DocID/e-mails/AttachID ausentes => os mesmos 422', async () => {
+  const world = await verifyWorld();
+  for (const [fields, re] of [
+    [{ DocID: null }, /DocID/],
+    [{ DocID: 'abc' }, /DocID/],
+    [{ 'Email Firmante 1': '', 'Email Firmante 2': '?' }, /correos/],
+    [{ 'Email Firmante 1': null, 'Email Firmante 2': null }, /correos/],
+    [{ AttachID: null }, /AttachID/]
+  ]) {
+    world.otcs.workflows = {};
+    seedStartFlow(world, { subprocessId: '3003', assignee: HUMAN_USER_ID, fields });
+    const r = await authThenStart(world, STANDALONE);
+    assert.equal(r.status, 422, JSON.stringify(fields));
+    assert.match((await r.json()).error, re);
+  }
+  assert.equal(modelCalled(world, 'getTaskForm'), 0);
+  assert.equal(world.adobe.created.length, 0);
+  await world.close();
+});
+
+test('/start pelo caminho dos atributos: dados divergentes => 409 genérico; atributos do OTCS prevalecem', async () => {
+  const world = await verifyWorld();
+  seedStartFlow(world, {
+    subprocessId: '3003',
+    assignee: HUMAN_USER_ID,
+    fields: { 'Email Firmante 1': 'Uno@Example.com; dos@example.com', 'Email Firmante 2': null }
+  });
+  const msg = { error: 'Los datos enviados no coinciden con el flujo.' };
+  for (const over of [{ nodeId: '9999' }, { attachId: '1' }, { userEmail1: 'evil@x.com', userEmail2: '' }]) {
+    const r = await authThenStart(world, { ...STANDALONE, ...over });
+    assert.equal(r.status, 409, JSON.stringify(over));
+    assert.deepEqual(await r.json(), msg);
+  }
+  assert.ok(world.logger.has('warn', /nodeId payload=9999 otcs=1001/));
+  assert.equal(world.adobe.created.length, 0);
+
+  // payload só com o essencial: valem os e-mails do OTCS
+  const r = await authThenStart(world, { workflowId: '3003', subworkflowId: '3003' });
+  assert.equal(r.status, 200);
+  assert.deepEqual(world.repo.get('AG-1').emails, ['Uno@Example.com', 'dos@example.com']);
+  await world.close();
+});
+
+test('/start pelo caminho dos atributos: erros do OTCS (404 => 409, 5xx => 503); usuário de integração indisponível => 503', async () => {
+  const world = await verifyWorld();
+  seedStartFlow(world, { subprocessId: '3003', assignee: HUMAN_USER_ID });
+
+  world.otcs.attributesFailure = httpError(404, 'gone');
+  let r = await authThenStart(world, STANDALONE);
+  assert.equal(r.status, 409);
+  assert.deepEqual(await r.json(), { error: 'Flujo no encontrado.' });
+
+  world.otcs.attributesFailure = httpError(500, 'boom');
+  r = await authThenStart(world, STANDALONE);
+  assert.equal(r.status, 503);
+  assert.deepEqual(await r.json(), { error: 'Content Server no disponible; intente nuevamente.' });
+  assert.ok(world.logger.has('error', /getWorkflowAttributes\(3003\) falhou/));
+  world.otcs.attributesFailure = null;
+
+  world.otcs.currentUserFailure = httpError(500, 'auth down');
+  r = await authThenStart(world, STANDALONE);
+  assert.equal(r.status, 503);
+  assert.ok(world.logger.has('error', /getCurrentUser falhou/));
+  assert.equal(world.adobe.created.length, 0);
   await world.close();
 });
 

@@ -38,7 +38,7 @@ function start() {
 
   const reconciliation = createReconciliationService({ repo, adobe, otcs, config, logger });
   const signatureService = createSignatureService({
-    repo, adobe, otcs, logger, config, onCreated: (id) => reconciliation.reconcile(id)
+    repo, adobe, otcs, logger, config, onCreated: (id, ctx) => (ctx?.existing ? reconciliation.resumeStart(id) : reconciliation.reconcile(id))
   });
   const poller = createPoller({ repo, adobe, processor: reconciliation, config, logger });
 

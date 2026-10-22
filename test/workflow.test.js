@@ -5,7 +5,8 @@ const assert = require('node:assert/strict');
 const path = require('path');
 const { parseWebhookPayload } = require('../server/domain/eventPolicy');
 const {
-  buildWorld, seedAgreement, seedAdobeForEvent, webhookPayload, httpError, basicHeader, waitFor, tmpDir
+  buildWorld, seedAgreement, seedAdobeForEvent, webhookPayload, httpError, basicHeader, waitFor, tmpDir,
+  INTEGRATION_USER_ID, HUMAN_USER_ID
 } = require('./support/fakes');
 
 // Como em reconciliation.test.js: o Adobe confirma o evento por padrão (ver seedAdobeForEvent)
@@ -316,6 +317,95 @@ test('start: falha do OTCS => retry com backoff pelo runQueue e recuperação; n
   await world.close();
 });
 
+test('start: tarefa ainda atribuída ao usuário => espera a reatribuição (sem SendOn, sem erro, sem needs_attention) e envia depois', async () => {
+  const world = await buildWorld();
+  world.otcs.addWorkflow('5000', { subprocessId: 5111, stage: 'start', assignee: HUMAN_USER_ID });
+  seedAgreement(world, 'AG-1', { workflowId: '5000', subworkflowId: '5000', startSendonDone: false });
+
+  const res = await world.reconciliation.reconcile('AG-1');
+  assert.deepEqual([res.status, res.stage, res.attempts], ['waiting_handoff', 'start', 1]);
+  let rec = world.repo.get('AG-1');
+  assert.equal(rec.state, 'pending');
+  assert.equal(rec.startSendonDone, false);
+  assert.equal(rec.lastErrorStage, 'start');
+  assert.match(rec.lastError, /sigue asignada al usuario/);
+  assert.equal(rec.nextAttemptAt, new Date(world.clock.ms() + 60 * 1000).toISOString(), 'backoff normal da etapa start');
+  assert.equal(world.timers[0].ms, 60 * 1000);
+  assert.equal(world.otcs.sendons.length, 0, 'nenhum SendOn enquanto a tarefa está com o usuário');
+  assert.deepEqual(world.logger.lines.error, [], 'espera de reatribuição não gera log de erro');
+  assert.ok(world.logger.has('info', /sigue asignada al usuario/));
+
+  // o backoff ainda não venceu: o poller/runQueue não tenta; depois da reatribuição, o retry envia
+  assert.deepEqual(await world.reconciliation.runQueue(), []);
+  world.otcs.assign(5000, 2, INTEGRATION_USER_ID);
+  world.clock.advance(61 * 1000);
+  assert.deepEqual(await world.reconciliation.runQueue(), ['AG-1']);
+  rec = world.repo.get('AG-1');
+  assert.equal(rec.startSendonDone, true);
+  assert.equal(rec.attempts, 0);
+  assert.equal(rec.lastError, null);
+  assert.equal(world.otcs.sendons.length, 1);
+  assert.deepEqual(world.logger.lines.error, []);
+  await world.close();
+});
+
+test('start: reatribuição que não acontece esgota as tentativas com motivo explícito; resumeStart reabre e envia', async () => {
+  const world = await buildWorld({ env: { RETRY_MAX_ATTEMPTS: '3' } });
+  world.otcs.addWorkflow('3003', { subprocessId: '3004', stage: 'start', assignee: HUMAN_USER_ID });
+  seedAgreement(world, 'AG-1', { startSendonDone: false });
+
+  assert.equal((await world.reconciliation.reconcile('AG-1')).status, 'waiting_handoff');
+  assert.equal((await world.reconciliation.reconcile('AG-1')).status, 'waiting_handoff');
+  const res = await world.reconciliation.reconcile('AG-1');
+  assert.equal(res.status, 'needs_attention');
+  assert.match(res.reason, /sigue asignada al usuario; reabra la página/);
+  let rec = world.repo.get('AG-1');
+  assert.equal(rec.state, 'needs_attention');
+  assert.equal(rec.attentionKind, 'retries_exhausted', 'reabre sozinho depois de ATTENTION_RETRY_HOURS');
+  assert.equal(world.otcs.sendons.length, 0);
+
+  // needs_attention não reprocessa sozinho; o /start repetido (resumeStart) reabre uma rodada nova, ignorando o backoff
+  assert.equal((await world.reconciliation.reconcile('AG-1')).status, 'needs_attention');
+  world.otcs.assign(3003, 2, INTEGRATION_USER_ID);
+  assert.equal((await world.reconciliation.resumeStart('AG-1')).status, 'start_sent');
+  rec = world.repo.get('AG-1');
+  assert.equal([rec.state, rec.startSendonDone, rec.attempts].join(), 'pending,true,0');
+  assert.equal(world.otcs.sendons.length, 1);
+
+  // idempotente: repetir não envia de novo
+  assert.equal((await world.reconciliation.resumeStart('AG-1')).status, 'no_final');
+  assert.equal(world.otcs.sendons.length, 1);
+  await world.close();
+});
+
+test('start: responsáveis desconhecidos (assigneeIds null) => SendOn imediato, sem consultar o usuário de integração', async () => {
+  const world = await buildWorld();
+  world.otcs.addWorkflow('5000', { subprocessId: 5111, stage: 'start' });
+  world.otcs.unknownAssignees('5000');
+  world.otcs.currentUserFailure = httpError(500, 'não deve ser chamado');
+  seedAgreement(world, 'AG-1', { workflowId: '5000', subworkflowId: '5000', startSendonDone: false });
+
+  const res = await world.reconciliation.reconcile('AG-1');
+  assert.equal(res.status, 'start_sent');
+  assert.equal(world.otcs.sendons.length, 1);
+  assert.equal(world.repo.get('AG-1').startSendonDone, true);
+  assert.equal(world.otcs.modelCalls.filter(([m]) => m === 'getCurrentUser').length, 0);
+  assert.deepEqual(world.logger.lines.error, []);
+  await world.close();
+});
+
+test('start: falha ao consultar o usuário de integração é transitória (retry), sem SendOn', async () => {
+  const world = await buildWorld();
+  seedAgreement(world, 'AG-1', { startSendonDone: false });
+  world.otcs.currentUserFailure = httpError(500, 'auth down');
+  const res = await world.reconciliation.reconcile('AG-1');
+  assert.deepEqual([res.status, res.stage], ['failed', 'start']);
+  assert.equal(world.otcs.sendons.length, 0);
+  world.otcs.currentUserFailure = null;
+  assert.equal((await world.reconciliation.reconcile('AG-1')).status, 'start_sent');
+  await world.close();
+});
+
 test('start: tarefa de início já concluída (ou firma já ativa) só marca como feito, sem SendOn', async () => {
   for (const stage of ['sign', 'done']) {
     const world = await buildWorld();
@@ -377,6 +467,7 @@ test('POST /start grava startSendonDone=false, dispara a etapa start e devolve o
   const { startBody } = require('./support/fakes');
   const r = await postJson(world, '/start', startBody(world), {});
   assert.equal(r.status, 200);
+  // sem START_VERIFY_WORKFLOW não há consulta ao workflow, então também não há handoff
   assert.deepEqual(await r.json(), { message: 'Signature requested. ID: AG-1', id: 'AG-1' });
   await waitFor(() => world.repo.get('AG-1').startSendonDone);
   assert.equal(world.otcs.sendons.length, 1);
