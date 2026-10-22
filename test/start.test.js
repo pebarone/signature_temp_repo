@@ -155,7 +155,7 @@ test('assinatura v1 (só timestamp) é rejeitada por padrão e aceita com START_
   assert.equal(r.status, 409, 'payload divergente do OTCS');
   r = await post(world, '/start', startBodyV1(world));
   assert.equal(r.status, 200);
-  assert.ok(world.logger.has('warn', /Assinatura v1/));
+  assert.ok(world.logger.has('warn', /Firma v1/));
   assert.ok(world.otcs.modelCalls.some(([m]) => m === 'getTaskForm'));
 
   // GET /auth v1 só com a flag
@@ -186,7 +186,7 @@ test('GET /start (contrato antigo) responde 404 por padrão e funciona com START
   assert.equal(r.status, 200);
   assert.match((await r.json()).message, /^Signature requested\. ID: AG-1$/);
   assert.equal(world.repo.get('AG-1').subworkflowId, '3004', 'subprocesso resolvido pelo OTCS');
-  assert.ok(world.logger.has('warn', /GET \/start \(contrato antigo/));
+  assert.ok(world.logger.has('warn', /GET \/start \(contrato antiguo/));
   await world.close();
 });
 
@@ -434,7 +434,7 @@ test('/start verificado: erros do OTCS — 5xx/rede/timeout => 503; 401/403 no f
 
   assert.equal(world.adobe.created.length, 0);
   // o detalhe do OTCS só aparece no log
-  assert.ok(world.logger.has('error', /getProcessSteps\(3003\) falhou/));
+  assert.ok(world.logger.has('error', /getProcessSteps\(3003\) falló/));
   await world.close();
 });
 
@@ -760,13 +760,13 @@ test('/start pelo caminho dos atributos: erros do OTCS (404 => 409, 5xx => 503);
   r = await authThenStart(world, STANDALONE);
   assert.equal(r.status, 503);
   assert.deepEqual(await r.json(), { error: 'Content Server no disponible; intente nuevamente.' });
-  assert.ok(world.logger.has('error', /getWorkflowAttributes\(3003\) falhou/));
+  assert.ok(world.logger.has('error', /getWorkflowAttributes\(3003\) falló/));
   world.otcs.attributesFailure = null;
 
   world.otcs.currentUserFailure = httpError(500, 'auth down');
   r = await authThenStart(world, STANDALONE);
   assert.equal(r.status, 503);
-  assert.ok(world.logger.has('error', /getCurrentUser falhou/));
+  assert.ok(world.logger.has('error', /getCurrentUser falló/));
   assert.equal(world.adobe.created.length, 0);
   await world.close();
 });

@@ -622,7 +622,7 @@ test('OAuth: callback sem state, com state desconhecido, reutilizado ou expirado
   assert.equal(await cb(`code=abc&state=${fresh}`), 200, 'dentro do TTL');
 
   assert.deepEqual(world.tokenStore.exchanged, ['abc', 'abc'], 'o code só foi trocado com state válido');
-  assert.ok(world.logger.has('warn', /OAuth callback rejeitado/));
+  assert.ok(world.logger.has('warn', /OAuth callback rechazado/));
   await world.close();
 });
 

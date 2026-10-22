@@ -15,16 +15,16 @@
   const AGREEMENT_ONE = /\bCBJCHBCA[A-Za-z0-9_-]{16,}/;
   const PREFIX_ID_RE = /^\[([A-Za-z0-9_-]{16,})\]\s*/;      // "[<id>] ..." do pipeline de reconciliação
 
-  const LEVEL_LABEL = { INFO: 'Info', WARN: 'Aviso', ERROR: 'Erro', DEBUG: 'Debug' };
+  const LEVEL_LABEL = { INFO: 'Info', WARN: 'Advertencia', ERROR: 'Error', DEBUG: 'Debug' };
   const SOURCE_RULES = [
     [/^\[poll\]/i, 'poller'],
     [/^\[(START|AUTH)/i, 'start'],
     [/^\[STORAGE\]/i, 'storage'],
     [/^webhook/i, 'webhook'],
-    [/^(Signature request|Signature requested|Falha na etapa start)/i, 'start'],
+    [/^(Signature request|Signature requested|Falló la etapa start)/i, 'start'],
     [/oauth|^token saved/i, 'oauth'],
     [/^(Bad request on|Unhandled error on)/i, 'http'],
-    [PREFIX_ID_RE, 'reconciliação']
+    [PREFIX_ID_RE, 'reconciliación']
   ];
 
   const $ = (id) => document.getElementById(id);
@@ -71,7 +71,7 @@
 
   // ---------- Utilidades ----------
   const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-  const fmtInt = (n) => n.toLocaleString('pt-BR');
+  const fmtInt = (n) => n.toLocaleString('es');
   const pad = (n, w = 2) => String(n).padStart(w, '0');
   const levelGroup = (lvl) => (lvl === 'ERROR' || lvl === 'WARN' ? lvl : 'INFO');
   // Os IDs do Adobe compartilham o prefixo "CBJCHBCAABAA": o final é o que distingue um acordo do outro
@@ -98,12 +98,12 @@
 
   function relative(ms) {
     const s = Math.max(0, Math.round((Date.now() - ms) / 1000));
-    if (s < 5) return 'agora';
-    if (s < 60) return `há ${s} s`;
+    if (s < 5) return 'ahora';
+    if (s < 60) return `hace ${s} s`;
     const m = Math.floor(s / 60);
-    if (m < 60) return `há ${m} min`;
+    if (m < 60) return `hace ${m} min`;
     const h = Math.floor(m / 60);
-    return h < 24 ? `há ${h} h` : `há ${Math.floor(h / 24)} d`;
+    return h < 24 ? `hace ${h} h` : `hace ${Math.floor(h / 24)} d`;
   }
 
   // Destaca a busca sobre texto já escapado
@@ -237,7 +237,7 @@
       const v = AGREEMENT_ONE.test(a.value) ? esc(shortId(a.value)) : hl(a.value);
       html +=`<span class="kv-chip"><span class="k">${hl(a.key)}</span><span class="v">${v}</span></span>`;
     }
-    if (e.extra.length) html += `<span class="more-chip">+${e.extra.length} ${e.extra.length === 1 ? 'linha' : 'linhas'}</span>`;
+    if (e.extra.length) html += `<span class="more-chip">+${e.extra.length} ${e.extra.length === 1 ? 'línea' : 'líneas'}</span>`;
     return html;
   }
 
@@ -369,10 +369,10 @@
     const held = state.held.length;
     const text = {
       connecting: 'Conectando…',
-      live: 'Ao vivo',
+      live: 'En vivo',
       reconnecting: 'Reconectando…',
       offline: 'Desconectado',
-      paused: held ? `Pausado · ${fmtInt(held)} na fila` : 'Pausado'
+      paused: held ? `En pausa · ${fmtInt(held)} en cola` : 'En pausa'
     }[shown];
     els.conn.dataset.state = shown;
     els.connText.textContent = text;
@@ -396,7 +396,7 @@
   function updateJump() {
     const show = !state.follow && els.rows.childElementCount > 0;
     els.jump.hidden = !show;
-    if (show) els.jumpText.textContent = state.unseen ? `${fmtInt(state.unseen)} ${state.unseen === 1 ? 'novo evento' : 'novos eventos'}` : 'Ir para o fim';
+    if (show) els.jumpText.textContent = state.unseen ? `${fmtInt(state.unseen)} ${state.unseen === 1 ? 'nuevo evento' : 'nuevos eventos'}` : 'Ir al final';
   }
 
   // ---------- Resumo, contadores e status ----------
@@ -405,8 +405,8 @@
     els.statTotal.textContent = fmtInt(c.total);
     els.statErrors.textContent = fmtInt(c.ERROR);
     els.statWarns.textContent = fmtInt(c.WARN);
-    els.statErrorsPct.textContent = c.total ? `${((c.ERROR / c.total) * 100).toLocaleString('pt-BR', { maximumFractionDigits: 1 })}% do total` : '—';
-    els.statWarnsPct.textContent = c.total ? `${((c.WARN / c.total) * 100).toLocaleString('pt-BR', { maximumFractionDigits: 1 })}% do total` : '—';
+    els.statErrorsPct.textContent = c.total ? `${((c.ERROR / c.total) * 100).toLocaleString('es', { maximumFractionDigits: 1 })}% del total` : '—';
+    els.statWarnsPct.textContent = c.total ? `${((c.WARN / c.total) * 100).toLocaleString('es', { maximumFractionDigits: 1 })}% del total` : '—';
     for (const span of els.tabs.querySelectorAll('[data-count]')) {
       const k = span.dataset.count;
       span.textContent = fmtInt(k ? c[k] : c.total);
@@ -419,8 +419,8 @@
     els.emptyFiltered.hidden = empty || state.matchCount > 0;
 
     let info = `<strong>${fmtInt(c.total)}</strong> ${c.total === 1 ? 'evento' : 'eventos'}`;
-    if (hasFilters()) info = `<strong>${fmtInt(state.matchCount)}</strong> de ${fmtInt(c.total)} eventos correspondem aos filtros`;
-    if (state.matchCount > MAX_ROWS) info += ` · exibindo os ${fmtInt(MAX_ROWS)} mais recentes`;
+    if (hasFilters()) info = `<strong>${fmtInt(state.matchCount)}</strong> de ${fmtInt(c.total)} eventos coinciden con los filtros`;
+    if (state.matchCount > MAX_ROWS) info += ` · mostrando los ${fmtInt(MAX_ROWS)} más recientes`;
     els.info.innerHTML = info;
     updateJump();
   }
@@ -432,7 +432,7 @@
       els.statLastAt.textContent = `${timeUtc(last.ts).slice(0, 8)} UTC`;
     } else {
       els.statLast.textContent = '—';
-      els.statLastAt.textContent = 'sem eventos';
+      els.statLastAt.textContent = 'sin eventos';
     }
     const now = Math.floor(Date.now() / 60000);
     let recent = 0;
@@ -440,7 +440,7 @@
       const b = state.minutes.get(k);
       if (b) recent += b.INFO + b.WARN + b.ERROR;
     }
-    els.statRate.textContent = `${(recent / 5).toLocaleString('pt-BR', { maximumFractionDigits: 1 })} eventos/min (5 min)`;
+    els.statRate.textContent = `${(recent / 5).toLocaleString('es', { maximumFractionDigits: 1 })} eventos/min (5 min)`;
   }
 
   function updateSources() {
@@ -448,7 +448,7 @@
     if (state.source && !names.includes(state.source)) names.push(state.source);
     const current = [...els.source.options].slice(1).map((o) => o.value);
     if (current.join('|') === names.join('|')) return;
-    els.source.innerHTML = '<option value="">Todas as origens</option>'
+    els.source.innerHTML = '<option value="">Todos los orígenes</option>'
       + names.map((s) => `<option value="${esc(s)}">${esc(s)}</option>`).join('');
     els.source.value = state.source;
   }
@@ -520,7 +520,7 @@
         svg += `<text class="chart-axis" x="${padL + i * slot + slot / 2}" y="${H - 4}" text-anchor="middle">${pad(minute.getUTCHours())}:${pad(minute.getUTCMinutes())}</text>`;
       }
     });
-    if (!peak) svg += `<text class="chart-empty" x="${padL + plotW / 2}" y="${padT + plotH / 2}" text-anchor="middle">Sem eventos na última hora</text>`;
+    if (!peak) svg += `<text class="chart-empty" x="${padL + plotW / 2}" y="${padT + plotH / 2}" text-anchor="middle">Sin eventos en la última hora</text>`;
     svg += '</svg>';
 
     const tipHidden = els.tip.hidden;
@@ -538,8 +538,8 @@
     const total = d.INFO + d.WARN + d.ERROR;
     els.tip.innerHTML = `<div class="chart-tip-title">${label}</div>`
       + `<div class="chart-tip-row"><span class="swatch swatch-info"></span>Info<b>${fmtInt(d.INFO)}</b></div>`
-      + `<div class="chart-tip-row"><span class="swatch swatch-warn"></span>Aviso<b>${fmtInt(d.WARN)}</b></div>`
-      + `<div class="chart-tip-row"><span class="swatch swatch-error"></span>Erro<b>${fmtInt(d.ERROR)}</b></div>`
+      + `<div class="chart-tip-row"><span class="swatch swatch-warn"></span>Advertencia<b>${fmtInt(d.WARN)}</b></div>`
+      + `<div class="chart-tip-row"><span class="swatch swatch-error"></span>Error<b>${fmtInt(d.ERROR)}</b></div>`
       + `<div class="chart-tip-row">Total<b>${fmtInt(total)}</b></div>`;
     els.tip.hidden = false;
     const W = els.chart.clientWidth;
@@ -584,22 +584,22 @@
     const badge = e.level === 'INFO' ? 'badge' : `badge badge-${e.level.toLowerCase()}`;
     const iso = Number.isFinite(e.ts) ? new Date(e.ts).toISOString() : '—';
     els.sheetMeta.innerHTML = `<span class="${badge}"><span class="dot"></span>${esc(lvl)}</span><span>${esc(e.source)}</span><span aria-hidden="true">·</span><span>${Number.isFinite(e.ts) ? relative(e.ts) : ''}</span>`;
-    els.sheetTitle.innerHTML = hl(e.message || '(sem mensagem)');
+    els.sheetTitle.innerHTML = hl(e.message || '(sin mensaje)');
 
     let html = '<section><h3 class="section-title">Evento</h3><dl class="kv-list">';
-    html += kvRow('Horário (UTC)', esc(iso.replace('T', ' ').replace('Z', '')), { mono: true });
-    if (Number.isFinite(e.ts)) html += kvRow('Horário local', esc(new Date(e.ts).toLocaleString('pt-BR', { dateStyle: 'short', timeStyle: 'medium' })), { mono: true });
-    html += kvRow('Nível', esc(lvl));
-    html += kvRow('Origem', esc(e.source));
-    if (e.agreement) html += kvRow('ID do acordo', esc(e.agreement), { mono: true, copy: e.agreement });
+    html += kvRow('Hora (UTC)', esc(iso.replace('T', ' ').replace('Z', '')), { mono: true });
+    if (Number.isFinite(e.ts)) html += kvRow('Hora local', esc(new Date(e.ts).toLocaleString('es', { dateStyle: 'short', timeStyle: 'medium' })), { mono: true });
+    html += kvRow('Nivel', esc(lvl));
+    html += kvRow('Origen', esc(e.source));
+    if (e.agreement) html += kvRow('ID del acuerdo', esc(e.agreement), { mono: true, copy: e.agreement });
     html += '</dl></section>';
     if (e.attrs.length) {
       html += '<section><h3 class="section-title">Atributos</h3><dl class="kv-list">';
       for (const a of e.attrs) html += kvRow(a.key, hl(a.value), { mono: true, copy: a.value });
       html += '</dl></section>';
     }
-    if (e.extra.length) html += `<section><h3 class="section-title">Linhas adicionais</h3><pre class="pre">${hl(e.extra.join('\n'))}</pre></section>`;
-    html += `<section><h3 class="section-title">Linha bruta</h3><pre class="pre">${hl(e.raw.join('\n'))}</pre></section>`;
+    if (e.extra.length) html += `<section><h3 class="section-title">Líneas adicionales</h3><pre class="pre">${hl(e.extra.join('\n'))}</pre></section>`;
+    html += `<section><h3 class="section-title">Línea sin procesar</h3><pre class="pre">${hl(e.raw.join('\n'))}</pre></section>`;
     els.sheetBody.innerHTML = html;
 
     const visible = visibleIds();
@@ -634,7 +634,7 @@
     const label = btn.querySelector('span');
     if (!label) return;
     const old = label.textContent;
-    label.textContent = ok ? 'Copiado' : 'Falha ao copiar';
+    label.textContent = ok ? 'Copiado' : 'Error al copiar';
     setTimeout(() => { label.textContent = old; }, 1500);
   }
 
@@ -680,7 +680,7 @@
   els.pause.addEventListener('click', () => {
     state.paused = !state.paused;
     els.pause.setAttribute('aria-pressed', String(state.paused));
-    els.pauseText.textContent = state.paused ? 'Retomar' : 'Pausar';
+    els.pauseText.textContent = state.paused ? 'Reanudar' : 'Pausar';
     if (!state.paused && state.held.length) {
       state.queue.push(...state.held);
       state.held = [];

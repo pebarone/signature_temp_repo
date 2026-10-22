@@ -63,7 +63,7 @@ function createVerifySignature({
 }) {
   return function verifySignature(req, res, next) {
     if (!secret) {
-      logger?.error('SIGNATURE_SECRET não configurado: /start indisponível');
+      logger?.error('SIGNATURE_SECRET no configurado: /start no disponible');
       return res.status(500).json({ error: 'Server misconfigured.' });
     }
     const body = req.body || {};
@@ -90,7 +90,7 @@ function createVerifySignature({
       return res.status(403).json({ error: 'Invalid signature.' });
     }
     if (legacy) {
-      logger?.warn('[START] Assinatura v1 (só timestamp) aceita por START_LEGACY_SIGNATURE: o WebReport precisa ser atualizado para o protocolo v2.');
+      logger?.warn('[START] Firma v1 (solo timestamp) aceptada por START_LEGACY_SIGNATURE: el WebReport debe actualizarse al protocolo v2.');
       req.legacyAuth = true;
     } else if (!consumeNonce || !consumeNonce(nonce, NONCE_TTL_MS)) {
       // Sem armazenamento de nonces não há como garantir uso único: falha fechado

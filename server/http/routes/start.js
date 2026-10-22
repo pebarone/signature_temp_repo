@@ -64,7 +64,7 @@ function startRoutes({ config, logger, signatureService, startBasicAuth, verifyS
   if (config.startLegacySignature) {
     router.get('/auth', startBasicAuth, (req, res) => {
       if (!config.signatureSecret) return res.status(500).json({ error: 'Server misconfigured.' });
-      logger.warn('[AUTH] GET /auth (v1, só timestamp) por START_LEGACY_SIGNATURE: o WebReport precisa ser atualizado para o protocolo v2.');
+      logger.warn('[AUTH] GET /auth (v1, solo timestamp) por START_LEGACY_SIGNATURE: el WebReport debe actualizarse al protocolo v2.');
       const timestamp = now().toString();
       res.json({ timestamp, signature: sign(config.signatureSecret, timestamp) });
     });
@@ -72,7 +72,7 @@ function startRoutes({ config, logger, signatureService, startBasicAuth, verifyS
 
   if (config.startLegacyGet) {
     router.get('/start', (req, res) => {
-      logger.warn('[START] GET /start (contrato antigo, sem HMAC) por START_LEGACY_GET_ENABLED: o WebReport precisa ser atualizado para o protocolo v2.');
+      logger.warn('[START] GET /start (contrato antiguo, sin HMAC) por START_LEGACY_GET_ENABLED: el WebReport debe actualizarse al protocolo v2.');
       // Repetições de um parâmetro (?a=1&a=2) viram array: fica só o primeiro valor
       const fields = Object.fromEntries(
         Object.entries(req.query || {}).map(([k, v]) => [k, Array.isArray(v) ? v[0] : v])

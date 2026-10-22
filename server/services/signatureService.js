@@ -73,7 +73,7 @@ function createSignatureService({ repo, adobe, otcs, logger, config, now = () =>
   function kickStart(id, ctx) {
     if (!onCreated) return Promise.resolve();
     return Promise.resolve().then(() => onCreated(id, ctx)).then(() => undefined).catch((e) => {
-      logger.error(`Falha na etapa start del acuerdo ${id}: ${describeError(e)}`);
+      logger.error(`Falló la etapa start del acuerdo ${id}: ${describeError(e)}`);
     });
   }
 
@@ -161,7 +161,7 @@ function createSignatureService({ repo, adobe, otcs, logger, config, now = () =>
       steps = await otcs.getProcessSteps(workflowId);
     } catch (e) {
       if (httpStatus(e) === 404) throw flowNotFound();
-      logger.error(`[START] OTCS getProcessSteps(${workflowId}) falhou: ${describeError(e)}`);
+      logger.error(`[START] OTCS getProcessSteps(${workflowId}) falló: ${describeError(e)}`);
       throw otcsUnavailable();
     }
     // Usa a mesma normalização do HMAC: espaços não podem mudar o subprocesso escolhido.
@@ -176,7 +176,7 @@ function createSignatureService({ repo, adobe, otcs, logger, config, now = () =>
       const nodeHint = clean(input.nodeId);
       const known = where !== 'absent' && nodeHint ? repo.findLatestByWorkflow(workflowId, task.subprocessId, nodeHint) : null;
       if (known) return { existing: known };
-      logger.warn(`[START] Workflow ${workflowId}: tarefa de início ${where === 'absent' ? 'não encontrada' : `em "${where}"`}`);
+      logger.warn(`[START] Workflow ${workflowId}: tarea de inicio ${where === 'absent' ? 'no encontrada' : `en "${where}"`}`);
       throw new ServiceError(409, { error: 'El flujo no está en el paso de envío a firma.' });
     }
 
@@ -191,7 +191,7 @@ function createSignatureService({ repo, adobe, otcs, logger, config, now = () =>
         integrationUserId = Number((await otcs.getCurrentUser())?.id);
         if (!Number.isFinite(integrationUserId)) throw new Error('usuario de integración desconocido');
       } catch (e) {
-        logger.error(`[START] OTCS getCurrentUser falhou: ${describeError(e)}`);
+        logger.error(`[START] OTCS getCurrentUser falló: ${describeError(e)}`);
         throw otcsUnavailable();
       }
       assigned = task.assigneeIds.includes(integrationUserId);
@@ -213,11 +213,11 @@ function createSignatureService({ repo, adobe, otcs, logger, config, now = () =>
       } catch (e) {
         const status = httpStatus(e);
         if (status === 401 || status === 403) {
-          logger.warn(`[START] Workflow ${workflowId}: formulário da tarefa ${task.taskId} sem acesso (HTTP ${status})`);
+          logger.warn(`[START] Workflow ${workflowId}: formulario de la tarea ${task.taskId} sin acceso (HTTP ${status})`);
           throw new ServiceError(409, { error: 'La tarea no está asignada al usuario de integración.' });
         }
         if (status === 404) throw flowNotFound();
-        logger.error(`[START] OTCS getTaskForm(${task.processId}/${task.subprocessId}/${task.taskId}) falhou: ${describeError(e)}`);
+        logger.error(`[START] OTCS getTaskForm(${task.processId}/${task.subprocessId}/${task.taskId}) falló: ${describeError(e)}`);
         throw otcsUnavailable();
       }
       fields = form.fields;
@@ -227,7 +227,7 @@ function createSignatureService({ repo, adobe, otcs, logger, config, now = () =>
         attrs = await otcs.getWorkflowAttributes(task.processId);
       } catch (e) {
         if (httpStatus(e) === 404) throw flowNotFound();
-        logger.error(`[START] OTCS getWorkflowAttributes(${task.processId}) falhou: ${describeError(e)}`);
+        logger.error(`[START] OTCS getWorkflowAttributes(${task.processId}) falló: ${describeError(e)}`);
         throw otcsUnavailable();
       }
       fields = Object.fromEntries(Object.entries(attrs || {}).map(([label, value]) => [label, { value }]));
@@ -235,7 +235,7 @@ function createSignatureService({ repo, adobe, otcs, logger, config, now = () =>
       // Sub-workflow: status/info só devolve os atributos do pai e o formulário exige a tarefa no usuário de integração.
       // A regra é reatribuir só com acordo gerado: aqui ainda não há, então valida antes o que as dicas do corpo permitem
       await precheckBeforeReassign(input, handoff);
-      logger.info(`[START] Workflow ${workflowId}/${task.subprocessId}: tarefa ${task.taskId} ainda no usuário; a página deve reatribuí-la antes do envio`);
+      logger.info(`[START] Workflow ${workflowId}/${task.subprocessId}: tarea ${task.taskId} aún en el usuario; la página debe reasignarla antes del envío`);
       throw new ServiceError(409, {
         error: 'La tarea debe asignarse al usuario de integración antes del envío.',
         code: 'REASSIGN_REQUIRED',
@@ -269,7 +269,7 @@ function createSignatureService({ repo, adobe, otcs, logger, config, now = () =>
       diffs.push(`emails payload=[${emailKey(payloadEmails)}] otcs=[${emailKey(emails)}]`);
     }
     if (diffs.length) {
-      logger.warn(`[START] Workflow ${workflowId}: dados enviados não coincidem com o fluxo (${diffs.join('; ')})`);
+      logger.warn(`[START] Workflow ${workflowId}: los datos enviados no coinciden con el flujo (${diffs.join('; ')})`);
       throw new ServiceError(409, { error: 'Los datos enviados no coinciden con el flujo.' });
     }
 

@@ -56,16 +56,16 @@ function webhookRoutes({ config, logger, reconciliation }) {
     const sent = sentClientId(req);
     const mismatch = !accepted.size || !sent || !accepted.has(sent);
     if (rawClientId(req) && accepted.size && mismatch) {
-      logger.warn('Webhook com X-AdobeSign-ClientId diferente do CLIENT_ID configurado');
+      logger.warn('Webhook con X-AdobeSign-ClientId diferente del CLIENT_ID configurado');
     }
     if (config.webhookRequireClientId && mismatch) {
-      logger.warn('Webhook recusado (WEBHOOK_REQUIRE_CLIENT_ID=true): X-AdobeSign-ClientId ausente ou inválido');
+      logger.warn('Webhook rechazado (WEBHOOK_REQUIRE_CLIENT_ID=true): X-AdobeSign-ClientId ausente o inválido');
       return res.status(401).send('Invalid client id');
     }
 
     const payload = req.body;
     if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
-      logger.error('Webhook parse error: corpo ausente ou não é JSON');
+      logger.error('Webhook parse error: cuerpo ausente o no es JSON');
       return res.status(400).send('Invalid webhook payload');
     }
 
@@ -84,7 +84,7 @@ function webhookRoutes({ config, logger, reconciliation }) {
       result = reconciliation.handleEvent(parsed); // persiste (síncrono) e dispara o processamento
     } catch (e) {
       // Não conseguimos persistir: 5xx faz o Adobe reenviar a notificação
-      logger.error(`Webhook: falha ao persistir evento ${parsed.notificationId || ''}: ${describeError(e)}`);
+      logger.error(`Webhook: falló al persistir el evento ${parsed.notificationId || ''}: ${describeError(e)}`);
       return res.status(500).send('Event could not be stored');
     }
 

@@ -39,7 +39,7 @@ function adminRoutes({
   router.get('/admin/callback', async (req, res) => {
     const { code, state } = req.query;
     if (!consumeState(state)) {
-      logger.warn('OAuth callback rejeitado: state ausente, desconhecido ou expirado');
+      logger.warn('OAuth callback rechazado: state ausente, desconocido o expirado');
       return res.status(400).send('<pre>Invalid state</pre>');
     }
     if (!code) return res.status(400).send('<pre>Missing code</pre>');

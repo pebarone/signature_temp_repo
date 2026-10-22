@@ -13,7 +13,7 @@ function importLegacyAgreements(repo, files, { logger, now = () => new Date() } 
     try {
       data = JSON.parse(fs.readFileSync(file, 'utf8'));
     } catch (e) {
-      logger?.error(`Legacy import: ${file} ilegível (${e.message}); renomeado para .corrupt`);
+      logger?.error(`Legacy import: ${file} ilegible (${e.message}); renombrado a .corrupt`);
       try { fs.renameSync(file, `${file}.corrupt`); } catch { /* ignore */ }
       continue;
     }
@@ -45,9 +45,9 @@ function importLegacyAgreements(repo, files, { logger, now = () => new Date() } 
     try {
       fs.renameSync(file, target);
     } catch (err) {
-      logger?.error(`Legacy import: não foi possível renomear ${file}: ${err.message}`);
+      logger?.error(`Legacy import: no se pudo renombrar ${file}: ${err.message}`);
     }
-    logger?.info(`Legacy import: ${count} acordo(s) importados de ${file}`);
+    logger?.info(`Legacy import: ${count} acuerdo(s) importados de ${file}`);
     imported += count;
   }
   return imported;

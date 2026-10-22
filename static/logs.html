@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="pt-BR">
+<html lang="es">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -48,7 +48,7 @@
     <header class="topbar">
       <div class="brand">
         <span class="brand-mark"><svg class="icon"><use href="#i-activity"/></svg></span>
-        <nav class="crumbs" aria-label="Navegação">
+        <nav class="crumbs" aria-label="Navegación">
           <span class="crumb-muted">Signature Orchestrator</span>
           <span class="crumb-sep" aria-hidden="true">/</span>
           <span>Logs</span>
@@ -59,9 +59,9 @@
           <span class="status-dot"></span><span id="connText">Conectando…</span>
         </span>
         <a class="btn btn-outline btn-sm" href="/logs" download>
-          <svg class="icon"><use href="#i-download"/></svg><span class="hide-sm">Baixar .log</span>
+          <svg class="icon"><use href="#i-download"/></svg><span class="hide-sm">Descargar .log</span>
         </a>
-        <button type="button" class="btn btn-ghost btn-icon" id="themeBtn" aria-label="Alternar tema" title="Alternar tema">
+        <button type="button" class="btn btn-ghost btn-icon" id="themeBtn" aria-label="Cambiar tema" title="Cambiar tema">
           <svg class="icon icon-sun"><use href="#i-sun"/></svg>
           <svg class="icon icon-moon"><use href="#i-moon"/></svg>
         </button>
@@ -70,11 +70,11 @@
 
     <main class="page">
       <div class="page-head">
-        <h1>Logs de auditoria</h1>
-        <p class="muted">Eventos do arquivo <code class="code" id="fileName">audit-—.log</code> em tempo real. Horários em UTC.</p>
+        <h1>Logs de auditoría</h1>
+        <p class="muted">Eventos del archivo <code class="code" id="fileName">audit-—.log</code> en tiempo real. Horas en UTC.</p>
       </div>
 
-      <section class="card overview" aria-label="Resumo">
+      <section class="card overview" aria-label="Resumen">
         <div class="stats">
           <div class="stat">
             <span class="stat-label">Eventos</span>
@@ -82,31 +82,31 @@
             <span class="stat-sub" id="statRate">—</span>
           </div>
           <div class="stat">
-            <span class="stat-label"><span class="swatch swatch-error"></span>Erros</span>
+            <span class="stat-label"><span class="swatch swatch-error"></span>Errores</span>
             <span class="stat-value" id="statErrors">0</span>
             <span class="stat-sub" id="statErrorsPct">—</span>
           </div>
           <div class="stat">
-            <span class="stat-label"><span class="swatch swatch-warn"></span>Avisos</span>
+            <span class="stat-label"><span class="swatch swatch-warn"></span>Advertencias</span>
             <span class="stat-value" id="statWarns">0</span>
             <span class="stat-sub" id="statWarnsPct">—</span>
           </div>
           <div class="stat">
             <span class="stat-label">Último evento</span>
             <span class="stat-value" id="statLast">—</span>
-            <span class="stat-sub" id="statLastAt">sem eventos</span>
+            <span class="stat-sub" id="statLastAt">sin eventos</span>
           </div>
         </div>
         <div class="volume">
           <div class="volume-head">
-            <span class="volume-title">Volume por minuto <span class="muted">· última hora</span></span>
+            <span class="volume-title">Volumen por minuto <span class="muted">· última hora</span></span>
             <div class="legend" aria-hidden="true">
               <span><span class="swatch swatch-info"></span>Info</span>
-              <span><span class="swatch swatch-warn"></span>Aviso</span>
-              <span><span class="swatch swatch-error"></span>Erro</span>
+              <span><span class="swatch swatch-warn"></span>Advertencia</span>
+              <span><span class="swatch swatch-error"></span>Error</span>
             </div>
           </div>
-          <div class="volume-chart" id="volumeChart" role="img" aria-label="Volume de eventos por minuto na última hora">
+          <div class="volume-chart" id="volumeChart" role="img" aria-label="Volumen de eventos por minuto en la última hora">
             <div class="chart-tip" id="chartTip" hidden></div>
           </div>
         </div>
@@ -116,8 +116,8 @@
         <div class="alert" id="connAlert" hidden role="alert">
           <svg class="icon"><use href="#i-alert"/></svg>
           <div class="alert-body">
-            <strong>Sem conexão com o stream de logs</strong>
-            <span>Confira as credenciais ou se já existe log hoje (o arquivo nasce no primeiro evento do dia).</span>
+            <strong>Sin conexión con el flujo de logs</strong>
+            <span>Revise las credenciales o si ya existe un log hoy (el archivo se crea con el primer evento del día).</span>
           </div>
           <button type="button" class="btn btn-outline btn-sm" id="retryBtn">
             <svg class="icon"><use href="#i-refresh"/></svg>Reconectar
@@ -127,23 +127,23 @@
         <div class="toolbar">
           <div class="input-group search">
             <svg class="icon"><use href="#i-search"/></svg>
-            <input type="search" id="searchInput" placeholder="Buscar mensagem, ID do acordo, workflow…" autocomplete="off" spellcheck="false" aria-label="Buscar nos logs" />
+            <input type="search" id="searchInput" placeholder="Buscar mensaje, ID del acuerdo, workflow…" autocomplete="off" spellcheck="false" aria-label="Buscar en los logs" />
             <kbd class="kbd" aria-hidden="true">/</kbd>
           </div>
-          <div class="tabs" id="levelTabs" role="radiogroup" aria-label="Nível">
+          <div class="tabs" id="levelTabs" role="radiogroup" aria-label="Nivel">
             <button type="button" role="radio" aria-checked="true" data-level="">Todos <span class="tab-count" data-count="">0</span></button>
             <button type="button" role="radio" aria-checked="false" data-level="INFO">Info <span class="tab-count" data-count="INFO">0</span></button>
-            <button type="button" role="radio" aria-checked="false" data-level="WARN">Aviso <span class="tab-count" data-count="WARN">0</span></button>
-            <button type="button" role="radio" aria-checked="false" data-level="ERROR">Erro <span class="tab-count" data-count="ERROR">0</span></button>
+            <button type="button" role="radio" aria-checked="false" data-level="WARN">Advertencia <span class="tab-count" data-count="WARN">0</span></button>
+            <button type="button" role="radio" aria-checked="false" data-level="ERROR">Error <span class="tab-count" data-count="ERROR">0</span></button>
           </div>
-          <select class="select" id="sourceFilter" aria-label="Origem">
-            <option value="">Todas as origens</option>
+          <select class="select" id="sourceFilter" aria-label="Origen">
+            <option value="">Todos los orígenes</option>
           </select>
           <div class="toolbar-end">
-            <button type="button" class="btn btn-ghost btn-icon" id="wrapBtn" aria-pressed="false" title="Quebrar linhas longas" aria-label="Quebrar linhas longas">
+            <button type="button" class="btn btn-ghost btn-icon" id="wrapBtn" aria-pressed="false" title="Ajustar líneas largas" aria-label="Ajustar líneas largas">
               <svg class="icon"><use href="#i-wrap"/></svg>
             </button>
-            <button type="button" class="btn btn-ghost btn-icon" id="followBtn" aria-pressed="true" title="Acompanhar novos eventos" aria-label="Acompanhar novos eventos">
+            <button type="button" class="btn btn-ghost btn-icon" id="followBtn" aria-pressed="true" title="Seguir nuevos eventos" aria-label="Seguir nuevos eventos">
               <svg class="icon"><use href="#i-follow"/></svg>
             </button>
             <span class="toolbar-sep" aria-hidden="true"></span>
@@ -152,38 +152,38 @@
               <svg class="icon icon-play"><use href="#i-play"/></svg>
               <span id="pauseText">Pausar</span>
             </button>
-            <button type="button" class="btn btn-ghost btn-sm" id="clearBtn" title="Limpar a visualização (não apaga o arquivo)">
-              <svg class="icon"><use href="#i-trash"/></svg><span class="hide-sm">Limpar</span>
+            <button type="button" class="btn btn-ghost btn-sm" id="clearBtn" title="Limpiar la vista (no borra el archivo)">
+              <svg class="icon"><use href="#i-trash"/></svg><span class="hide-sm">Limpiar</span>
             </button>
           </div>
         </div>
 
         <div class="grid-head" aria-hidden="true">
-          <span>Horário</span><span>Nível</span><span>Origem</span><span>Mensagem</span>
+          <span>Hora</span><span>Nivel</span><span>Origen</span><span>Mensaje</span>
         </div>
 
         <div class="viewport" id="viewport" tabindex="0" aria-label="Lista de eventos">
           <div class="rows" id="rows"></div>
           <div class="empty" id="emptyWaiting">
             <span class="empty-icon"><svg class="icon"><use href="#i-inbox"/></svg></span>
-            <strong>Aguardando eventos</strong>
-            <span class="muted">Os registros aparecem aqui assim que forem gravados no log.</span>
+            <strong>Esperando eventos</strong>
+            <span class="muted">Los registros aparecen aquí apenas se escriben en el log.</span>
           </div>
           <div class="empty" id="emptyFiltered" hidden>
             <span class="empty-icon"><svg class="icon"><use href="#i-filter"/></svg></span>
-            <strong>Nenhum evento corresponde aos filtros</strong>
-            <span class="muted">Ajuste a busca, o nível ou a origem.</span>
-            <button type="button" class="btn btn-outline btn-sm" id="resetFiltersBtn">Limpar filtros</button>
+            <strong>Ningún evento coincide con los filtros</strong>
+            <span class="muted">Ajuste la búsqueda, el nivel o el origen.</span>
+            <button type="button" class="btn btn-outline btn-sm" id="resetFiltersBtn">Limpiar filtros</button>
           </div>
         </div>
 
         <button type="button" class="jump" id="jumpBtn" hidden>
-          <svg class="icon"><use href="#i-arrow-down"/></svg><span id="jumpText">Ir para o fim</span>
+          <svg class="icon"><use href="#i-arrow-down"/></svg><span id="jumpText">Ir al final</span>
         </button>
 
         <footer class="statusbar">
           <span id="resultInfo">0 eventos</span>
-          <span class="muted hide-sm"><kbd class="kbd">/</kbd> buscar · <kbd class="kbd">Esc</kbd> limpar · clique numa linha para detalhes</span>
+          <span class="muted hide-sm"><kbd class="kbd">/</kbd> buscar · <kbd class="kbd">Esc</kbd> limpiar · haga clic en una fila para ver el detalle</span>
         </footer>
       </section>
     </main>
@@ -197,7 +197,7 @@
           <div class="sheet-meta" id="sheetMeta"></div>
           <h2 id="sheetTitle"></h2>
         </div>
-        <button type="button" class="btn btn-ghost btn-icon" data-close aria-label="Fechar">
+        <button type="button" class="btn btn-ghost btn-icon" data-close aria-label="Cerrar">
           <svg class="icon"><use href="#i-x"/></svg>
         </button>
       </header>
@@ -207,12 +207,12 @@
           <button type="button" class="btn btn-outline btn-icon btn-icon-sm" id="prevBtn" aria-label="Evento anterior" title="Evento anterior (↑)">
             <svg class="icon"><use href="#i-chevron-up"/></svg>
           </button>
-          <button type="button" class="btn btn-outline btn-icon btn-icon-sm" id="nextBtn" aria-label="Próximo evento" title="Próximo evento (↓)">
+          <button type="button" class="btn btn-outline btn-icon btn-icon-sm" id="nextBtn" aria-label="Evento siguiente" title="Evento siguiente (↓)">
             <svg class="icon"><use href="#i-chevron-down"/></svg>
           </button>
         </div>
         <button type="button" class="btn btn-default btn-sm" id="copyRawBtn">
-          <svg class="icon"><use href="#i-copy"/></svg><span>Copiar linha bruta</span>
+          <svg class="icon"><use href="#i-copy"/></svg><span>Copiar línea sin procesar</span>
         </button>
       </footer>
     </aside>
