@@ -13,7 +13,6 @@ const { createOtcsClient } = require('./infra/otcsClient');
 const { createReconciliationService } = require('./services/reconciliationService');
 const { createSignatureService } = require('./services/signatureService');
 const { createPoller } = require('./services/poller');
-const { createStartDiscovery } = require('./services/startDiscovery');
 const { createApp } = require('./app');
 
 function start() {
@@ -42,8 +41,6 @@ function start() {
     repo, adobe, otcs, logger, config, onCreated: (id) => reconciliation.reconcile(id)
   });
   const poller = createPoller({ repo, adobe, processor: reconciliation, config, logger });
-  // Mesma instância do signatureService: o anti-corrida (inflight) do /start vale também para a descoberta
-  const startDiscovery = createStartDiscovery({ otcs, signatureService, config, logger });
 
   const app = createApp({ config, logger, repo, reconciliation, signatureService, tokenStore });
   const server = app.listen(config.port, () => {
@@ -55,12 +52,6 @@ function start() {
     );
   });
   poller.start();
-  if (startDiscovery.start()) {
-    logger.info(`[discovery] Descoberta de tarefas de envio ativa: ${config.startDiscovery.taskNames.join(', ')} ` +
-      `(carência ${config.startDiscovery.graceMs} ms, a cada ${config.startDiscovery.intervalMs} ms)`);
-  } else {
-    logger.info('[discovery] Descoberta de tarefas de envio desativada (START_DISCOVERY_TASK_NAMES vazio)');
-  }
 
   /*
     Keepalive / self-ping (Render): evita que o serviço hiberne.
@@ -82,7 +73,6 @@ function start() {
     closing = true;
     logger.info(`${signal} recibido: cerrando`);
     poller.stop();
-    startDiscovery.stop();
     reconciliation.stop();
     if (keepalive) clearInterval(keepalive);
     logger.stopPurge();

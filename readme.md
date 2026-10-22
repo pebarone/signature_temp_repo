@@ -95,12 +95,6 @@ START_FIELD_EMAILS=Email Firmante 1,Email Firmante 2
 START_LEGACY_SIGNATURE=false          # true => accepts GET /auth and the v1 signature (timestamp only) on POST /start
 START_LEGACY_GET_ENABLED=false        # true => accepts the old GET /start?userEmail1=... contract (no HMAC)
 
-# Rede de segurança do envio (DESLIGADA por padrão; ver "/auth e /start" e docs/REGLAS_DEL_FLUJO.md §4.1)
-START_DISCOVERY_TASK_NAMES=                 # nomes EXATOS (lista; sem prefixo) das tarefas de envio procuradas na caixa do OTCS_USER; vazio = desligada
-START_DISCOVERY_GRACE_MS=120000             # tempo que a tarefa precisa ficar na caixa antes da ação (o WebReport normalmente envia primeiro)
-START_DISCOVERY_INTERVAL_MS=60000           # intervalo de leitura da caixa (mínimo 5000)
-START_DISCOVERY_RETRY_MS=1800000            # após erro, nova tentativa só depois deste tempo
-
 # Disposition names in the OTCS workflow (custom_action)
 DISPOSITION_SIGNED=Firmado
 DISPOSITION_REJECTED=Rechazado

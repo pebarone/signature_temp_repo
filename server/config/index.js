@@ -182,17 +182,6 @@ function computeConfig(env = process.env, { projectRoot = PROJECT_ROOT } = {}) {
     // OBSOLETO: a disposição é endereçada pela tarefa resolvida por nome (SIGN_TASK_NAMES); mantido só por compatibilidade
     signTaskId: int(env.SIGN_TASK_ID, 3),
 
-    /*
-      Rede de segurança do /start (services/startDiscovery.js): procura na caixa do OTCS_USER as tarefas de envio.
-      Nomes EXATOS (normalizados, sem prefixo). Vazio => desligado.
-    */
-    startDiscovery: {
-      taskNames: list(env.START_DISCOVERY_TASK_NAMES, []),
-      graceMs: int(env.START_DISCOVERY_GRACE_MS, 120000),
-      intervalMs: Math.max(5000, int(env.START_DISCOVERY_INTERVAL_MS, 60000)),
-      retryMs: int(env.START_DISCOVERY_RETRY_MS, 1800000)
-    },
-
     // Atributos do workflow com dados do Adobe (best effort; formUpdate ainda não validado em QA => desligado)
     wfAttributes: {
       enabled: bool(env.WF_ATTRIBUTES_ENABLED, false),
