@@ -60,10 +60,23 @@ function adminRoutes({ config, logger, repo, reconciliation, tokenStore, basicAu
     res.json({ counts: repo.countByState(), total: agreements.length, agreements });
   });
 
-  // Força a reconciliação (consulta o Adobe se ainda não há resultado final e reprocessa pendências)
+  /*
+    Força a reconciliação (consulta o Adobe se ainda não há resultado final e reprocessa pendências).
+    Corpo JSON opcional { subworkflowId }: corrige o subprocesso do acordo antes de reconciliar (tarefa ambígua entre
+    subprocessos, acordo registrado com o pai no lugar do subprocesso). Não vale para acordo já concluído.
+  */
   router.post('/admin/reconcile/:id', basicAuth, async (req, res) => {
     const id = String(req.params.id);
     if (!repo.has(id)) return res.status(404).json({ error: 'Unknown agreement.' });
+    const raw = req.body?.subworkflowId;
+    const subworkflowId = raw === undefined || raw === null ? '' : String(raw).trim();
+    if (subworkflowId) {
+      if (!/^\d+$/.test(subworkflowId)) return res.status(422).json({ error: 'subworkflowId must be numeric.' });
+      const current = repo.get(id);
+      if (current.sendonDone) return res.status(409).json({ error: 'Agreement already concluded.' });
+      repo.upsert(id, { subworkflowId });
+      logger.warn(`[${id}] subproceso corregido manualmente: ${current.subworkflowId || '(vacío)'} -> ${subworkflowId}`);
+    }
     try {
       const { record, ...result } = await reconciliation.reconcile(id, { force: true, refresh: true, manual: true });
       logger.info(`[${id}] reconcile manual: ${result.status}`);

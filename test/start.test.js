@@ -276,8 +276,9 @@ test('/start verificado: os valores do OTCS prevalecem e o subprocesso/tarefa re
   const world = await verifyWorld();
   seedStartFlow(world, { fields: { 'Email Firmante 1': 'Uno@Example.com; dos@example.com', 'Email Firmante 2': ' tres@example.com ,' } });
 
-  // payload com subworkflowId errado (hint inválido), sem nodeId/attachId/emails/docName e taskId absurdo
-  const fields = { workflowId: '3003', subworkflowId: '999' };
+  // payload com subworkflowId = pai (o WebReport antigo manda WFID nos dois campos), sem nodeId/attachId/emails/docName
+  // e taskId absurdo. Uma dica de subprocesso real sem a tarefa já não é tolerada (ver o teste seguinte).
+  const fields = { workflowId: '3003', subworkflowId: '3003' };
   const auth = await (await post(world, '/auth', fields, ADMIN)).json();
   const r = await post(world, '/start', { ...fields, taskId: '77', ...auth });
   assert.equal(r.status, 200, await r.clone().text());
@@ -295,6 +296,23 @@ test('/start verificado: os valores do OTCS prevalecem e o subprocesso/tarefa re
   assert.deepEqual(world.otcs.downloads, ['1001']);
   assert.ok(world.otcs.modelCalls.some((c) => c[0] === 'getTaskForm' && c[1] === 3003 && c[2] === 3004 && c[3] === 2));
 
+  await waitFor(() => world.repo.get('AG-1').startSendonDone);
+  await world.close();
+});
+
+test('/start verificado: subworkflowId de um subprocesso real que não tem a tarefa de início => 409; tarefa em vários subprocessos sem dica usa o mais recente', async () => {
+  const world = await verifyWorld();
+  seedStartFlow(world);
+  const wrong = { workflowId: '3003', subworkflowId: '999' };
+  const r = await authThenStart(world, wrong);
+  assert.equal(r.status, 409, 'a tarefa existe só no subprocesso 3004, que não é o do payload');
+  assert.equal(world.adobe.created.length, 0);
+
+  // o mesmo pai com outro subprocesso na tarefa de início e a dica = pai: latest => o de maior subprocessId
+  world.otcs.addSubprocess('3003', 3005, { stage: 'start' });
+  const both = await authThenStart(world, { workflowId: '3003', subworkflowId: '3003' });
+  assert.equal(both.status, 200, await both.clone().text());
+  assert.equal(world.repo.get('AG-1').subworkflowId, '3005');
   await waitFor(() => world.repo.get('AG-1').startSendonDone);
   await world.close();
 });

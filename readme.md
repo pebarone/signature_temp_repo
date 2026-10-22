@@ -126,7 +126,7 @@ POLL_MAX_PER_TICK=50
 POLL_MAX_AGE_DAYS=90
 RETRY_BASE_MS=60000                   # exponential backoff: 1 min ... 1 h
 RETRY_MAX_MS=3600000
-RETRY_MAX_ATTEMPTS=10                 # attempts before needs_attention (0 = unlimited); OTCS 4xx (except 401/408/429) goes there at once
+RETRY_MAX_ATTEMPTS=10                 # attempts before needs_attention (0 = unlimited); OTCS 4xx also retry (only data errors go there at once)
 ADOBE_DOWNLOAD_ATTEMPTS=8             # retries of 403 on combinedDocument right after signing
 LOG_RETENTION_DAYS=15                 # 0 disables the purge
 OTCS_TIMEOUT_MS=60000
@@ -277,7 +277,9 @@ it does not provide an atomic lock against other processes writing the same node
 
 - `GET /admin/agreements[?state=needs_attention][&events=5]` — state of every agreement
 - `POST /admin/reconcile/:id` — force a reconciliation (asks Adobe if no final result is known yet); also takes a
-  `needs_attention` agreement back and resets its attempts
+  `needs_attention` agreement back and resets its attempts. Optional JSON body `{ "subworkflowId": "<digits>" }` first
+  corrects the sub-process stored on the agreement (use it when the task exists in several sub-processes of the same
+  parent and the agreement does not say which one); `422` if not numeric, `409` if the agreement is already concluded
 - `POST /admin/adopt/:id` — registers an Adobe agreement that is not in SQLite (lost ephemeral database, new deploy) and
   reconciles it. It uses the agreement's `externalId` (`otcs|wf=..|sub=..|node=..|attach=..`, set by `/start` since this
   version); for older agreements send JSON `{ "workflowId", "subworkflowId"?, "nodeId", "attachId", "fileName"? }`.

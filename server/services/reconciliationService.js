@@ -78,7 +78,9 @@ function createReconciliationService({
     return { status: 'needs_attention', reason };
   }
 
-  // permanent: erro que não adianta retentar (4xx do OTCS) => needs_attention direto
+  // permanent: só problema de dado/configuração que retentar não resolve (workflow inexistente...) => needs_attention
+  // direto. Erros 4xx do OTCS NÃO são permanentes: retentam com backoff e, esgotadas as tentativas, viram
+  // needs_attention retries_exhausted (reabre sozinho após ATTENTION_RETRY_HOURS).
   function registerFailure(id, stage, err, { permanent = false } = {}) {
     const rec = repo.get(id);
     const message = describeError(err);
@@ -147,9 +149,9 @@ function createReconciliationService({
 
       if (!located) {
         const steps = await otcs.getProcessSteps(rec.workflowId);
-        located = locate(steps, signNames(), { subprocessHint: rec.subworkflowId });
+        located = locate(steps, signNames(), { subprocessHint: rec.subworkflowId, processId: rec.workflowId });
       }
-      if (located.where !== 'current') return; // só com a tarefa ativa (formUpdate)
+      if (located.where !== 'current') return; // só com a tarefa ativa (formUpdate); ambígua/ausente: nada a gravar
       const t = located.task;
       form = form || await otcs.getTaskForm(t.processId, t.subprocessId, t.taskId);
 
@@ -194,15 +196,33 @@ function createReconciliationService({
   /* ---------- etapas do pipeline ---------- */
   // Cada etapa devolve { rec } (segue) ou { result } (encerra a reconciliação com esse resultado).
 
-  // Falha ao ler o processo: 404 = workflow inexistente (permanente); demais seguem a regra geral
-  function stepsFailure(id, stage, rec, e, { allow4xx = false } = {}) {
+  // Falha ao ler o processo: 404 = workflow inexistente (permanente); qualquer outro erro é transitório (retry com backoff)
+  function stepsFailure(id, stage, rec, e) {
     if (e?.response?.status === 404) {
       return registerFailure(
         id, stage, new Error(`workflow inexistente (${rec.workflowId}): ${describeError(e)}`), { permanent: true }
       );
     }
-    return registerFailure(id, stage, e, { permanent: !allow4xx && state.isPermanentHttpError(e) });
+    return registerFailure(id, stage, e);
   }
+
+  // A tarefa existe em mais de um subprocesso do pai e o acordo não diz qual: dado ambíguo, retentar não resolve.
+  // Nada é enviado ao OTCS; o admin indica o subprocesso em POST /admin/reconcile/:id.
+  function attentionAmbiguous(id, rec, names, located) {
+    const hint = String(rec.subworkflowId ?? '').trim() || 'vacío';
+    return markAttention(
+      id,
+      `la tarea "${names.join(' / ')}" existe en más de un subproceso (${located.subprocesses.join(', ')}) del workflow `
+      + `${rec.workflowId} y el acuerdo no indica cuál (subworkflowId ${hint}); indique el subproceso en `
+      + `POST /admin/reconcile/${id} con {"subworkflowId": ...}`,
+      ATTENTION_KINDS.PERMANENT
+    );
+  }
+
+  // Sufixo da mensagem quando a tarefa só existe em OUTRO subprocesso (nunca se usa a de outro subprocesso)
+  const elsewhereNote = (rec, located) => (located.elsewhere?.length
+    ? ` (existe en otro subproceso: ${located.elsewhere.join(', ')}; no corresponde al acuerdo, subproceso ${rec.subworkflowId})`
+    : '');
 
   // Tarefa de início ainda atribuída ao usuário (não ao de integração): estado transitório "aguardando reatribuição".
   // Conta como tentativa da etapa start (backoff e limite normais), mas sem log de erro; esgotadas as tentativas,
@@ -226,10 +246,11 @@ function createReconciliationService({
     try {
       steps = steps || await otcs.getProcessSteps(rec.workflowId);
     } catch (e) {
-      return { result: stepsFailure(id, 'start', rec, e, { allow4xx: true }) };
+      return { result: stepsFailure(id, 'start', rec, e) };
     }
-    const hint = { subprocessHint: rec.subworkflowId };
+    const hint = { subprocessHint: rec.subworkflowId, processId: rec.workflowId };
     const start = locate(steps, startNames(), hint);
+    if (start.where === 'ambiguous') return { result: attentionAmbiguous(id, rec, startNames(), start) };
 
     if (start.where === 'current') {
       const t = start.task;
@@ -263,6 +284,9 @@ function createReconciliationService({
     }
 
     const sign = locate(steps, signNames(), hint);
+    if (start.where !== 'completed' && sign.where === 'ambiguous') {
+      return { result: attentionAmbiguous(id, rec, signNames(), sign) };
+    }
     if (start.where === 'completed' || sign.where === 'current' || sign.where === 'completed') {
       rec = repo.upsert(id, state.startDonePatch(rec, nowIso()));
       logger.info(
@@ -272,7 +296,7 @@ function createReconciliationService({
     }
     return {
       result: registerFailure(id, 'start', new Error(
-        `no se encontró la tarea de inicio (${startNames().join(' / ')}) activa en el workflow ${rec.workflowId} (${start.where})`
+        `no se encontró la tarea de inicio (${startNames().join(' / ')}) activa en el workflow ${rec.workflowId} (${start.where})${elsewhereNote(rec, start)}`
       ))
     };
   }
@@ -338,7 +362,11 @@ function createReconciliationService({
 
   /*
     pdf: o PDF assinado vira NOVA VERSÃO do nó que foi enviado à assinatura (DocID): o workflow devolve e a
-    distribuição ao workspace copia esse nó. Se o nó não existe mais (404), cai para um documento na pasta de anexos.
+    distribuição ao workspace copia esse nó. Se o nó não existe mais ou não é acessível, cai para um documento na pasta
+    de anexos. Falha no addVersion: 404 => fallback direto; outro 4xx (o OTCS documenta 400 para nó inexistente/sem
+    acesso; 409/423 para nó reservado) => sonda o nó: inexistente => fallback; existente => transitório (retry, o nó
+    pode estar reservado); sonda com erro => transitório, sem fallback. Erros não-4xx (5xx, rede, 401/408/429) e
+    qualquer falha no upload para a pasta também são transitórios.
   */
   async function deliverSignedPdf(id, plan, rec) {
     if (!plan.pdf || rec.pdfDelivered) return { rec };
@@ -363,10 +391,26 @@ function createReconciliationService({
         pdfNodeId = rec.nodeId;
         versioned = true;
       } catch (e) {
-        if (e?.response?.status !== 404) {
-          return { result: registerFailure(id, 'pdf', e, { permanent: state.isPermanentHttpError(e) }) };
+        const status = e?.response?.status;
+        if (status !== 404) {
+          if (!state.isPermanentHttpError(e)) return { result: registerFailure(id, 'pdf', e) };
+          let exists;
+          try {
+            exists = await otcs.nodeExists(rec.nodeId);
+          } catch {
+            return { result: registerFailure(id, 'pdf', e) }; // sem saber se o nó existe não há fallback
+          }
+          if (exists) {
+            return {
+              result: registerFailure(id, 'pdf', new Error(
+                `el documento ${rec.nodeId} existe pero rechazó la nueva versión (${describeError(e)}); puede estar reservado o sin permiso`
+              ))
+            };
+          }
         }
-        logger.warn(`[${id}] el nodo ${rec.nodeId} ya no existe: el PDF irá a la carpeta ${rec.attachId || '(sin attachId)'}`);
+        logger.warn(
+          `[${id}] el nodo ${rec.nodeId} ya no existe o no es accesible (HTTP ${status}): el PDF irá a la carpeta ${rec.attachId || '(sin attachId)'}`
+        );
       }
     }
     if (!versioned) {
@@ -379,7 +423,7 @@ function createReconciliationService({
         const created = await otcs.uploadToFolder(rec.attachId, buf, name, { agreementId: id });
         pdfNodeId = created?.id ?? null;
       } catch (e) {
-        return { result: registerFailure(id, 'pdf', e, { permanent: state.isPermanentHttpError(e) }) };
+        return { result: registerFailure(id, 'pdf', e) };
       }
     }
     rec = repo.upsert(id, state.pdfDeliveredPatch(nowIso(), pdfNodeId));
@@ -390,8 +434,9 @@ function createReconciliationService({
   }
 
   /*
-    disposition: localiza a tarefa de firma pelo nome (o subprocesso pode ser diferente do processo) e a conclui.
-    Tarefa já concluída fora da integração => conclui sem enviar nada (não é needs_attention).
+    disposition: localiza a tarefa de firma pelo nome, SÓ no subprocesso do acordo (pode ser diferente do processo), e a
+    conclui. Tarefa já concluída fora da integração => conclui sem enviar nada (não é needs_attention).
+    Tarefa em mais de um subprocesso sem dica clara => needs_attention permanente, sem SendOn.
   */
   async function executeDisposition(id, plan, rec) {
     const disposition = state.dispositionFor(plan, config.dispositions);
@@ -409,11 +454,14 @@ function createReconciliationService({
       } catch (e) {
         return { result: stepsFailure(id, 'disposition', rec, e) };
       }
-      located = locate(steps, signNames(), { subprocessHint: rec.subworkflowId });
+      const hint = { subprocessHint: rec.subworkflowId, processId: rec.workflowId };
+      located = locate(steps, signNames(), hint);
+      if (located.where === 'ambiguous') return { result: attentionAmbiguous(id, rec, signNames(), located) };
       if (located.where === 'current' || located.where === 'completed') break;
 
       // Tarefa de firma ainda não existe: se o pedido de firma não foi enviado, envia agora e olha de novo (uma vez)
-      const start = locate(steps, startNames(), { subprocessHint: rec.subworkflowId });
+      const start = locate(steps, startNames(), hint);
+      if (start.where === 'ambiguous') return { result: attentionAmbiguous(id, rec, startNames(), start) };
       if (start.where === 'current' && pass === 0) {
         const r = await ensureStartSent(id, rec, { steps });
         if (r.result) return r;
@@ -422,7 +470,7 @@ function createReconciliationService({
       }
       return {
         result: registerFailure(id, 'disposition', new Error(
-          `la tarea de firma (${signNames().join(' / ')}) no está activa en el workflow ${rec.workflowId} (${located.where})`
+          `la tarea de firma (${signNames().join(' / ')}) no está activa en el workflow ${rec.workflowId} (${located.where})${elsewhereNote(rec, located)}`
         ))
       };
     }
@@ -481,7 +529,7 @@ function createReconciliationService({
       });
     } catch (e) {
       // A tarefa pode ter sido concluída entre a consulta e o PUT, inclusive com a resposta do PUT perdida.
-      // Antes de tratar um 4xx como permanente, confirma a conclusão da MESMA tarefa no processo.
+      // Antes de retentar um 4xx, confirma a conclusão da MESMA tarefa no processo.
       if (state.isPermanentHttpError(e)) {
         try {
           const steps = await otcs.getProcessSteps(rec.workflowId);
@@ -496,11 +544,11 @@ function createReconciliationService({
             return { result: { status: 'completed', completedExternally: true, record: rec } };
           }
         } catch (checkError) {
-          // Sem conseguir confirmar a conclusão não encerra permanentemente: a próxima tentativa consulta de novo.
+          // Sem conseguir confirmar a conclusão: a próxima tentativa consulta de novo.
           return { result: stepsFailure(id, 'disposition', rec, checkError) };
         }
       }
-      return { result: registerFailure(id, 'disposition', e, { permanent: state.isPermanentHttpError(e) }) };
+      return { result: registerFailure(id, 'disposition', e) };
     }
     clearTimeout_(id);
     rec = repo.upsert(id, state.completedPatch(plan, action, nowIso()));

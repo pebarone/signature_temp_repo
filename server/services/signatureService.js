@@ -89,7 +89,10 @@ function createSignatureService({ repo, adobe, otcs, logger, config, now = () =>
       throw otcsUnavailable();
     }
     // Usa a mesma normalização do HMAC: espaços não podem mudar o subprocesso escolhido.
-    const { where, task } = locate(steps, config.startTaskNames, { subprocessHint: clean(input.subworkflowId) });
+    // latest: com a tarefa em mais de um subprocesso sem dica clara, o /start cria o acordo a partir do mais recente
+    const { where, task } = locate(steps, config.startTaskNames, {
+      subprocessHint: clean(input.subworkflowId), processId: workflowId, latest: true
+    });
     if (where !== 'current') {
       // Recarga da página depois de um envio já processado: a tarefa de início pode já ter avançado (SendOn em background)
       const nodeHint = clean(input.nodeId);

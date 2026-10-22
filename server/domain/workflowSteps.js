@@ -21,28 +21,53 @@ function matchesTask(name, names) {
     .some((candidate) => n.startsWith(candidate));
 }
 
-// Entre vários candidatos: o do subprocesso indicado; senão o de maior subprocessId (o mais recente)
-function pick(candidates, subprocessHint) {
-  if (candidates.length <= 1) return candidates[0] || null;
-  const hint = subprocessHint === undefined || subprocessHint === null ? '' : String(subprocessHint);
-  if (hint) {
-    const hinted = candidates.filter((t) => String(t.subprocessId) === hint);
-    if (hinted.length) return hinted.reduce((a, b) => (b.subprocessId > a.subprocessId ? b : a));
-  }
-  return candidates.reduce((a, b) => ((b.subprocessId || 0) > (a.subprocessId || 0) ? b : a));
+const WHERES = ['current', 'completed', 'next'];
+
+// Ids distintos (ordem numérica) dos subprocessos de uma lista de candidatos { where, task }
+function distinctSubprocesses(candidates) {
+  const byKey = new Map();
+  for (const c of candidates) byKey.set(String(c.task.subprocessId), c.task.subprocessId);
+  return [...byKey.values()].sort((a, b) => Number(a) - Number(b));
 }
 
 /*
   Onde está a tarefa: 'current' (prioridade) > 'completed' > 'next'; 'absent' se nenhuma lista a tem.
-  Devolve { where, task } (task é null quando absent).
+  Devolve { where, task } (task é null quando não há tarefa utilizável).
+
+  A tarefa NUNCA é de outro subprocesso que o do acordo: o step_list do pai traz as tarefas de todos os subprocessos
+  (inclusive os já encerrados, em 'completed'). Por isso os candidatos de todas as listas são juntados antes de escolher:
+    - subprocessHint presente entre os candidatos => só os dele (prioridade current > completed > next);
+    - dica de um subprocesso real (diferente do pai) sem candidato próprio => { where: 'absent', elsewhere: [subprocessos] };
+    - sem dica, ou dica = o próprio pai (WebReport antigo manda WFID nos dois campos; adoção sem subworkflowId grava o
+      pai): vale o único subprocesso que tem a tarefa; com vários => { where: 'ambiguous', subprocesses: [...] },
+      salvo `latest` (o mais recente, na lista de maior prioridade: aceitável quando a tarefa vira o acordo, como no /start).
+  processId: o pai (padrão: o processId da primeira tarefa do step_list).
 */
-function locate(stepList, names, { subprocessHint } = {}) {
-  for (const where of ['current', 'completed', 'next']) {
-    const matches = (stepList?.[where] || []).filter((t) => matchesTask(t.name, names));
-    const task = pick(matches, subprocessHint);
-    if (task) return { where, task };
+function locate(stepList, names, { subprocessHint, processId, latest = false } = {}) {
+  const candidates = [];
+  for (const where of WHERES) {
+    for (const task of stepList?.[where] || []) {
+      if (matchesTask(task.name, names)) candidates.push({ where, task });
+    }
   }
-  return { where: 'absent', task: null };
+  const hint = String(subprocessHint ?? '').trim();
+
+  const hinted = candidates.filter((c) => String(c.task.subprocessId) === hint);
+  if (hint && hinted.length) return { where: hinted[0].where, task: hinted[0].task };
+
+  const firstTask = WHERES.flatMap((w) => stepList?.[w] || [])[0];
+  const parent = String(processId ?? '').trim() || String(firstTask?.processId ?? '').trim();
+  if (hint && hint !== parent) {
+    return { where: 'absent', task: null, elsewhere: distinctSubprocesses(candidates) };
+  }
+
+  const subprocesses = distinctSubprocesses(candidates);
+  if (!subprocesses.length) return { where: 'absent', task: null };
+  if (subprocesses.length === 1) return { where: candidates[0].where, task: candidates[0].task };
+  if (!latest) return { where: 'ambiguous', task: null, subprocesses };
+  const top = candidates.filter((c) => c.where === candidates[0].where);
+  const chosen = top.reduce((a, b) => ((b.task.subprocessId || 0) > (a.task.subprocessId || 0) ? b : a));
+  return { where: chosen.where, task: chosen.task };
 }
 
 module.exports = { normalizeName, matchesTask, locate };

@@ -126,7 +126,9 @@ const HUMAN_USER_ID = 279463;
 /*
   OTCS falso. `gate` (Promise) segura a escrita do PDF até ser liberada (teste de "200 rápido").
   Modelo de workflow em memória (`workflows`): processo -> tarefas { subprocessId, taskId, name, status }.
-  `addWorkflow(processId, { subprocessId, stage })`: subprocessId diferente do processo simula um sub-fluxo.
+  `addWorkflow(processId, { subprocessId, stage })`: subprocessId diferente do processo simula um sub-fluxo;
+  `addSubprocess(processId, subprocessId, { stage })` acrescenta outro subprocesso (4 tarefas padrão) ao mesmo pai, como
+  o step_list real do OTCS (tarefas do pai e de todos os subprocessos, inclusive os já encerrados).
   O SendOn da tarefa de início ativa "Aguardar Firma"; a disposição conclui a tarefa de firma.
   Chamadas ao modelo (getProcessSteps/getTaskForm/updateTaskForm/getWorkflowAttributes/getCurrentUser) vão para
   `modelCalls` (não poluem `calls`).
@@ -134,6 +136,9 @@ const HUMAN_USER_ID = 279463;
   define o dono das tarefas e `assign(processId, taskId, userId)` reatribui (o REASSIGN da página). Com a tarefa fora do
   usuário de integração, getTaskForm e sendOnWorkflow respondem 403, como no OTCS.
   Atributos do workflow (status/info): `workflowAttributes[processId]` ({ rótulo: valor }); sem entrada, vêm de `formFields`.
+  Nós: `missingNodes` (inexistentes; addVersion falha com `missingNodeStatus`, 404 por padrão; a spec do OTCS usa 400) e
+  `lockedNodes` (existem, mas addVersion falha com `lockedNodeStatus`, 409). `nodeExists` consulta `missingNodes`;
+  `nodeExistsFailures` faz as próximas N sondagens falharem com `nodeExistsFailStatus`.
 */
 function makeOtcs(calls = []) {
   const otcs = {
@@ -146,7 +151,12 @@ function makeOtcs(calls = []) {
     dispositionFailStatus: 500,
     uploads: [],             // uploadToFolder (PDF criado na pasta: fallback)
     versions: [],            // addVersion (PDF como nova versão do nó assinado)
-    missingNodes: new Set(), // nós que respondem 404 em addVersion
+    missingNodes: new Set(), // nós inexistentes: addVersion falha com missingNodeStatus; nodeExists => false
+    missingNodeStatus: 404,
+    lockedNodes: new Set(),  // nós que existem mas rejeitam a nova versão (reservados...) com lockedNodeStatus
+    lockedNodeStatus: 409,
+    nodeExistsFailures: 0,   // próximas N sondagens nodeExists falham
+    nodeExistsFailStatus: 500,
     sendons: [],
     downloads: [],
     sendOnFailsAlways: false,
@@ -164,24 +174,34 @@ function makeOtcs(calls = []) {
     attributesFailure: null, // se definido, getWorkflowAttributes lança
     updateFormFailures: 0,
     updateFormCalls: [],
-    addWorkflow(processId, { subprocessId = processId, stage = 'sign', assignee = null } = {}) {
+    // As 4 tarefas padrão de um subprocesso no estágio dado
+    standardTasks(subprocessId, stage) {
       const sub = Number(subprocessId);
       const status = {
         start: ['current', 'next'],
         sign: ['completed', 'current'],
         done: ['completed', 'completed']
       }[stage];
+      return [
+        { subprocessId: sub, taskId: 1, name: 'Trae Documento a Firmar', status: 'completed' },
+        { subprocessId: sub, taskId: 2, name: START_TASK_NAME, status: status[0] },
+        { subprocessId: sub, taskId: 3, name: SIGN_TASK_NAME, status: status[1] },
+        { subprocessId: sub, taskId: 4, name: 'Firmado?', status: 'next' }
+      ];
+    },
+    addWorkflow(processId, { subprocessId = processId, stage = 'sign', assignee = null } = {}) {
       otcs.workflows[String(processId)] = {
         processId: Number(processId),
-        tasks: [
-          { subprocessId: sub, taskId: 1, name: 'Trae Documento a Firmar', status: 'completed' },
-          { subprocessId: sub, taskId: 2, name: START_TASK_NAME, status: status[0] },
-          { subprocessId: sub, taskId: 3, name: SIGN_TASK_NAME, status: status[1] },
-          { subprocessId: sub, taskId: 4, name: 'Firmado?', status: 'next' }
-        ]
+        tasks: otcs.standardTasks(subprocessId, stage)
       };
       if (assignee !== null) for (const t of otcs.workflows[String(processId)].tasks) t.assignees = [Number(assignee)];
       return otcs.workflows[String(processId)];
+    },
+    // Outro subprocesso no mesmo pai (o workflow do pai precisa existir)
+    addSubprocess(processId, subprocessId, { stage = 'sign' } = {}) {
+      const wf = otcs.workflows[String(processId)];
+      wf.tasks.push(...otcs.standardTasks(subprocessId, stage));
+      return wf;
     },
     // REASSIGN da tarefa a outro usuário (a página faz isso na sessão do usuário humano)
     assign(processId, taskId, userId) {
@@ -194,8 +214,10 @@ function makeOtcs(calls = []) {
     unknownAssignees(processId) {
       for (const t of otcs.workflows[String(processId)].tasks) t.assignees = null;
     },
-    task(processId, taskId) {
-      return otcs.workflows[String(processId)]?.tasks.find((t) => t.taskId === Number(taskId));
+    // Com subprocessId casa os dois; sem, o primeiro por taskId
+    task(processId, taskId, subprocessId) {
+      return otcs.workflows[String(processId)]?.tasks.find((t) => t.taskId === Number(taskId)
+        && (subprocessId === undefined || subprocessId === null || t.subprocessId === Number(subprocessId)));
     },
     async downloadNode(nodeId) {
       calls.push(['otcs.download', String(nodeId)]);
@@ -215,13 +237,22 @@ function makeOtcs(calls = []) {
     async addVersion(nodeId, buffer, fileName, { agreementId } = {}) {
       calls.push(['otcs.addVersion', String(nodeId), fileName]);
       if (otcs.uploadGate) await otcs.uploadGate;
-      if (otcs.missingNodes.has(String(nodeId))) throw httpError(404, 'node not found');
+      if (otcs.missingNodes.has(String(nodeId))) throw httpError(otcs.missingNodeStatus, 'node not found');
+      if (otcs.lockedNodes.has(String(nodeId))) throw httpError(otcs.lockedNodeStatus, 'node reserved');
       if (otcs.uploadFailures > 0) {
         otcs.uploadFailures--;
         throw httpError(otcs.uploadFailStatus, 'otcs upload failed');
       }
       otcs.versions.push({ nodeId: String(nodeId), fileName, size: buffer.length, agreementId });
       return { ok: true };
+    },
+    async nodeExists(nodeId) {
+      otcs.modelCalls.push(['nodeExists', String(nodeId)]);
+      if (otcs.nodeExistsFailures > 0) {
+        otcs.nodeExistsFailures--;
+        throw httpError(otcs.nodeExistsFailStatus, 'node probe failed');
+      }
+      return !otcs.missingNodes.has(String(nodeId));
     },
     async getProcessSteps(processId) {
       otcs.modelCalls.push(['getProcessSteps', String(processId)]);
@@ -283,14 +314,15 @@ function makeOtcs(calls = []) {
         throw httpError(otcs.dispositionFailStatus, 'otcs disposition failed');
       }
       // Modelo: só uma tarefa ativa pode receber SendOn; o início ativa a firma e a disposição conclui a firma
-      const task = otcs.task(args.workflowId, args.taskId);
+      // (a próxima tarefa é a do MESMO subprocesso). Sem a tarefa no subprocesso pedido, cai na primeira por taskId (409)
+      const task = otcs.task(args.workflowId, args.taskId, args.subworkflowId) || otcs.task(args.workflowId, args.taskId);
       if (task) {
         if (task.status !== 'current' || Number(args.subworkflowId) !== task.subprocessId) {
           throw httpError(409, 'task is not current');
         }
         if (!otcs.assignedToIntegration(task)) throw httpError(403, 'task not assigned to the integration user');
         task.status = 'completed';
-        const next = otcs.task(args.workflowId, Number(args.taskId) + 1);
+        const next = otcs.task(args.workflowId, Number(args.taskId) + 1, task.subprocessId);
         if (next && next.status === 'next') next.status = 'current';
       }
       otcs.sendons.push(args);

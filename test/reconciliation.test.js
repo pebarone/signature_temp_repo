@@ -702,11 +702,13 @@ test('needs_attention por limite de tentativas: reconcile manual zera as tentati
 test('POST /admin/reconcile/:id reprocessa um needs_attention (erro permanente) e conclui', async () => {
   const world = await buildWorld({ listen: true });
   seedAgreement(world);
-  world.otcs.dispositionFailStatus = 404;
-  world.otcs.dispositionFailures = 1;
+  // permanente: a tarefa não oferece a disposição configurada (só dado/config; 4xx do OTCS já não é permanente)
+  world.otcs.customActions = ['Otra'];
   await fire(world, 'AGREEMENT_WORKFLOW_COMPLETED');
   assert.equal(world.repo.get('AG-1').state, 'needs_attention');
+  assert.equal(world.repo.get('AG-1').attentionKind, 'permanent');
   assert.equal(world.repo.get('AG-1').pdfDelivered, true);
+  world.otcs.customActions = ['Firmado', 'Rechazado'];
 
   const r = await fetch(`${world.baseUrl}/admin/reconcile/AG-1`, {
     method: 'POST', headers: { authorization: basicHeader('admin', 'pa:ss') }
@@ -720,8 +722,8 @@ test('POST /admin/reconcile/:id reprocessa um needs_attention (erro permanente) 
   await world.close();
 });
 
-test('erro 4xx na disposição (exceto 401/408/429) => needs_attention na hora; 401/408/429 e 5xx retentam', async () => {
-  for (const [status, permanent] of [[400, true], [403, true], [404, true], [409, true], [401, false], [408, false], [429, false], [500, false]]) {
+test('erro 4xx na disposição também retenta com backoff (nenhum status vai direto para needs_attention)', async () => {
+  for (const status of [400, 403, 404, 409, 401, 408, 429, 500]) {
     const world = await buildWorld();
     seedAgreement(world);
     world.otcs.dispositionFailStatus = status;
@@ -730,30 +732,44 @@ test('erro 4xx na disposição (exceto 401/408/429) => needs_attention na hora; 
     const rec = world.repo.get('AG-1');
     assert.equal(rec.attempts, 1, `HTTP ${status}`);
     assert.equal(rec.lastErrorStage, 'disposition');
-    if (permanent) {
-      assert.equal(rec.state, 'needs_attention', `HTTP ${status}`);
-      assert.match(rec.attentionReason, new RegExp(`error permanente en disposition.*HTTP ${status}`));
-      assert.equal(rec.pdfDelivered, true, 'PDF entregue é preservado');
-      assert.equal(world.timers.length, 0, 'sem retry agendado');
-    } else {
-      assert.equal(rec.state, 'pdf_delivered', `HTTP ${status}`);
-      assert.equal(world.timers.length, 1);
-    }
+    assert.equal(rec.state, 'pdf_delivered', `HTTP ${status}`);
+    assert.equal(rec.pdfDelivered, true, 'PDF entregue é preservado');
+    assert.equal(world.timers.length, 1, 'retry agendado');
     await world.close();
   }
 });
 
-test('erro 4xx no upload do PDF segue a mesma regra; falha de download no Adobe nunca é permanente', async () => {
+test('erro 4xx no upload do PDF: nó existente retenta; nó inexistente (400/403/404) cai para a pasta; 429 e download 404 do Adobe retentam', async () => {
+  // 403 no addVersion com o nó existente (a sonda confirma): transitório, sem fallback
   let world = await buildWorld();
   seedAgreement(world);
   world.otcs.uploadFailStatus = 403;
   world.otcs.uploadFailures = 1;
   await fire(world, 'AGREEMENT_WORKFLOW_COMPLETED');
   let rec = world.repo.get('AG-1');
-  assert.equal(rec.state, 'needs_attention');
-  assert.match(rec.attentionReason, /error permanente en pdf.*HTTP 403/);
+  assert.equal(rec.state, 'signed');
+  assert.equal(rec.attempts, 1);
+  assert.match(rec.lastError, /existe pero rechazó la nueva versión.*HTTP 403/);
   assert.equal(rec.pdfDelivered, false);
+  assert.equal(world.timers.length, 1);
+  assert.equal(world.otcs.uploads.length, 0, 'sem fallback com o nó existente');
   assert.equal(world.otcs.dispositionCalls().length, 0);
+  world.clock.advance(60 * 1000);
+  await world.reconciliation.reconcile('AG-1', { force: false });
+  assert.equal(world.repo.get('AG-1').state, 'completed', 'o retry entrega como nova versão');
+  assert.equal(world.otcs.versions.length, 1);
+  await world.close();
+
+  // 403 com o nó inexistente/inacessível: fallback para a pasta de anexos
+  world = await buildWorld();
+  seedAgreement(world);
+  world.otcs.missingNodes.add('1001');
+  world.otcs.missingNodeStatus = 403;
+  await fire(world, 'AGREEMENT_WORKFLOW_COMPLETED');
+  rec = world.repo.get('AG-1');
+  assert.equal(rec.state, 'completed');
+  assert.equal(world.otcs.uploads.length, 1);
+  assert.equal(world.otcs.uploads[0].folderId, '2002');
   await world.close();
 
   world = await buildWorld();
@@ -763,6 +779,7 @@ test('erro 4xx no upload do PDF segue a mesma regra; falha de download no Adobe 
   await fire(world, 'AGREEMENT_WORKFLOW_COMPLETED');
   assert.equal(world.repo.get('AG-1').state, 'signed');
   assert.equal(world.timers.length, 1);
+  assert.ok(!world.otcs.modelCalls.some((c) => c[0] === 'nodeExists'), '429 é transitório: sem sonda');
   await world.close();
 
   world = await buildWorld();
@@ -1165,4 +1182,294 @@ test('reconcile manual de um final OK não confirmado volta a consultar o Adobe 
   assert.equal(res.status, 'completed');
   assert.equal(world.repo.get('AG-1').adobeStatus, 'SIGNED');
   await world.close();
+});
+
+/* ---------- tarefa só no subprocesso do acordo (A2) ---------- */
+
+const ADMIN_HEADERS = { authorization: basicHeader('admin', 'pa:ss'), 'content-type': 'application/json' };
+const adminReconcile = (world, id, body) => fetch(`${world.baseUrl}/admin/reconcile/${id}`, {
+  method: 'POST', headers: ADMIN_HEADERS, ...(body === undefined ? {} : { body: JSON.stringify(body) })
+});
+
+test('A2 disposição: o Firmado do S1 (Aguardar Firma já concluída à mão) não conclui a tarefa current do S2 do mesmo pai', async () => {
+  const world = await buildWorld();
+  seedAgreement(world); // pai 3003, subprocesso do acordo (S1) = 3004
+  world.otcs.addSubprocess('3003', 3005, { stage: 'sign' }); // S2 com "Aguardar Firma" current
+  world.otcs.task('3003', 3, 3004).status = 'completed'; // S1 concluído manualmente
+
+  const res = await fire(world, 'AGREEMENT_WORKFLOW_COMPLETED');
+  assert.equal(res.known, true);
+  const rec = world.repo.get('AG-1');
+  assert.equal(rec.completedExternally, true);
+  assert.equal(rec.sendonDone, true);
+  assert.equal(rec.state, 'completed');
+  assert.equal(rec.signSubprocessId, '3004');
+  assert.equal(world.otcs.sendons.length, 0, 'nenhum SendOn nem disposição');
+  assert.equal(world.otcs.task('3003', 3, 3005).status, 'current', 'a tarefa do S2 continua current');
+  await world.close();
+});
+
+test('A2 início: o início concluído do S1 não deixa o SendOn ir para a tarefa de início current do S2', async () => {
+  const world = await buildWorld();
+  seedAgreement(world, 'AG-1', { startSendonDone: false });
+  world.otcs.addSubprocess('3003', 3005, { stage: 'start' });
+  world.otcs.task('3003', 2, 3004).status = 'completed'; // início do S1 já enviado fora da integração
+
+  const res = await world.reconciliation.reconcile('AG-1');
+  assert.equal(res.status, 'start_sent');
+  assert.equal(world.otcs.sendons.length, 0, 'nenhum SendOn no S2');
+  assert.equal(world.otcs.task('3003', 2, 3005).status, 'current');
+  assert.equal(world.repo.get('AG-1').startSendonDone, true);
+  await world.close();
+});
+
+test('A2: a dica aponta um subprocesso sem a tarefa => retry transitório citando em que outro subprocesso ela existe', async () => {
+  const world = await buildWorld();
+  world.otcs.addWorkflow('3003', { subprocessId: 3005, stage: 'sign' }); // a tarefa só existe no 3005
+  seedAgreement(world, 'AG-1', { subworkflowId: '3004' });
+  await fire(world, 'AGREEMENT_WORKFLOW_COMPLETED');
+  const rec = world.repo.get('AG-1');
+  assert.equal(rec.state, 'pdf_delivered');
+  assert.equal(rec.lastErrorStage, 'disposition');
+  assert.match(rec.lastError, /existe en otro subproceso: 3005; no corresponde al acuerdo, subproceso 3004/);
+  assert.equal(world.otcs.sendons.length, 0);
+  assert.equal(world.timers.length, 1);
+  await world.close();
+});
+
+test('dica = pai com um único subprocesso: a disposição vai para esse subprocesso', async () => {
+  const world = await buildWorld();
+  world.otcs.addWorkflow('3003', { subprocessId: 3004, stage: 'sign' });
+  seedAgreement(world, 'AG-1', { subworkflowId: '3003' }); // WebReport antigo: WFID nos dois campos
+  await fire(world, 'AGREEMENT_WORKFLOW_COMPLETED');
+  assert.equal(world.repo.get('AG-1').state, 'completed');
+  assert.equal(world.otcs.dispositionCalls().length, 1);
+  assert.equal(world.otcs.dispositionCalls()[0].subworkflowId, 3004);
+  assert.equal(world.repo.get('AG-1').signSubprocessId, '3004');
+  await world.close();
+});
+
+test('tarefa ambígua (dica = pai, dois subprocessos): needs_attention permanente sem SendOn; POST /admin/reconcile com subworkflowId conclui no escolhido', async () => {
+  const world = await buildWorld({ listen: true });
+  world.otcs.addWorkflow('3003', { subprocessId: 3004, stage: 'sign' });
+  world.otcs.addSubprocess('3003', 3005, { stage: 'sign' });
+  seedAgreement(world, 'AG-1', { subworkflowId: '3003' });
+
+  await fire(world, 'AGREEMENT_WORKFLOW_COMPLETED');
+  let rec = world.repo.get('AG-1');
+  assert.equal(rec.state, 'needs_attention');
+  assert.equal(rec.attentionKind, 'permanent');
+  assert.match(rec.attentionReason, /más de un subproceso \(3004, 3005\) del workflow 3003.*subworkflowId 3003/);
+  assert.match(rec.attentionReason, /POST \/admin\/reconcile\/AG-1/);
+  assert.equal(rec.pdfDelivered, true);
+  assert.equal(world.otcs.sendons.length, 0, 'nenhum SendOn');
+  assert.equal(world.timers.length, 0, 'sem retry agendado');
+
+  // corpo inválido: 422 e nada muda
+  let r = await adminReconcile(world, 'AG-1', { subworkflowId: '30x5' });
+  assert.equal(r.status, 422);
+  assert.deepEqual(await r.json(), { error: 'subworkflowId must be numeric.' });
+  assert.equal(world.repo.get('AG-1').subworkflowId, '3003');
+  assert.equal(world.repo.get('AG-1').state, 'needs_attention');
+
+  // subprocesso escolhido: corrige o registro, loga e conclui no S2
+  r = await adminReconcile(world, 'AG-1', { subworkflowId: 3005 });
+  assert.equal(r.status, 200);
+  assert.equal((await r.json()).result.status, 'completed');
+  rec = world.repo.get('AG-1');
+  assert.equal(rec.subworkflowId, '3005');
+  assert.equal(rec.state, 'completed');
+  assert.equal(world.otcs.dispositionCalls().length, 1);
+  assert.equal(world.otcs.dispositionCalls()[0].subworkflowId, 3005);
+  assert.equal(world.otcs.task('3003', 3, 3004).status, 'current', 'a tarefa do S1 não foi tocada');
+  assert.ok(world.logger.has('warn', /\[AG-1\] subproceso corregido manualmente: 3003 -> 3005/));
+
+  // acordo já concluído: 409 e o subprocesso gravado não muda
+  r = await adminReconcile(world, 'AG-1', { subworkflowId: '3004' });
+  assert.equal(r.status, 409);
+  assert.deepEqual(await r.json(), { error: 'Agreement already concluded.' });
+  assert.equal(world.repo.get('AG-1').subworkflowId, '3005');
+
+  // sem corpo / corpo sem subworkflowId: comportamento de sempre
+  r = await adminReconcile(world, 'AG-1');
+  assert.equal(r.status, 200);
+  r = await adminReconcile(world, 'AG-1', {});
+  assert.equal(r.status, 200);
+  assert.equal(world.repo.get('AG-1').subworkflowId, '3005');
+  await world.close();
+});
+
+test('tarefa de início ambígua (dica = pai, dois subprocessos): needs_attention permanente sem SendOn', async () => {
+  const world = await buildWorld();
+  world.otcs.addWorkflow('3003', { subprocessId: 3004, stage: 'start' });
+  world.otcs.addSubprocess('3003', 3005, { stage: 'start' });
+  seedAgreement(world, 'AG-1', { subworkflowId: '3003', startSendonDone: false });
+  const res = await world.reconciliation.reconcile('AG-1');
+  assert.equal(res.status, 'needs_attention');
+  assert.match(res.reason, /Enviar solicitud de firma.*más de un subproceso \(3004, 3005\)/);
+  assert.equal(world.repo.get('AG-1').attentionKind, 'permanent');
+  assert.equal(world.otcs.sendons.length, 0);
+  await world.close();
+});
+
+/* ---------- 4xx do OTCS: sonda do nó e retry (M1) ---------- */
+
+test('M1: addVersion 400 em nó inexistente/inacessível => sonda, fallback para a pasta e conclusão; 404 não sonda', async () => {
+  for (const status of [400, 403, 404]) {
+    const world = await buildWorld();
+    seedAgreement(world);
+    world.otcs.missingNodes.add('1001');
+    world.otcs.missingNodeStatus = status;
+    await fire(world, 'AGREEMENT_WORKFLOW_COMPLETED');
+    const rec = world.repo.get('AG-1');
+    assert.equal(rec.state, 'completed', `HTTP ${status}`);
+    assert.equal(world.otcs.versions.length, 0);
+    assert.equal(world.otcs.uploads.length, 1);
+    assert.equal(world.otcs.uploads[0].folderId, '2002');
+    assert.equal(rec.pdfNodeId, '9001');
+    assert.ok(world.logger.has('warn', /el nodo 1001 ya no existe/), `HTTP ${status}`);
+    const probes = world.otcs.modelCalls.filter((c) => c[0] === 'nodeExists').length;
+    assert.equal(probes, status === 404 ? 0 : 1, `sondas com HTTP ${status}`);
+    await world.close();
+  }
+});
+
+test('M1: nó existente que rejeita a versão (reservado, 409) é transitório; liberado o nó, o retry entrega como versão', async () => {
+  const world = await buildWorld();
+  seedAgreement(world);
+  world.otcs.lockedNodes.add('1001');
+  await fire(world, 'AGREEMENT_WORKFLOW_COMPLETED');
+  let rec = world.repo.get('AG-1');
+  assert.equal(rec.state, 'signed');
+  assert.equal(rec.attempts, 1);
+  assert.equal(rec.lastErrorStage, 'pdf');
+  assert.match(rec.lastError, /el documento 1001 existe pero rechazó la nueva versión.*HTTP 409.*reservado o sin permiso/);
+  assert.equal(world.timers.length, 1);
+  assert.equal(world.otcs.uploads.length, 0, 'sem fallback');
+  assert.equal(world.otcs.sendons.length, 0);
+
+  world.otcs.lockedNodes.clear();
+  world.clock.advance(60 * 1000);
+  await world.reconciliation.reconcile('AG-1', { force: false });
+  rec = world.repo.get('AG-1');
+  assert.equal(rec.state, 'completed');
+  assert.equal(world.otcs.versions.length, 1);
+  assert.equal(world.otcs.versions[0].nodeId, '1001');
+  assert.equal(rec.pdfNodeId, '1001');
+  assert.equal(world.otcs.uploads.length, 0);
+  await world.close();
+});
+
+test('M1: a sonda do nó falha (500) => transitório, sem fallback; na tentativa seguinte a sonda decide', async () => {
+  const world = await buildWorld();
+  seedAgreement(world);
+  world.otcs.missingNodes.add('1001');
+  world.otcs.missingNodeStatus = 400;
+  world.otcs.nodeExistsFailures = 1;
+  await fire(world, 'AGREEMENT_WORKFLOW_COMPLETED');
+  let rec = world.repo.get('AG-1');
+  assert.equal(rec.state, 'signed');
+  assert.equal(rec.attempts, 1);
+  assert.equal(rec.lastErrorStage, 'pdf');
+  assert.match(rec.lastError, /HTTP 400/, 'o erro registrado é o do addVersion');
+  assert.equal(world.otcs.uploads.length, 0, 'sem saber se o nó existe não há fallback');
+  assert.equal(world.timers.length, 1);
+
+  world.clock.advance(60 * 1000);
+  await world.reconciliation.reconcile('AG-1', { force: false });
+  rec = world.repo.get('AG-1');
+  assert.equal(rec.state, 'completed');
+  assert.equal(world.otcs.uploads.length, 1, 'sonda ok: o nó não existe => pasta de anexos');
+  await world.close();
+});
+
+test('M1: falha 4xx no uploadToFolder (fallback) também é transitória', async () => {
+  const world = await buildWorld();
+  seedAgreement(world);
+  world.otcs.missingNodes.add('1001');
+  world.otcs.uploadFailStatus = 403;
+  world.otcs.uploadFailures = 1;
+  await fire(world, 'AGREEMENT_WORKFLOW_COMPLETED');
+  let rec = world.repo.get('AG-1');
+  assert.equal(rec.state, 'signed');
+  assert.equal(rec.attempts, 1);
+  assert.equal(rec.attentionReason, null);
+  assert.equal(world.timers.length, 1);
+  assert.equal(world.otcs.uploads.length, 0);
+
+  world.clock.advance(60 * 1000);
+  await world.reconciliation.reconcile('AG-1', { force: false });
+  assert.equal(world.repo.get('AG-1').state, 'completed');
+  assert.equal(world.otcs.uploads.length, 1);
+  await world.close();
+});
+
+test('M1: disposição com 403 até esgotar => retries_exhausted (não permanent) e reopenStale reabre depois de ATTENTION_RETRY_HOURS', async () => {
+  const world = await buildWorld({ env: { RETRY_MAX_ATTEMPTS: '3', ATTENTION_RETRY_HOURS: '6' } });
+  seedAgreement(world);
+  world.otcs.dispositionFailStatus = 403;
+  world.otcs.dispositionFailures = 99;
+  await fire(world, 'AGREEMENT_WORKFLOW_COMPLETED');
+  for (const wait of [60, 120]) {
+    assert.equal(world.repo.get('AG-1').state, 'pdf_delivered');
+    world.clock.advance(wait * 1000);
+    await world.reconciliation.reconcile('AG-1', { force: false });
+  }
+  let rec = world.repo.get('AG-1');
+  assert.equal(rec.state, 'needs_attention');
+  assert.equal(rec.attentionKind, 'retries_exhausted');
+  assert.match(rec.attentionReason, /reintentos agotados en disposition \(3\/3\).*HTTP 403/);
+  assert.equal(rec.pdfDelivered, true);
+
+  // antes do prazo não reabre; depois reabre sozinho e o runQueue conclui
+  world.clock.advance(5 * 60 * 60 * 1000);
+  assert.deepEqual(await world.reconciliation.reopenStale(), []);
+  world.clock.advance(2 * 60 * 60 * 1000);
+  assert.deepEqual(await world.reconciliation.reopenStale(), ['AG-1']);
+  rec = world.repo.get('AG-1');
+  assert.equal(rec.state, 'pdf_delivered');
+  assert.equal(rec.attempts, 0);
+  world.otcs.dispositionFailures = 0;
+  assert.deepEqual(await world.reconciliation.runQueue(), ['AG-1']);
+  assert.equal(world.repo.get('AG-1').state, 'completed');
+  await world.close();
+});
+
+test('M1: getProcessSteps com 403 é transitório; 404 (workflow inexistente) segue permanente', async () => {
+  const world = await buildWorld();
+  seedAgreement(world);
+  world.otcs.stepsFailStatus = 403;
+  world.otcs.stepsFailures = 1;
+  await fire(world, 'AGREEMENT_WORKFLOW_COMPLETED');
+  let rec = world.repo.get('AG-1');
+  assert.equal(rec.state, 'pdf_delivered');
+  assert.equal(rec.attempts, 1);
+  assert.equal(rec.lastErrorStage, 'disposition');
+  assert.match(rec.lastError, /HTTP 403|403/);
+  assert.equal(world.timers.length, 1);
+
+  world.clock.advance(60 * 1000);
+  await world.reconciliation.reconcile('AG-1', { force: false });
+  assert.equal(world.repo.get('AG-1').state, 'completed');
+  await world.close();
+
+  // a etapa start também trata o 403 do processo como transitório
+  const w2 = await buildWorld();
+  seedAgreement(w2, 'AG-2', { startSendonDone: false });
+  w2.otcs.stepsFailStatus = 403;
+  w2.otcs.stepsFailures = 1;
+  const res = await w2.reconciliation.reconcile('AG-2');
+  assert.equal(res.status, 'failed');
+  assert.equal(w2.repo.get('AG-2').state, 'pending');
+  assert.equal(w2.repo.get('AG-2').attempts, 1);
+  await w2.close();
+
+  const w3 = await buildWorld();
+  seedAgreement(w3, 'AG-3', { startSendonDone: false });
+  delete w3.otcs.workflows['3003'];
+  const gone = await w3.reconciliation.reconcile('AG-3');
+  assert.equal(gone.status, 'needs_attention');
+  assert.equal(w3.repo.get('AG-3').attentionKind, 'permanent');
+  assert.match(gone.reason, /workflow inexistente \(3003\)/);
+  await w3.close();
 });

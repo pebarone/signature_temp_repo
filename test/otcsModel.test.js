@@ -70,6 +70,19 @@ test('otcs.addVersion: resposta perdida após a escrita não duplica versão, in
   assert.equal(writes, 1);
 });
 
+test('otcs.nodeExists: 2xx => true; 400/403/404 => false; outros erros sobem (transitórios)', async () => {
+  const httpErr = (status) => Object.assign(new Error(`HTTP ${status}`), { response: { status } });
+  const answer = (status) => otcsStub(() => { if (status >= 400) throw httpErr(status); return { data: {} }; }).client;
+  assert.equal(await answer(200).nodeExists(1001), true);
+  for (const status of [400, 403, 404]) assert.equal(await answer(status).nodeExists(1001), false, String(status));
+  for (const status of [500, 502, 429]) await assert.rejects(() => answer(status).nodeExists(1001), { response: { status } });
+  const { client, seen } = otcsStub(() => ({ data: {} }));
+  await client.nodeExists(1001);
+  assert.equal(seen[0].method, 'get');
+  assert.equal(seen[0].url, 'https://otcs.invalid/api/v1/nodes/1001');
+  assert.equal(seen[0].opts.headers.OTCSTicket, 'tk');
+});
+
 test('otcs.uploadToFolder: resposta perdida ao criar não adiciona versão e retorna o ID do nó no retry', async () => {
   const nodes = [];
   let writes = 0;

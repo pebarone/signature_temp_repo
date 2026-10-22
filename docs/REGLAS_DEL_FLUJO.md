@@ -51,7 +51,7 @@ Estados persistidos (`state`): `pending`, `signed`, `pdf_delivered`, `completed`
 ```
 pending --(final OK)--> signed --(PDF entregue)--> pdf_delivered --(disposição)--> completed
 pending --(recusado | expirado | cancelado)--> rejected | expired | cancelled   [sendon_done=1 quando a disposição vai]
-qualquer estado aberto --(erro permanente | tentativas esgotadas | config | não confirmado | evento)--> needs_attention
+qualquer estado aberto --(erro de dado | tentativas esgotadas | config | não confirmado | evento)--> needs_attention
 needs_attention --(POST /admin/reconcile/:id | reabertura automática | novo evento final)--> estado aberto
 ```
 
@@ -95,7 +95,9 @@ fora da integração), `sign_subprocess_id`/`sign_task_id` (tarefa de firma reso
     envío". Reabre sozinho após `ATTENTION_RETRY_HOURS` ou ao repetir o `/start` da página.
   - já `completed`, ou a tarefa de firma já está `current/completed` → só marca como feito (nada é enviado).
   - não encontrada / SendOn com erro → retry com backoff (o WebReport pode ainda estar ocupando a tarefa).
-  - processo inexistente (404) → `needs_attention` permanente.
+  - tarefa de início só em outro subprocesso → retry, com os ids na mensagem (seção 6).
+  - tarefa existente em mais de um subprocesso e o acordo não indica qual → `needs_attention` permanente (seção 6).
+  - processo inexistente (404) → `needs_attention` permanente; qualquer outro erro ao ler o processo → retry.
 - Registros com `start_sendon_done=0` e `workflow_id` entram em `listPending`, então o `runQueue`/poller os retoma após restart.
 
 ### 4.2 verify
@@ -114,8 +116,17 @@ não há consulta extra.
 
 ### 4.3 pdf
 Baixa `combinedDocument?attachAuditReport=true` e grava como **nova versão do `nodeId`** (o `DocID` do fluxo: é o nó que o
-fluxo devolve ao pai e que a distribuição ao workspace copia). Se o nó não existe mais (404) cai para
-`uploadToFolder(attachId)`; sem `attachId` → `needs_attention`. 4xx do OTCS (exceto 401/408/429) é permanente; demais, retry.
+fluxo devolve ao pai e que a distribuição ao workspace copia). Se o nó não existe mais ou não é acessível, cai para
+`uploadToFolder(attachId)`; sem `attachId` → `needs_attention`. Falha no `addVersion`:
+- 404 → fallback direto para a pasta;
+- 5xx, rede, 401/408/429 → retry com backoff (sem fallback);
+- outro 4xx (400, 403, 409, 423…; a spec do OTCS documenta **400**, não 404, para nó inexistente ou sem acesso) → a
+  integração **sonda o nó** (`GET /v1/nodes/{id}`): inexistente (400/403/404) → fallback para a pasta; existente → retry
+  com backoff (`el documento N existe pero rechazó la nueva versión…`: pode estar reservado ou sem permissão); sonda com
+  erro (5xx/rede) → retry, sem fallback.
+
+Falha no `uploadToFolder` (qualquer status) também é retry. Esgotadas as tentativas → `needs_attention`
+`retries_exhausted` (reabre sozinho, seção 5).
 
 A descrição da versão recebe `Adobe Sign: <agreementId>`; a entrega consulta as versões antes de escrever. No fallback,
 um novo nó recebe esse marcador na sua descrição; se já existe um nó com o mesmo nome, a versão recebe o marcador.
@@ -123,26 +134,33 @@ Assim, resposta perdida após a gravação ou restart antes de `pdf_delivered` n
 Não remova o marcador durante a reconciliação. A checagem pressupõe um único processo do orquestrador, conforme o deploy.
 
 ### 4.4 disposition
-Localiza a tarefa de firma por `SIGN_TASK_NAMES` (dica: o `subworkflowId` gravado), no `processId` do acordo:
+Localiza a tarefa de firma por `SIGN_TASK_NAMES`, **só no subprocesso do acordo** (`subworkflowId` gravado; seção 6), no
+`processId` do acordo:
 
 | Onde está a tarefa | O que acontece |
 |---|---|
 | `current` | lê o formulário (`custom_actions`); disposição ausente → `needs_attention` permanente listando as disponíveis; senão (opcional: grava atributos) e SendOn com a disposição, no `processId/subprocessId/taskId` **resolvidos** |
 | `completed` (recuperação manual, ex.: alguém clicou Firmado) | conclui com `completed_externally=true`, `disposition=null`; log info; **não** é `needs_attention` |
 | ainda não existe e a tarefa de início está `current` | executa a etapa start agora e relocaliza (uma vez) |
-| `next` / `absent` | retry transitório (vira `needs_attention` pelo limite de tentativas) |
+| `next` / `absent` | retry transitório (vira `needs_attention` pelo limite de tentativas); se existir só em outro subprocesso, a mensagem traz os ids |
+| `ambiguous` (vários subprocessos, acordo sem dica clara) | `needs_attention` permanente; nada é enviado |
 | processo 404 | `needs_attention` permanente "workflow inexistente" |
 
 Se o formulário não puder ser lido (ex.: permissão) a disposição configurada é enviada mesmo assim.
-Uma lista de ações vazia em formulário legível significa disposição indisponível. Se o PUT falhar com 4xx permanente,
-a integração consulta de novo o processo: a mesma tarefa já concluída é tratada como conclusão externa, sem reenviar.
+Uma lista de ações vazia em formulário legível significa disposição indisponível. Se o PUT falhar com 4xx, a integração
+consulta de novo o processo: a mesma tarefa já concluída é tratada como conclusão externa, sem reenviar; senão o 4xx
+também é retry com backoff (não vai direto para `needs_attention`).
 
 ## 5. Retry, atenção e reabertura
 
 - **Backoff**: `RETRY_BASE_MS` × 2^(n−1), limitado a `RETRY_MAX_MS` (1 min … 1 h).
-- **Permanente**: 4xx do OTCS (exceto 401/408/429), processo inexistente, disposição inexistente na tarefa → `needs_attention`
-  imediato (`attention_kind=permanent`).
-- **Tentativas esgotadas**: `RETRY_MAX_ATTEMPTS` (padrão 10; 0 = sem limite) → `needs_attention` (`retries_exhausted`).
+- **Permanente**: só problema de dado/configuração que retentar não resolve: acordo sem `workflowId`/`nodeId`/`attachId`,
+  processo inexistente (404), disposição inexistente nas ações da tarefa, tarefa ambígua entre subprocessos →
+  `needs_attention` imediato (`attention_kind=permanent`).
+- **Transitório**: qualquer outro erro do OTCS/Adobe, **inclusive 4xx** (400, 403, 409, 423… no PUT, no `addVersion` com
+  nó existente, no upload para a pasta, na leitura do processo) → retry com backoff.
+- **Tentativas esgotadas**: `RETRY_MAX_ATTEMPTS` (padrão 10; 0 = sem limite) → `needs_attention` (`retries_exhausted`), que
+  reabre sozinho após `ATTENTION_RETRY_HOURS`.
 - Tipos de `attention_kind`: `permanent`, `retries_exhausted`, `config` (disposição vazia), `unconfirmed` (final que o
   Adobe não confirmou, inclusive a troca de resultado bloqueada por PDF já entregue), `event` (`DOCUMENTS_DELETED`/`ABORTED`).
 - **Reabertura automática**: o poller (com `POLL_ENABLED` true **ou** false) reabre os `needs_attention` do tipo
@@ -156,8 +174,20 @@ a integração consulta de novo o processo: a mesma tarefa já concluída é tra
 `{ process_id, subprocess_id, task_id, task_name, task_status }`. Em sub-fluxos o `subprocess_id` difere do `process_id`
 (o WebReport antigo de contratação enviava `workflowId = subworkflowId = WFID`, o WorkID do pai); endereçar
 `/processes/P/subprocesses/P/tasks/3` acertaria a tarefa errada. O nome é normalizado (sem acentos, minúsculas, espaços
-colapsados) e casa por **prefixo** (`Aguardar Firma`, `Enviar solicitud de firma (Empleado y/o Firmante 2)`). Prioridade
-`current` > `completed` > `next`; entre vários candidatos, o do subprocesso gravado, senão o de maior `subprocess_id`.
+colapsados) e casa por **prefixo** (`Aguardar Firma`, `Enviar solicitud de firma (Empleado y/o Firmante 2)`).
+
+O `step_list` do pai traz as tarefas do pai **e de todos os subprocessos** (os já encerrados ficam em `completed`), então a
+tarefa só é aceita no **subprocesso do acordo**: nunca se usa a de outro subprocesso (senão o `Firmado` de um acordo
+concluiria a tarefa de outro). Os candidatos das três listas são juntados e a prioridade `current` > `completed` > `next`
+vale dentro do subprocesso escolhido:
+- o `subworkflowId` gravado tem a tarefa → vale ele;
+- o `subworkflowId` é um subprocesso real (≠ pai) que não tem a tarefa → `absent` (retry; a mensagem lista em que outros
+  subprocessos ela existe);
+- `subworkflowId` vazio ou igual ao pai (WebReport antigo de contratação, adoção manual sem `subworkflowId`): se a tarefa
+  existe em um único subprocesso, vale ele; em mais de um → `ambiguous` → `needs_attention` permanente, sem SendOn.
+  Corrigir com `POST /admin/reconcile/:id` e corpo `{"subworkflowId": "<id>"}` (numérico; `422` se não for, `409` se o
+  acordo já concluiu). O `/start` usa o subprocesso mais recente na ambiguidade, pois cria o acordo a partir da própria
+  tarefa resolvida.
 `SIGN_TASK_ID` está **obsoleto** (não endereça mais a disposição).
 
 ## 7. Rastreabilidade e adoção de acordos

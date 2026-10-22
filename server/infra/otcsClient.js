@@ -114,6 +114,23 @@ function createOtcsClient({
   const addVersion = (nodeId, buffer, fileName, { agreementId } = {}) => withTicket((tck) =>
     addVersionWithTicket(tck, nodeId, buffer, fileName, deliveryMarker(agreementId)));
 
+  /*
+    O nó existe e está acessível? GET /v1/nodes/{id}: 2xx => true. A spec do OTCS documenta 400 (não 404) para nó
+    inexistente ou sem acesso; 403/404 também valem como "não existe/acessível". Qualquer outro erro (5xx, rede...) é
+    transitório e sobe para o chamador.
+  */
+  const nodeExists = (nodeId) => withTicket(async (tck) => {
+    try {
+      await http.get(`${base}/v1/nodes/${encodeURIComponent(nodeId)}`, {
+        headers: { OTCSTicket: tck }, timeout: timeoutMs
+      });
+      return true;
+    } catch (e) {
+      if ([400, 403, 404].includes(e.response?.status)) return false;
+      throw e;
+    }
+  });
+
   const sendOnWorkflow = ({ workflowId, subworkflowId, taskId = 2, disposition = '', comment = '' }) => withTicket(async (tck) => {
     const url = `${base}/v2/processes/${workflowId}/subprocesses/${subworkflowId}/tasks/${taskId}`;
 
@@ -249,8 +266,8 @@ function createOtcsClient({
   });
 
   return {
-    ensureTicket, downloadNode, uploadToFolder, addVersion, sendOnWorkflow, getProcessSteps, getTaskForm, updateTaskForm,
-    getWorkflowAttributes, getCurrentUser
+    ensureTicket, downloadNode, uploadToFolder, addVersion, nodeExists, sendOnWorkflow, getProcessSteps, getTaskForm,
+    updateTaskForm, getWorkflowAttributes, getCurrentUser
   };
 }
 

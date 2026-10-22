@@ -120,7 +120,9 @@ function backoffDelay(attempts, { baseMs = 60 * 1000, maxMs = 60 * 60 * 1000 } =
   return Math.min(maxMs, baseMs * 2 ** Math.min(n - 1, 30));
 }
 
-// Erro HTTP 4xx permanente (nome de disposição errado, task já avançada...); 401/408/429 são transitórios
+// Só CLASSIFICA o erro HTTP 4xx (nome de disposição errado, tarefa já avançada, nó inexistente/reservado...); 401/408/429
+// são transitórios. Não manda para needs_attention: decide se vale sondar o nó (PDF) ou conferir se a tarefa já foi
+// concluída (disposição); em qualquer caso a falha retenta com backoff.
 const isPermanentHttpError = (err) => {
   const status = err?.response?.status;
   return status >= 400 && status <= 499 && ![401, 408, 429].includes(status);
