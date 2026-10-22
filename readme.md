@@ -36,7 +36,8 @@ This project sends documents from OTCS to Adobe Sign, retrieves the signed PDF a
 - 🔒 `/start` authenticated by an HMAC (v2) bound to the request fields, with timestamp and a single-use nonce (anti-replay)
 - 🔐 `/auth` endpoint protected with Basic Auth (own credential `START_AUTH_*`) to restrict who can obtain signatures
 - ✅ `/start` is validated against the OTCS workflow (the Content Server is the source of truth, not the browser)
-- 🌐 CORS restricted to `/auth` and `/start`, only for the OTCS origin
+- 🌐 CORS restricted to `/auth`, `/start` and (when enabled) `/cancel`, only for the OTCS origin
+- 🛑 Flow cancellation (ticket 2026060410003715): a cancellation workflow calls `POST /cancel` (same HMAC v2 + nonce model, OFF by default) and the agreement of the flow to cancel is cancelled on Adobe; operator endpoints `POST /admin/cancel/:agreementId` and `POST /admin/cancel-workflow/:workflowId`
 ---
 
 ## 🚀 How to Run
@@ -113,6 +114,14 @@ WF_ATTR_STATUS=Adobe Estado
 WF_ATTR_LAST_EVENT=Adobe Último Evento
 WF_ATTR_UPDATED_AT=Adobe Fecha Actualización
 WF_ATTR_INTEGRATION_STATE=Estado Integración Firma
+
+# Flow cancellation (see "Flow cancellation"). The names below are PROVISIONAL: the cancellation workflow map does not exist yet
+CANCEL_ENABLED=false                  # true => POST /cancel (WebReport of the cancellation workflow) exists; false => 404. /admin/cancel* do not depend on it
+CANCEL_TASK_NAMES=Cancelar Flujo de Firma         # task of the cancellation workflow that runs the WebReport (prefix match, comma list)
+CANCEL_FIELD_TARGET_WORKFLOW=ID Flujo a Cancelar  # label of the task form attribute with the ID of the flow to cancel (mandatory, numeric)
+CANCEL_FIELD_TARGET_SUBWORKFLOW=ID Subflujo a Cancelar  # label of the optional attribute with its sub-process (numeric)
+CANCEL_NOTIFY_SIGNERS=false           # true => Adobe notifies the signers of the cancellation (notifyOthers)
+CANCEL_SETTLE_TIMEOUT_MS=20000        # max wait (ms, min 1000) for a reconciliation already running on the agreement before cancelling; timeout => 503 RECONCILE_IN_PROGRESS
 
 # Storage (see below)
 DATA_DIR=                             # explicit data directory (OpenShift: the PVC mount, e.g. /data)
@@ -273,6 +282,39 @@ binds the payload, so in these modes the validation against the OTCS is **always
 
 ---
 
+## 🛑 Flow cancellation
+
+Ticket 2026060410003715 (details, decisions and open points: [`docs/DESIGN_TICKET_2026060410003715.md`](docs/DESIGN_TICKET_2026060410003715.md)).
+A flow sent for signature that is no longer needed (resent, duplicated, wrong document) stays open in the Content Server
+("Aguardar Firma") and in Adobe (`OUT_FOR_SIGNATURE`, with reminders). A **cancellation workflow** in the Content Server gets
+the ID of the flow to cancel in its attributes and calls the orchestrator; the orchestrator cancels the Adobe agreement and
+hands control back (SendOn of the cancellation workflow's own task), then the cancellation workflow cancels the original
+flow in the Content Server. The orchestrator never touches the original flow.
+
+**`POST /cancel`** (WebReport of the cancellation workflow; only with `CANCEL_ENABLED=true`, otherwise `404 { "error": "Endpoint not found" }`).
+Same protocol as `/start`: `POST /auth` (Basic Auth) with `{workflowId, subworkflowId}` of the **cancellation workflow**
+(`&WORKID`/`&SUBWORKID`) returns `{ v: 2, timestamp, nonce, signature }`; then `POST /cancel` with
+`{workflowId, subworkflowId, timestamp, nonce, signature}` (HMAC v2, 2 min window, single-use nonce; the v1 signature is always refused here).
+The target flow is **never** read from the body: the server re-reads the cancellation task in the OTCS (task named by
+`CANCEL_TASK_NAMES`, must be `current` and assigned to `OTCS_USER`, else `409` — `REASSIGN_REQUIRED` carries a `handoff`
+like `/start`) and takes the flow from its form attributes (`CANCEL_FIELD_TARGET_WORKFLOW`, optional
+`CANCEL_FIELD_TARGET_SUBWORKFLOW`). Responses: `200 { message, id, alreadyCancelled }` (the task is sent on after the
+cancellation is confirmed); `404` no agreement known for the flow (the old orchestrator's agreements must be adopted first with
+`POST /admin/adopt/:id`); `409` ambiguous (several open agreements, with the list), already signed / not cancelable,
+wrong step; `422` missing/invalid target attribute; `503` Adobe or OTCS unavailable (nothing marked) or `SENDON_FAILED`
+(agreement cancelled, task not sent on: repeating is safe). Error bodies are `{ error, code, ... }`.
+
+Rules: the open agreement is looked up by `workflowId` (and the exact `subworkflowId`, if given) — never the agreement of
+another sub-process; a reconciliation already running on the agreement is awaited first (`CANCEL_SETTLE_TIMEOUT_MS`, else `503 RECONCILE_IN_PROGRESS`);
+the Adobe state is checked next (`CANCELLED`/`ABORTED` => idempotent, no new cancellation, except `CANCELLED` caused by a signer's
+rejection, which is `409 ALREADY_REJECTED` with the record untouched so the pipeline still delivers the `Rechazado`; `SIGNED` or
+other final state => `409`); a failure from Adobe is transient and marks nothing. After a confirmed cancellation the agreement
+is closed (`state=cancelled`, `sendon_done`, `cancel_requested_at`/`cancel_source`, event `CANCEL_REQUESTED`), so the
+`AGREEMENT_RECALLED` that Adobe sends next (webhook, polling or retry queue) **does not** produce a `Rechazado` on the original
+flow (default decision, reviewable). `otcsClient.stopProcess` (`PUT /v2/processes/{id}/status`, `stop`) exists but is not wired.
+
+---
+
 ## 🔀 Webhook
 
 - **Endpoint:** `/webhook` — `HEAD`/`GET` echo, in `X-AdobeSign-ClientId`, **the same value received** (Adobe requires the
@@ -294,7 +336,7 @@ rules (states, stages, retry/attention/reopen, adoption) are in [`docs/REGLAS_DE
 |---|---|
 | `AGREEMENT_WORKFLOW_COMPLETED` (or `AGREEMENT_ACTION_COMPLETED` with `agreement.status = SIGNED`) | write the final PDF (with audit report) as a **new version of the same node** (`nodeId`) that was sent to sign — folder `attachId` only as a fallback if the node no longer exists — then disposition `Firmado` on the signing task |
 | `AGREEMENT_REJECTED` | disposition `Rechazado` (no PDF) |
-| `AGREEMENT_EXPIRED`, `AGREEMENT_RECALLED`, `AGREEMENT_AUTO_CANCELLED_CONVERSION_PROBLEM` | disposition `DISPOSITION_*` (default `Rechazado`, the only other action in the maps); empty => `needs_attention` |
+| `AGREEMENT_EXPIRED`, `AGREEMENT_RECALLED`, `AGREEMENT_AUTO_CANCELLED_CONVERSION_PROBLEM` | disposition `DISPOSITION_*` (default `Rechazado`, the only other action in the maps); empty => `needs_attention`. Exception: an agreement closed by a cancellation request (see "Flow cancellation") ignores the `RECALLED` echo — history only |
 | `AGREEMENT_DOCUMENTS_DELETED` | `needs_attention` |
 | informational / unavailable / unknown events | history only |
 
@@ -328,6 +370,18 @@ it does not provide an atomic lock against other processes writing the same node
   the same automatically for unknown agreements with our `externalId` (`ADOPT_UNKNOWN_AGREEMENTS`). Adopted agreements
   enter the retry queue to check the start task in OTCS, sending it on only if still active. This also recovers a
   restart before the initial SendOn, including with `POLL_ENABLED=false`.
+- `POST /admin/cancel/:agreementId` — cancels one agreement known to the orchestrator on Adobe (optional JSON `{ "comment" }`)
+  and closes it without a disposition on the original flow. Idempotent: an agreement already `CANCELLED` on Adobe is not
+  cancelled again; `SIGNED` or another final state => `409`; Adobe failure => `503` and nothing is marked (if the cancel call fails
+  the agreement is read again: `CANCELLED`/`ABORTED` means Adobe applied it and only the response was lost, so it counts as
+  confirmed); `CANCELLED` because a signer rejected => `409 ALREADY_REJECTED` (record untouched; contract change: a rejected agreement whose `Rechazado` the pipeline already delivered used to answer `200 alreadyCancelled`); unknown agreement => `404` with a hint to adopt it. Works regardless of `CANCEL_ENABLED`.
+- `POST /admin/cancel-workflow/:workflowId` — same for the open agreement of a flow. Optional JSON `{ "subworkflowId", "comment" }`;
+  several open agreements without `subworkflowId` => `409` `AMBIGUOUS` with the list and nothing is cancelled; none => `404`.
+- **Both `/admin/cancel*` routes leave the Content Server flow untouched.** They cancel on Adobe and close the agreement without a
+  disposition, so the original workflow stays in "Aguardar Firma": the `200` carries `contentFlow: "unchanged"` and a Spanish
+  `note` ("El flujo del Content Server no fue modificado: deténgalo en el Content o ejecute el workflow de cancelación"), and a `warn`
+  with the `workflowId`/`subworkflowId` is logged. `Rechazado` is deliberately not sent: the Rechazado branch of the maps may fire
+  business actions that are not "cancel". Reviewable alternative: a future option to close the original through `stopProcess`.
 - `GET /logs`, `GET /logs/stream` — today's `audit-YYYY-MM-DD.log` (download / live SSE)
 - `GET /admin/login` (Basic Auth) — Adobe OAuth consent with a random one-time `state` (10 min); `GET /admin/callback` —
   Adobe's redirect (no Basic Auth, requires a valid `state`); `GET /health` — liveness
@@ -344,7 +398,7 @@ it does not provide an atomic lock against other processes writing the same node
 ├── template.html         # WebReport "Requisicion de Firma" (pure flow): POST /auth + POST /start (v2)
 ├── webreports/           # WebReport of the hiring sub-flow + README (rollout, per-environment changes, QA checklist)
 ├── static/               # logs viewer (logs.html/js/css)
-├── docs/                 # design notes (DESIGN_TICKET_2026062210004476.md) and flow rules (REGLAS_DEL_FLUJO.md)
+├── docs/                 # design notes (DESIGN_TICKET_2026062210004476.md, DESIGN_TICKET_2026060410003715.md) and flow rules (REGLAS_DEL_FLUJO.md)
 ├── deploy/openshift/     # PVC + README (example)
 ├── test/                 # node:test suites + fakes (test/support)
 ├── data/                 # local state (git-ignored): state/, logs/, inprocess/
@@ -353,10 +407,10 @@ it does not provide an atomic lock against other processes writing the same node
     ├── index.js          # entrypoint: wires real dependencies, poller, listen, keepalive
     ├── app.js            # createApp(deps): Express app with injected dependencies
     ├── config/           # env -> config, storage selection per platform
-    ├── domain/           # pure functions: eventPolicy (events), agreementState (state machine), workflowSteps (task lookup by name), externalId, documentType (PDF header check)
+    ├── domain/           # pure functions: eventPolicy (events), agreementState (state machine), workflowSteps (task lookup by name), externalId, documentType (PDF header check), cancellation
     ├── infra/            # SQLite (db, agreementRepository, legacyImport), tokenStore, adobeClient, otcsClient, logger
-    ├── services/         # reconciliationService (start -> verify -> PDF -> disposition), signatureService (/start), poller
-    ├── http/             # routes (webhook, start, admin, logs) and middleware (hmac, basicAuth)
+    ├── services/         # reconciliationService (start -> verify -> PDF -> disposition), signatureService (/start), cancellationService (/cancel), poller
+    ├── http/             # routes (webhook, start, cancel, admin, logs) and middleware (hmac, basicAuth)
     └── serverModules/
         └── backend.js    # shim kept for `node server/serverModules/backend.js`
 ```
@@ -376,7 +430,7 @@ it does not provide an atomic lock against other processes writing the same node
 
 - No sensitive tokens are exposed on the frontend. The WebReport only holds the Basic credential of `/auth` (use `START_AUTH_*`, which does not open `/admin` or `/logs`); the HMAC key never leaves the server.
 - `/start` cannot be forged from the browser: the signature binds the request fields, expires in 2 min and its nonce is single use; the server re-reads the workflow in the OTCS and uses those values (from the start task form when the integration user holds it, or from the workflow attributes while a standalone task is still with the user; the `SendOn` only happens once the integration user holds the task).
-- CORS is limited to `/auth` and `/start` and to the OTCS origin (`CORS_ORIGINS`).
+- CORS is limited to `/auth`, `/start` and (only with `CANCEL_ENABLED=true`) `/cancel`, and to the OTCS origin (`CORS_ORIGINS`). `/cancel` never takes the target flow from the browser: it comes from the cancellation task form in the OTCS.
 - Passwords and keys are read from the `.env` file.
 - Webhook filters out irrelevant events and only processes mapped agreements; events are deduplicated and failures are retried, never swallowed.
 

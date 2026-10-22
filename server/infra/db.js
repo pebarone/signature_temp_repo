@@ -78,6 +78,14 @@ const MIGRATIONS = [
     expires_at TEXT NOT NULL
   );
   CREATE INDEX idx_start_nonces_expires ON start_nonces(expires_at);
+  `,
+  // v4: cancelamento de fluxos (ticket 2026060410003715). cancel_requested_at/cancel_source marcam o acordo encerrado por
+  // pedido de cancelamento (o AGREEMENT_RECALLED que o Adobe emite depois não gera disposição); o índice atende a busca
+  // por workflow_id (POST /admin/cancel-workflow e o endpoint /cancel do WebReport).
+  `
+  ALTER TABLE agreements ADD COLUMN cancel_requested_at TEXT;
+  ALTER TABLE agreements ADD COLUMN cancel_source TEXT;
+  CREATE INDEX idx_agreements_workflow ON agreements(workflow_id);
   `
 ];
 

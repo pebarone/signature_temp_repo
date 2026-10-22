@@ -193,6 +193,29 @@ function computeConfig(env = process.env, { projectRoot = PROJECT_ROOT } = {}) {
         updatedAt: str(env.WF_ATTR_UPDATED_AT, 'Adobe Fecha Actualización'),
         integrationState: str(env.WF_ATTR_INTEGRATION_STATE, 'Estado Integración Firma')
       }
+    },
+
+    /*
+      Cancelamento de fluxos (ticket 2026060410003715). Um workflow de cancelamento no Content chama POST /cancel (mesmo
+      modelo do /start: Basic no /auth + HMAC v2 com nonce) e o orquestrador cancela o acordo do fluxo alvo no Adobe.
+      enabled=false (padrão): POST /cancel responde 404. As rotas administrativas (POST /admin/cancel/:agreementId e
+      POST /admin/cancel-workflow/:workflowId, Basic Auth) não dependem deste flag.
+      Os nomes abaixo são PROVISÓRIOS: o mapa do workflow de cancelamento ainda não existe no Content.
+    */
+    cancel: {
+      enabled: bool(env.CANCEL_ENABLED, false),
+      // Tarefa do workflow de cancelamento que roda o WebReport (nome normalizado COMEÇA com um destes, como SIGN_TASK_NAMES)
+      taskNames: list(env.CANCEL_TASK_NAMES, ['Cancelar Flujo de Firma']),
+      // Rótulos dos atributos do formulário dessa tarefa (GET /v1/forms/processes/tasks/update): o fluxo a cancelar
+      fields: {
+        targetWorkflow: str(env.CANCEL_FIELD_TARGET_WORKFLOW, 'ID Flujo a Cancelar'),
+        // Opcional no formulário: sem valor, o acordo é procurado em todos os subprocessos do fluxo alvo
+        targetSubworkflow: str(env.CANCEL_FIELD_TARGET_SUBWORKFLOW, 'ID Subflujo a Cancelar')
+      },
+      // true => o Adobe avisa os signatários do cancelamento (agreementCancellationInfo.notifyOthers). Padrão: não avisa.
+      notifySigners: bool(env.CANCEL_NOTIFY_SIGNERS, false),
+      // Espera máxima pela reconciliação do acordo que já estava em curso antes de cancelar (ms); estourou => 503
+      settleTimeoutMs: Math.max(1000, int(env.CANCEL_SETTLE_TIMEOUT_MS, 20 * 1000))
     }
   };
 }

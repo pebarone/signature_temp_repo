@@ -7,6 +7,7 @@
 // Fluxo OK:  pending -> signed -> pdf_delivered -> completed
 // Demais finais: pending -> rejected | expired | cancelled (sendonDone marca a disposição entregue)
 // needs_attention: exige intervenção (sem disposição configurada, sem workflowId, documentos apagados...)
+// Cancelamento de fluxos: qualquer estado aberto -> cancelled por pedido (cancelRequestedPatch), sem disposição
 
 const { KINDS } = require('./eventPolicy');
 
@@ -113,6 +114,37 @@ const completedPatch = (plan, disposition, nowIso, { externally = false } = {}) 
   lastErrorStage: null,
   nextAttemptAt: null
 });
+
+/*
+  Acordo encerrado por PEDIDO DE CANCELAMENTO (ticket 2026060410003715; services/cancellationService.js), depois de o Adobe
+  confirmar o cancelamento. Quem encerra o fluxo original no Content é o workflow de cancelamento: o AGREEMENT_RECALLED que
+  o Adobe emite em seguida NÃO pode virar disposição (Rechazado) na tarefa de firma. sendonDone=true é o que garante isso:
+  tira o acordo de listPending/listPollable, finalPatch devolve null, hasPendingWork é falso e reconcile devolve 'done'
+  (mesmo precedente de completedExternally: o pipeline considera o acordo concluído sem enviar nada ao OTCS).
+  Acordo cujo pipeline já havia concluído (sendonDone, p.ex. tarefa concluída fora da integração com o acordo ainda aberto
+  no Adobe) só ganha a marca do pedido: estado e disposição já gravados são preservados.
+*/
+const cancelRequestedPatch = (rec, nowIso, { source = '', adobeStatus = 'CANCELLED' } = {}) => {
+  const marks = { cancelRequestedAt: nowIso, cancelSource: source || null, adobeStatus };
+  if (rec.sendonDone) return marks;
+  return {
+    ...marks,
+    finalKind: rec.finalKind || KINDS.FINAL_RECALLED,
+    finalAt: rec.finalAt || nowIso,
+    sendonDone: true,
+    sendonAt: nowIso,
+    disposition: null,
+    completedExternally: false,
+    startSendonDone: true,
+    state: STATES.CANCELLED,
+    attentionReason: null,
+    attentionKind: null,
+    attempts: 0,
+    lastError: null,
+    lastErrorStage: null,
+    nextAttemptAt: null
+  };
+};
 
 // Backoff exponencial: base * 2^(attempts-1), limitado a max
 function backoffDelay(attempts, { baseMs = 60 * 1000, maxMs = 60 * 60 * 1000 } = {}) {
@@ -222,6 +254,6 @@ function shouldPoll(rec, nowMs, maxAgeDays = 0) {
 
 module.exports = {
   STATES, ATTENTION_KINDS, FINAL_PLANS, planFor, dispositionFor, finalPatch, attentionPatch, reopenPatch,
-  pdfDeliveredPatch, completedPatch, startDonePatch, backoffDelay, isPermanentHttpError, failurePatch,
+  pdfDeliveredPatch, completedPatch, cancelRequestedPatch, startDonePatch, backoffDelay, isPermanentHttpError, failurePatch,
   isStartPending, hasPendingWork, isDue, isRetryable, shouldPoll, isOpenAgreement, finalNotice
 };

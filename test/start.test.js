@@ -1300,7 +1300,7 @@ test('repo.consumeNonce: uso único, purga dos expirados a cada inserção', () 
 });
 
 test('db: banco no schema v2 recebe a migração v3 (start_nonces) preservando os dados', () => {
-  assert.equal(MIGRATIONS.length, 3);
+  assert.equal(MIGRATIONS.length, 4); // v4: cancelamento de fluxos (test/cancellation.test.js)
   const file = path.join(tmpDir(), 'v2.db');
   const raw = new Database(file);
   raw.exec(MIGRATIONS[0]);
@@ -1310,7 +1310,7 @@ test('db: banco no schema v2 recebe a migração v3 (start_nonces) preservando o
   raw.close();
 
   const db = openDatabase(file);
-  assert.equal(db.pragma('user_version', { simple: true }), 3);
+  assert.equal(db.pragma('user_version', { simple: true }), MIGRATIONS.length);
   const cols = db.prepare('PRAGMA table_info(start_nonces)').all().map((c) => c.name);
   assert.deepEqual(cols.sort(), ['expires_at', 'nonce']);
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM agreements').get().n, 1);
@@ -1320,6 +1320,6 @@ test('db: banco no schema v2 recebe a migração v3 (start_nonces) preservando o
 
   // reabrir é idempotente
   const again = openDatabase(file);
-  assert.equal(again.pragma('user_version', { simple: true }), 3);
+  assert.equal(again.pragma('user_version', { simple: true }), MIGRATIONS.length);
   again.close();
 });

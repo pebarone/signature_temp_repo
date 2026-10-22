@@ -4,10 +4,13 @@ const crypto = require('crypto');
 const express = require('express');
 const { describeError } = require('../../infra/util');
 const { AdoptError } = require('../../services/reconciliationService');
+const { ServiceError } = require('../../services/signatureService');
 
 const OAUTH_STATE_TTL_MS = 10 * 60 * 1000;
 
-function adminRoutes({ config, logger, repo, reconciliation, tokenStore, basicAuth, now = () => Date.now() }) {
+function adminRoutes({
+  config, logger, repo, reconciliation, tokenStore, basicAuth, cancellationService = null, now = () => Date.now()
+}) {
   const router = express.Router();
 
   // `state` do OAuth (anti-CSRF): em memória, uso único, expira em 10 min
@@ -113,6 +116,60 @@ function adminRoutes({ config, logger, repo, reconciliation, tokenStore, basicAu
       res.status(500).json({ error: 'Internal error', adopted: true });
     }
   });
+
+  /*
+    Cancelamento de fluxos (ticket 2026060410003715). Não dependem de CANCEL_ENABLED (esse flag só liga o POST /cancel do
+    WebReport): são ferramentas do operador, com Basic Auth. Corpo opcional { comment }. Respostas de erro: { error, code, ... }
+    com 404 (sem acordo; dica de adoção), 409 (ambíguo, já assinado/concluído), 422 (ids inválidos), 503 (Adobe fora).
+    Estas rotas cancelam no Adobe e fecham o acordo SEM disposição: ninguém encerra o workflow original, que continua em
+    "Aguardar Firma". A resposta 200 diz isso (contentFlow: 'unchanged' + note) e o log registra um warn. Decisão: não
+    mandar `Rechazado`, porque o ramo Rechazado dos mapas pode disparar ações de negócio que não são "cancelar".
+    Alternativa revisável: fechar o original pelo otcsClient.stopProcess (hoje sem uso; ver o design do ticket).
+  */
+  if (cancellationService) {
+    const CONTENT_FLOW_NOTE =
+      'El flujo del Content Server no fue modificado: deténgalo en el Content o ejecute el workflow de cancelación.';
+    const withContentFlow = (result, record) => {
+      logger.warn(
+        `[${result.agreementId}] acuerdo cancelado manualmente; el flujo del Content Server `
+        + `(workflow ${result.workflowId}, subproceso ${result.subworkflowId}) no fue modificado`
+      );
+      return { ...result, contentFlow: 'unchanged', note: CONTENT_FLOW_NOTE, agreement: record };
+    };
+
+    const cancelError = (res, e, tag) => {
+      if (e instanceof ServiceError) {
+        logger.warn(`${tag} cancelación rechazada (${e.status}): ${e.message}`);
+        return res.status(e.status).json(e.body);
+      }
+      logger.error(`${tag} cancelación falló: ${describeError(e)}`);
+      return res.status(500).json({ error: 'Internal error' });
+    };
+
+    // Cancela UM acordo conhecido (inclusive um que o fluxo já deixou para trás, com o Adobe ainda aberto)
+    router.post('/admin/cancel/:agreementId', basicAuth, async (req, res) => {
+      const id = String(req.params.agreementId);
+      try {
+        const result = await cancellationService.cancelAgreement(id, { comment: req.body?.comment, source: 'admin' });
+        res.json(withContentFlow(result, repo.get(id)));
+      } catch (e) {
+        cancelError(res, e, `[${id}]`);
+      }
+    });
+
+    // Cancela o acordo aberto de um fluxo; subworkflowId opcional desempata vários acordos abertos
+    router.post('/admin/cancel-workflow/:workflowId', basicAuth, async (req, res) => {
+      const workflowId = String(req.params.workflowId);
+      try {
+        const result = await cancellationService.cancelWorkflow(workflowId, {
+          subworkflowId: req.body?.subworkflowId, comment: req.body?.comment, source: 'admin'
+        });
+        res.json(withContentFlow(result, repo.get(result.agreementId)));
+      } catch (e) {
+        cancelError(res, e, `[workflow ${workflowId}]`);
+      }
+    });
+  }
 
   return router;
 }

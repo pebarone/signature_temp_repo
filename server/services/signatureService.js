@@ -406,4 +406,4 @@ function createSignatureService({ repo, adobe, otcs, logger, config, now = () =>
   return { start };
 }
 
-module.exports = { createSignatureService, ServiceError, START_ERROR_MESSAGE };
+module.exports = { createSignatureService, ServiceError, START_ERROR_MESSAGE, fieldValue };
