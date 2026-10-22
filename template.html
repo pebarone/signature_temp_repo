@@ -220,7 +220,9 @@ REASIGNADO_OK
   /* ============================================================
      CONFIGURACION POR AMBIENTE (unico bloque a cambiar al publicar)
      Valores que cambian por ambiente:
-       - SERVER_URL, BASIC_USER, BASIC_PASS y RETURN_URL (aqui abajo);
+       - SERVER_URL, BASIC_USER, BASIC_PASS, RETURN_URL y REPORT_ID (aqui abajo);
+       - REPORT_ID: ID de ESTE WebReport en el ambiente (QA: 650835). WebReports no tiene una tag
+         para el ID del propio reporte (la tag REPORTID no existe);
        - usuario de integracion (11742766 en QA, AdminKeralty): NO va en este script.
          Esta fijado en la linea WFTASKACTION:REASSIGN del ramo reasignar del WebReport,
          con su comentario. Cambiarlo ahi al publicar en PROD.
@@ -232,6 +234,7 @@ REASIGNADO_OK
   const BASIC_USER = 'ADOBE-LOGS';
   const BASIC_PASS = 'ADOBE-LOGS-PASS';
   const RETURN_URL = 'https://hcm41preview.sapsf.com/sf/customExternalModule?bplte_company=keraltysasT1';
+  const REPORT_ID = '650835';
   /* ============================ fin de la configuracion ============================ */
 
   /* Valores de OTCS. Los que vienen de atributos del flujo (DocID, AttachID, nombre, e-mails) se leen
@@ -239,7 +242,6 @@ REASIGNADO_OK
   const WORKFLOW_ID = '[LL_REPTAG_&WORKID /]';
   const SUBWORKFLOW_ID = '[LL_REPTAG_&SUBWORKID /]';
   const OTCS_URL = '[LL_REPTAG_URLPREFIXFULL /]'.replace(/\/+$/, '');
-  const REPORT_ID = '[LL_REPTAG_REPORTID /]';
   const NODE_ID = valorDe('dato-docid');
   const ATTACH_ID = valorDe('dato-attachid');
   const DOC_NAME = valorDe('dato-doc');

@@ -109,6 +109,8 @@ e a linha `WFTASKACTION:REASSIGN` do ramo `reasignar`.
    ainda tem o ID fixo.
 3. Link do documento: nada a trocar, o `template.html` usa `[LL_REPTAG_URLPREFIXFULL /]` (base do OTCS do próprio ambiente).
    `RETURN_URL` aponta para o SuccessFactors de preview; confirmar o de PROD.
+   `REPORT_ID` é o ID do próprio WebReport no ambiente (QA: `650835`), usado no pedido `accion=reasignar`. O WebReports não
+   tem tag para o ID do próprio relatório (`[LL_REPTAG_REPORTID /]` não existe e quebra o WebReport).
 4. Usuário/senha Basic dos WebReports (`BASIC_USER`/`BASIC_PASS`, no bloco de configuração; no repositório ficam os
    placeholders `ADOBE-LOGS`/`ADOBE-LOGS-PASS`): devem ser iguais a
    `START_AUTH_USER`/`START_AUTH_PASS` do orquestrador (ou, sem elas, `LOG_USER`/`LOG_PASS`). Recomenda-se usar credencial
@@ -153,7 +155,7 @@ Rollback: religar as flags e republicar o WebReport antigo.
       literal das tags). Confirmar no OTCS que a tarefa foi para o ID da linha `WFTASKACTION:REASSIGN`.
 - [ ] `template.html`, confirmação: com uma cópia do WebReport apontando a linha `WFTASKACTION:REASSIGN` para um usuário que
       não é o de integração, a página mostra "No fue posible asignar la tarea" e **não** mostra "Listo".
-- [ ] `template.html`: `[LL_REPTAG_REPORTID /]` devolve `650835`, e `[LL_REPTAG_URLPREFIXFULL /]` devolve a base do CGI, sem
+- [ ] `template.html`: `REPORT_ID` do bloco de configuração é o ID do WebReport publicado, e `[LL_REPTAG_URLPREFIXFULL /]` devolve a base do CGI, sem
       barra no final (ex.: `https://host/cs/cs`). O link "Ver documento" abre o documento.
 - [ ] `template.html`, reabrir: fechar a página depois do `/start` com `assigned: false` e antes da reatribuição; ao reabrir,
       a página responde `existing: true`, reatribui, confirma e envia.
