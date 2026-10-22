@@ -69,6 +69,23 @@ function createAdobeClient({
   }
 
   /*
+    Cancela (recall) um acordo em andamento: PUT /agreements/{agreementId}/state (escopo agreement_write, já pedido).
+    Corpo da API v6 do Acrobat Sign: { state: 'CANCELLED', agreementCancellationInfo: { comment, notifyOthers } }.
+    Referência: API Reference v6 > Agreements > "PUT /agreements/{agreementId}/state"
+    (https://secure.na1.adobesign.com/public/docs/restapi/v6); estados em
+    https://developer.adobe.com/acrobat-sign/docs/overview/techblog/tldr/api-agreement-statuses.
+    notifyOthers: avisa os demais participantes do cancelamento (o `comment` aparece no aviso). O cancelamento é definitivo
+    e o Adobe depois emite AGREEMENT_RECALLED (webhook). Qualquer 2xx vale como confirmado; erros HTTP sobem ao chamador.
+  */
+  async function cancelAgreement(id, { comment = '', notifyOthers = false } = {}) {
+    const rsp = await http.put(`${rest}/agreements/${encodeURIComponent(id)}/state`, {
+      state: 'CANCELLED',
+      agreementCancellationInfo: { comment: String(comment ?? ''), notifyOthers: !!notifyOthers }
+    }, { headers: await authHeaders(), timeout: timeoutMs });
+    return rsp.data;
+  }
+
+  /*
     Baixa o PDF final (com relatório de auditoria). Retry limitado e *aguardado* em 403;
     qualquer outro erro (ou esgotadas as tentativas) é propagado.
   */
@@ -103,7 +120,8 @@ function createAdobeClient({
   const checkAuth = () => ensureToken();
 
   return {
-    createTransientDocument, createAgreement, getAgreement, getAgreementEvents, downloadCombinedDocument, checkAuth
+    createTransientDocument, createAgreement, getAgreement, getAgreementEvents, cancelAgreement, downloadCombinedDocument,
+    checkAuth
   };
 }
 

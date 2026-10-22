@@ -12,6 +12,7 @@ const { createAdobeClient } = require('./infra/adobeClient');
 const { createOtcsClient } = require('./infra/otcsClient');
 const { createReconciliationService } = require('./services/reconciliationService');
 const { createSignatureService } = require('./services/signatureService');
+const { createCancellationService } = require('./services/cancellationService');
 const { createPoller } = require('./services/poller');
 const { createApp } = require('./app');
 
@@ -40,9 +41,13 @@ function start() {
   const signatureService = createSignatureService({
     repo, adobe, otcs, logger, config, onCreated: (id, ctx) => (ctx?.existing ? reconciliation.resumeStart(id) : reconciliation.reconcile(id))
   });
+  const cancellationService = createCancellationService({
+    repo, adobe, otcs, logger, config, hold: reconciliation.hold
+  });
   const poller = createPoller({ repo, adobe, processor: reconciliation, config, logger });
 
-  const app = createApp({ config, logger, repo, reconciliation, signatureService, tokenStore });
+  const app = createApp({ config, logger, repo, reconciliation, signatureService, tokenStore, cancellationService });
+  if (config.cancel.enabled) logger.info(`Cancelación de flujos habilitada (POST /cancel; tareas: ${config.cancel.taskNames.join(' / ')})`);
   const server = app.listen(config.port, () => {
     logger.info(
       `Server started successfully\n` +

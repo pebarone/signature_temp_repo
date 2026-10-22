@@ -265,9 +265,23 @@ function createOtcsClient({
     return rsp.data;
   });
 
+  /*
+    Para um processo: PUT /v2/processes/{process_id}/status com status=stop (form-urlencoded; valores da spec do OTCS:
+    suspend, resume, stop, archive; 400 = sem permissão para mudar o status).
+    NÃO USADO: o fluxo de cancelamento (ticket 2026060410003715) deixa o workflow de cancelamento encerrar o fluxo original
+    no Content. Fica disponível como alternativa documentada em docs/DESIGN_TICKET_2026060410003715.md.
+  */
+  const stopProcess = (processId) => withTicket(async (tck) => {
+    const rsp = await http.put(`${base}/v2/processes/${encodeURIComponent(processId)}/status`, qs.stringify({ status: 'stop' }), {
+      headers: { OTCSTicket: tck, 'Content-Type': 'application/x-www-form-urlencoded' },
+      timeout: timeoutMs
+    });
+    return rsp.data;
+  });
+
   return {
     ensureTicket, downloadNode, uploadToFolder, addVersion, nodeExists, sendOnWorkflow, getProcessSteps, getTaskForm,
-    updateTaskForm, getWorkflowAttributes, getCurrentUser
+    updateTaskForm, getWorkflowAttributes, getCurrentUser, stopProcess
   };
 }
 

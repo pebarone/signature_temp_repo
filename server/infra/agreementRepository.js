@@ -1,7 +1,8 @@
 // infra/agreementRepository.js
 // Repositório de acordos/eventos sobre SQLite (better-sqlite3, síncrono).
 // Interface usada pelos services: get, has, upsert, list, listPending, listPollable, listAttentionToReopen, recordEvent,
-// listEvents, findRecent, findOpenByWorkflow, consumeNonce (nonces do /start), countByState, transaction.
+// listEvents, findRecent, findOpenByWorkflow, listByWorkflow (cancelamento), consumeNonce (nonces do /start), countByState,
+// transaction.
 
 // [chave JS, coluna SQL, tipo]
 const COLUMNS = [
@@ -38,6 +39,8 @@ const COLUMNS = [
   ['completedExternally', 'completed_externally', 'bool'],
   ['wfAttrsFingerprint', 'wf_attrs_fingerprint', 'text'],
   ['adopted', 'adopted', 'bool'],
+  ['cancelRequestedAt', 'cancel_requested_at', 'text'],
+  ['cancelSource', 'cancel_source', 'text'],
   ['createdAt', 'created_at', 'text'],
   ['updatedAt', 'updated_at', 'text']
 ];
@@ -103,6 +106,11 @@ function createAgreementRepository(db, { now = () => new Date(), maxEvents = 50 
     openByWorkflow: db.prepare(
       `SELECT * FROM agreements WHERE workflow_id = ? AND subworkflow_id = ? AND node_id = ?
          AND final_kind IS NULL AND sendon_done = 0 ORDER BY created_at DESC, id DESC LIMIT 1`
+    ),
+    // Todos os acordos de um workflow (mais recente primeiro), com ou sem filtro de subprocesso (cancelamento de fluxos)
+    byWorkflow: db.prepare('SELECT * FROM agreements WHERE workflow_id = ? ORDER BY created_at DESC, id DESC'),
+    byWorkflowSub: db.prepare(
+      'SELECT * FROM agreements WHERE workflow_id = ? AND subworkflow_id = ? ORDER BY created_at DESC, id DESC'
     ),
     purgeNonces: db.prepare('DELETE FROM start_nonces WHERE expires_at < ?'),
     insertNonce: db.prepare('INSERT OR IGNORE INTO start_nonces (nonce, expires_at) VALUES (?, ?)'),
@@ -211,6 +219,19 @@ function createAgreementRepository(db, { now = () => new Date(), maxEvents = 50 
     findOpenByWorkflow(workflowId, subworkflowId, nodeId) {
       const row = stmts.openByWorkflow.get(String(workflowId), String(subworkflowId), String(nodeId));
       return row ? rowToRecord(row) : null;
+    },
+
+    /*
+      Acordos de um workflow, mais recente primeiro (abertos e já encerrados). `subworkflowId` opcional filtra pelo
+      subprocesso exato: o cancelamento nunca escolhe o acordo de outro subprocesso. "Aberto" é decidido em
+      domain/cancellation.js (selectCancelTarget): sem sendonDone.
+    */
+    listByWorkflow(workflowId, subworkflowId) {
+      const sub = subworkflowId === undefined || subworkflowId === null ? '' : String(subworkflowId).trim();
+      const rows = sub
+        ? stmts.byWorkflowSub.all(String(workflowId), sub)
+        : stmts.byWorkflow.all(String(workflowId));
+      return rows.map(rowToRecord);
     },
 
     /*

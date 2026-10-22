@@ -61,8 +61,21 @@ function createReconciliationService({
   const attrMissingLogged = new Set(); // `${id}|${rótulo}` já logados (rótulo inexistente no mapa)
   const adopting = new Map();   // id -> Promise da adoção em curso
   const notOurs = new Map();    // id -> expiração (ms): acordo sem externalId nosso
+  const held = new Set();       // ids com cancelamento em curso (hold)
 
   const nowIso = () => now().toISOString();
+
+  /*
+    Cancelamento em curso (services/cancellationService.js): do pedido ao Adobe até o acordo ser marcado como encerrado,
+    o AGREEMENT_RECALLED (ou o polling) pode chegar antes da marcação. Durante o hold, a reconciliação do acordo não faz
+    nada (devolve 'held'): o evento já fica no histórico e, se o cancelamento falhar, a fila (runQueue) reprocessa depois.
+    Devolve a função que libera o hold.
+  */
+  function hold(id) {
+    id = String(id);
+    held.add(id);
+    return () => { held.delete(id); };
+  }
 
   /* ---------- helpers de estado ---------- */
 
@@ -561,6 +574,7 @@ function createReconciliationService({
   async function doReconcile(id, opts) {
     let rec = repo.get(id);
     if (!rec) return { status: 'unknown' };
+    if (held.has(id)) return { status: 'held', record: rec };
     if (rec.state === state.STATES.NEEDS_ATTENTION && !opts.manual) {
       return { status: 'needs_attention', reason: rec.attentionReason, record: rec };
     }
@@ -932,7 +946,7 @@ function createReconciliationService({
   }
 
   return {
-    handleEvent, handleStatus, applyAdobeStatus, reconcile, resumeStart, runQueue, reopenStale, adopt, stop
+    handleEvent, handleStatus, applyAdobeStatus, reconcile, resumeStart, runQueue, reopenStale, adopt, hold, stop
   };
 }
 

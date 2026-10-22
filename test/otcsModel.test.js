@@ -282,7 +282,7 @@ test('adobe.createAgreement: envia externalId { id } só quando informado', asyn
 /* ---------- banco: migração v1 -> v2 ---------- */
 
 test('db: arquivo criado no schema v1 recebe as migrações seguintes (v2, v3) preservando os dados', () => {
-  assert.equal(MIGRATIONS.length, 3);
+  assert.equal(MIGRATIONS.length, 4); // v4: cancelamento de fluxos (test/cancellation.test.js)
   const file = path.join(tmpDir(), 'v1.db');
 
   // banco "antigo": só a migração 1
@@ -312,7 +312,7 @@ test('db: arquivo criado no schema v1 recebe as migrações seguintes (v2, v3) p
   raw.close();
 
   const db = openDatabase(file);
-  assert.equal(db.pragma('user_version', { simple: true }), 3);
+  assert.equal(db.pragma('user_version', { simple: true }), MIGRATIONS.length);
   const cols = db.prepare('PRAGMA table_info(agreements)').all().map((c) => c.name);
   for (const c of ['start_sendon_done', 'start_sendon_at', 'sign_subprocess_id', 'sign_task_id', 'pdf_node_id',
     'attention_kind', 'completed_externally', 'wf_attrs_fingerprint', 'adopted']) {
@@ -339,7 +339,7 @@ test('db: arquivo criado no schema v1 recebe as migrações seguintes (v2, v3) p
   // e reabrir o arquivo já migrado é idempotente
   db.close();
   const again = openDatabase(file);
-  assert.equal(again.pragma('user_version', { simple: true }), 3);
+  assert.equal(again.pragma('user_version', { simple: true }), MIGRATIONS.length);
   assert.equal(createAgreementRepository(again).get('OLD').startSendonDone, true);
   again.close();
 });

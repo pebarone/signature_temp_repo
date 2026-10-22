@@ -9,6 +9,7 @@ const { openDatabase } = require('../../server/infra/db');
 const { createAgreementRepository } = require('../../server/infra/agreementRepository');
 const { createReconciliationService } = require('../../server/services/reconciliationService');
 const { createSignatureService } = require('../../server/services/signatureService');
+const { createCancellationService } = require('../../server/services/cancellationService');
 const { createPoller } = require('../../server/services/poller');
 const { classifyEvent, isFinalKind, KINDS } = require('../../server/domain/eventPolicy');
 const { createApp } = require('../../server/app');
@@ -54,6 +55,11 @@ function makeAdobe(calls = []) {
     events: {},              // id -> [{ type }] (GET /agreements/{id}/events)
     eventsError: null,       // se definido, getAgreementEvents lança
     downloadFailures: 0,     // próximas N chamadas de download falham
+    cancelFailures: 0,       // próximas N chamadas de cancelAgreement falham
+    cancelFailStatus: 503,
+    cancelLostResponses: 0,  // próximas N chamadas de cancelAgreement: o Adobe APLICA o cancelamento, mas a resposta se perde (erro)
+    cancelled: [],           // cancelAgreement aplicados: { id, comment, notifyOthers }
+    onCancel: null,          // async (id) => ...: roda DENTRO do cancelAgreement, depois de o Adobe aplicar (webhook antes da resposta)
     pdf: PDF,
     created: [],
     authOk: true,
@@ -81,6 +87,24 @@ function makeAdobe(calls = []) {
       calls.push(['adobe.getAgreementEvents', id]);
       if (adobe.eventsError) throw adobe.eventsError;
       return adobe.events[id] || [];
+    },
+    // Cancelamento (PUT /agreements/{id}/state): o acordo passa a CANCELLED e o histórico ganha o evento RECALLED
+    async cancelAgreement(id, { comment, notifyOthers } = {}) {
+      calls.push(['adobe.cancelAgreement', id]);
+      if (adobe.cancelFailures > 0) {
+        adobe.cancelFailures--;
+        throw httpError(adobe.cancelFailStatus, 'adobe cancel failed');
+      }
+      if (!adobe.agreements[id]) throw httpError(404, 'agreement not found');
+      adobe.cancelled.push({ id, comment, notifyOthers });
+      adobe.agreements[id] = { ...adobe.agreements[id], status: 'CANCELLED' };
+      adobe.events[id] = [...(adobe.events[id] || []), { type: 'RECALLED' }];
+      if (adobe.onCancel) await adobe.onCancel(id);
+      if (adobe.cancelLostResponses > 0) {
+        adobe.cancelLostResponses--;
+        throw httpError(504, 'gateway timeout'); // aplicado no Adobe, mas o chamador só vê o erro
+      }
+      return {};
     },
     async downloadCombinedDocument(id) {
       calls.push(['adobe.download', id]);
@@ -119,6 +143,7 @@ function seedAdobeForEvent(adobe, event, id, payload = {}) {
 // Nomes reais dos mapas de workflow (PROD/QA)
 const START_TASK_NAME = 'Enviar solicitud de firma (Empleado y/o Firmante 2)';
 const SIGN_TASK_NAME = 'Aguardar Firma';
+const CANCEL_TASK_NAME = 'Cancelar Flujo de Firma (Solicitante)';
 // Usuário de integração (OTCS_USER) do OTCS falso e um usuário humano qualquer (dono da tarefa antes do REASSIGN)
 const INTEGRATION_USER_ID = 11742766;
 const HUMAN_USER_ID = 279463;
@@ -193,6 +218,25 @@ function makeOtcs(calls = []) {
       otcs.workflows[String(processId)] = {
         processId: Number(processId),
         tasks: otcs.standardTasks(subprocessId, stage)
+      };
+      if (assignee !== null) for (const t of otcs.workflows[String(processId)].tasks) t.assignees = [Number(assignee)];
+      return otcs.workflows[String(processId)];
+    },
+    /*
+      Workflow de CANCELAMENTO (ticket 2026060410003715): tarefa 2 (nome em CANCEL_TASK_NAME) ativa, onde roda o WebReport
+      que chama o POST /cancel; o SendOn dela ativa a tarefa 3 ("Cancelar flujo original"). `stage: 'done'` deixa a tarefa 2
+      já concluída. O formulário vem de `formFields` (use seedCancelFlow).
+    */
+    addCancelWorkflow(processId, { subprocessId = processId, stage = 'cancel', assignee = null, taskName = CANCEL_TASK_NAME } = {}) {
+      const sub = Number(subprocessId);
+      const done = stage === 'done';
+      otcs.workflows[String(processId)] = {
+        processId: Number(processId),
+        tasks: [
+          { subprocessId: sub, taskId: 1, name: 'Registrar cancelación', status: 'completed' },
+          { subprocessId: sub, taskId: 2, name: taskName, status: done ? 'completed' : 'current' },
+          { subprocessId: sub, taskId: 3, name: 'Cancelar flujo original', status: done ? 'current' : 'next' }
+        ]
       };
       if (assignee !== null) for (const t of otcs.workflows[String(processId)].tasks) t.assignees = [Number(assignee)];
       return otcs.workflows[String(processId)];
@@ -395,11 +439,15 @@ async function buildWorld({
     repo, adobe, otcs, logger, config, now: clock.now,
     onCreated: (id, ctx) => (ctx?.existing ? reconciliation.resumeStart(id) : reconciliation.reconcile(id))
   });
+  const cancellation = createCancellationService({
+    repo, adobe, otcs, logger, config, now: clock.now, hold: reconciliation.hold
+  });
   const poller = createPoller({ repo, adobe, processor: reconciliation, config, logger, now: clock.now });
   tokenStore = tokenStore || makeTokenStore();
 
   const world = {
-    config, db, repo, adobe, otcs, clock, logger, timers, reconciliation, signatureService, poller, tokenStore, dataDir,
+    config, db, repo, adobe, otcs, clock, logger, timers, reconciliation, signatureService, cancellation, poller, tokenStore,
+    dataDir,
     calls: adobe.calls,
     async close() {
       reconciliation.stop();
@@ -411,7 +459,7 @@ async function buildWorld({
 
   if (listen) {
     world.app = createApp({
-      config, logger, repo, reconciliation, signatureService, tokenStore, now: clock.ms
+      config, logger, repo, reconciliation, signatureService, tokenStore, cancellationService: cancellation, now: clock.ms
     });
     world.server = await new Promise((resolve) => {
       const s = world.app.listen(0, '127.0.0.1', () => resolve(s));
@@ -512,9 +560,23 @@ function seedStartFlow(world, { processId = '3003', subprocessId = '3004', stage
   return world.otcs.addWorkflow(processId, { subprocessId, stage, assignee });
 }
 
+/*
+  Workflow de cancelamento no OTCS falso, na tarefa de cancelamento, com o formulário (atributos do workflow) apontando
+  para o fluxo a cancelar. `fields` sobrescreve/remove (null) atributos pelo rótulo; `assignee` (userId) é o dono das
+  tarefas (padrão: usuário de integração). Devolve o workflow.
+*/
+function seedCancelFlow(world, { processId = '9001', subprocessId = processId, stage = 'cancel', fields = {}, assignee = null } = {}) {
+  const base = { 'ID Flujo a Cancelar': '3003', 'ID Subflujo a Cancelar': '', ...fields };
+  world.otcs.formFields = {};
+  for (const [label, value] of Object.entries(base)) {
+    if (value !== null) world.otcs.formFields[label] = { key: `k_${label.replace(/\W/g, '')}`, value };
+  }
+  return world.otcs.addCancelWorkflow(processId, { subprocessId, stage, assignee });
+}
+
 const basicHeader = (user, pass) => 'Basic ' + Buffer.from(`${user}:${pass}`).toString('base64');
 
 module.exports = {
-  PDF, T0, START_TASK_NAME, SIGN_TASK_NAME, INTEGRATION_USER_ID, HUMAN_USER_ID, makeClock, makeLogger, makeAdobe, makeOtcs, makeTokenStore, httpError, tmpDir, buildWorld,
-  seedAdobeForEvent, seedAgreement, webhookPayload, waitFor, startBody, startBodyV1, seedStartFlow, basicHeader
+  PDF, T0, START_TASK_NAME, SIGN_TASK_NAME, CANCEL_TASK_NAME, INTEGRATION_USER_ID, HUMAN_USER_ID, makeClock, makeLogger, makeAdobe, makeOtcs, makeTokenStore, httpError, tmpDir, buildWorld,
+  seedAdobeForEvent, seedAgreement, webhookPayload, waitFor, startBody, startBodyV1, seedStartFlow, seedCancelFlow, basicHeader
 };

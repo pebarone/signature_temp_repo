@@ -28,7 +28,7 @@ Cada etapa só roda se a anterior concluiu, grava seu resultado no SQLite e, se 
 | `AGREEMENT_WORKFLOW_COMPLETED`; `AGREEMENT_ACTION_COMPLETED` com `status=SIGNED`; polling `SIGNED` | final OK (exige `SIGNED` confirmado no Adobe) | sim: nova versão do `nodeId` | `DISPOSITION_SIGNED` = `Firmado` | `completed` | estado Adobe `SIGNED`, integração `pdf_delivered` antes da disposição |
 | `AGREEMENT_REJECTED`; polling `CANCELLED` + evento `REJECTED`/`ACTION_REJECTED` | recusado | não | `DISPOSITION_REJECTED` = `Rechazado` | `rejected` | idem |
 | `AGREEMENT_EXPIRED`; polling `EXPIRED` | expirado | não | `DISPOSITION_EXPIRED` = `Rechazado` | `expired` | idem |
-| `AGREEMENT_RECALLED`; polling `CANCELLED` sem recusa | cancelado | não | `DISPOSITION_RECALLED` = `Rechazado` | `cancelled` | idem |
+| `AGREEMENT_RECALLED`; polling `CANCELLED` sem recusa | cancelado | não | `DISPOSITION_RECALLED` = `Rechazado` (**exceto** acordo já encerrado por pedido de cancelamento: sem disposição, seção 10) | `cancelled` | idem |
 | `AGREEMENT_AUTO_CANCELLED_CONVERSION_PROBLEM` | falha de conversão | não | `DISPOSITION_CONVERSION_FAILED` = `Rechazado` | `cancelled` | idem |
 | `AGREEMENT_DOCUMENTS_DELETED`; polling `ABORTED` | exige intervenção | não | nenhuma | `needs_attention` (`event`) | integração `needs_attention` |
 | `AGREEMENT_ACTION_COMPLETED` com status em andamento; informativos (`CREATED`, `ACTION_REQUESTED`, `MODIFIED`, `EMAIL_VIEWED`, `REMINDER_SENT`...) | progresso/histórico | não | nenhuma | `pending` | estado Adobe atualizado se o polling o viu mudar |
@@ -53,11 +53,13 @@ pending --(final OK)--> signed --(PDF entregue)--> pdf_delivered --(disposição
 pending --(recusado | expirado | cancelado)--> rejected | expired | cancelled   [sendon_done=1 quando a disposição vai]
 qualquer estado aberto --(erro de dado | tentativas esgotadas | config | não confirmado | evento)--> needs_attention
 needs_attention --(POST /admin/reconcile/:id | reabertura automática | novo evento final)--> estado aberto
+qualquer estado aberto --(pedido de cancelamento confirmado no Adobe, seção 10)--> cancelled   [sendon_done=1, sem disposição]
 ```
 
 Campos que acompanham: `start_sendon_done` (pedido de firma enviado), `pdf_delivered`/`pdf_node_id` (PDF gravado e nó que o
 recebeu), `sendon_done`/`disposition` (tarefa concluída pela integração), `completed_externally` (tarefa já concluída
-fora da integração), `sign_subprocess_id`/`sign_task_id` (tarefa de firma resolvida), `attention_kind`, `adopted`.
+fora da integração), `sign_subprocess_id`/`sign_task_id` (tarefa de firma resolvida), `attention_kind`, `adopted`,
+`cancel_requested_at`/`cancel_source` (acordo encerrado por pedido de cancelamento, seção 10).
 
 ## 4. Etapas
 
@@ -244,3 +246,34 @@ incluídos nos formulários dessas tarefas:
 | `WEBHOOK_CLIENT_IDS` | vazio | ClientIds extras aceitos no webhook além do `CLIENT_ID` |
 | `WF_ATTRIBUTES_ENABLED` | `false` | grava dados do Adobe nos atributos do workflow |
 | `WF_ATTR_AGREEMENT_ID`, `WF_ATTR_STATUS`, `WF_ATTR_LAST_EVENT`, `WF_ATTR_UPDATED_AT`, `WF_ATTR_INTEGRATION_STATE` | ver seção 8 | rótulos dos atributos (vazio desliga) |
+| `CANCEL_ENABLED` | `false` | liga o `POST /cancel` do WebReport do workflow de cancelamento (desligado => 404); as rotas `/admin/cancel*` não dependem dele |
+| `CANCEL_TASK_NAMES` | `Cancelar Flujo de Firma` | tarefa do workflow de cancelamento que roda o WebReport (prefixo normalizado). **Provisório** |
+| `CANCEL_FIELD_TARGET_WORKFLOW` / `CANCEL_FIELD_TARGET_SUBWORKFLOW` | `ID Flujo a Cancelar` / `ID Subflujo a Cancelar` | rótulos dos atributos do fluxo a cancelar (o segundo é opcional). **Provisórios** |
+| `CANCEL_NOTIFY_SIGNERS` | `false` | o Adobe avisa os signatários do cancelamento (`notifyOthers`) |
+
+## 10. Cancelamento de fluxos (ticket 2026060410003715)
+
+Detalhes, decisões e pontos em aberto: [`DESIGN_TICKET_2026060410003715.md`](DESIGN_TICKET_2026060410003715.md). Um workflow
+de cancelamento no Content chama o orquestrador com o ID do fluxo a cancelar (lido dos atributos do workflow, nunca do corpo);
+o orquestrador cancela o acordo no Adobe e faz o SendOn da tarefa do workflow de cancelamento, que então cancela o fluxo original
+no Content. O orquestrador **não** encerra o fluxo original.
+
+- **Entradas**: `POST /cancel` (WebReport; `CANCEL_ENABLED=true`; `/auth` Basic + HMAC v2 com nonce), `POST /admin/cancel/:agreementId`
+  e `POST /admin/cancel-workflow/:workflowId` (Basic Auth).
+- **Acordo escolhido**: o aberto (sem `sendon_done`) do `workflowId`, com `subworkflowId` exato se informado; nunca o de outro
+  subprocesso. Vários abertos sem subprocesso => `409 AMBIGUOUS` (nenhum é cancelado); nenhum => `404` com a dica de
+  `POST /admin/adopt/:id` (acordos do orquestrador antigo).
+- **Antes de cancelar** consulta `GET /agreements/{id}`: em andamento => `PUT /agreements/{id}/state` (`CANCELLED`);
+  `CANCELLED`/`ABORTED` => idempotente (sem novo cancelamento); `SIGNED` ou outro final => `409`; falha do Adobe => `503`, nada é marcado.
+  Se o `PUT` falha, o acordo é reconsultado uma vez: `CANCELLED`/`ABORTED` => a resposta se perdeu mas o Adobe cancelou, conta como
+  confirmado (warn no log); outro estado ou nova falha => `503`.
+- **Depois de confirmado**, o acordo é encerrado (`state=cancelled`, `sendon_done=1`, `start_sendon_done=1`, `disposition=null`,
+  `cancel_requested_at`/`cancel_source`) com o evento `CANCEL_REQUESTED` no histórico. O `AGREEMENT_RECALLED` seguinte **não gera
+  `Rechazado`**: o webhook só vai ao histórico (sem reconciliação), o polling e a fila de retry não enxergam mais o acordo e
+  `reconcile` devolve `done`. Durante o `PUT` a reconciliação do acordo fica em espera (`hold`), para o evento que chegar antes da marcação.
+  Decisão padrão, revisável.
+- **Rotas admin** (`/admin/cancel*`): não fecham o fluxo no Content (a resposta 200 traz `contentFlow: 'unchanged'` + `note`, e há
+  um `warn`); não mandam `Rechazado` porque esse ramo dos mapas pode disparar ações de negócio que não são "cancelar".
+- **Tarefa do workflow de cancelamento** (`POST /cancel`): precisa estar `current` e atribuída ao usuário de integração
+  (`409 REASSIGN_REQUIRED` com `handoff` se não); o SendOn (sem disposição) só acontece depois do cancelamento confirmado. Falha no
+  SendOn => `503 SENDON_FAILED`; repetir é idempotente.
