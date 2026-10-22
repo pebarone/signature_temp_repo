@@ -8,8 +8,10 @@ const { computeConfig } = require('../server/config');
 const { openDatabase, MIGRATIONS } = require('../server/infra/db');
 const { createAgreementRepository } = require('../server/infra/agreementRepository');
 const { canonicalStart, signStart } = require('../server/http/middleware/hmac');
+const { parseWebhookPayload } = require('../server/domain/eventPolicy');
+const { finalNotice } = require('../server/domain/agreementState');
 const {
-  buildWorld, startBody, startBodyV1, seedStartFlow, basicHeader, makeClock, waitFor, httpError, tmpDir,
+  buildWorld, startBody, startBodyV1, seedStartFlow, basicHeader, makeClock, waitFor, httpError, tmpDir, webhookPayload,
   INTEGRATION_USER_ID, HUMAN_USER_ID
 } = require('./support/fakes');
 
@@ -553,16 +555,18 @@ test('/start verificado: alteração de e-mails no formulário durante envio nã
   assert.equal(world.adobe.created.length, 1);
 });
 
-test('/start verificado: idempotência é por workflow + subprocesso + documento e só enquanto o acordo não é final', async () => {
+test('/start verificado: idempotência é por workflow + subprocesso + documento; outro documento do mesmo workflow cria outro acordo', async () => {
   const world = await verifyWorld();
   seedStartFlow(world);
   assert.equal((await authThenStart(world)).status, 200);
   await waitFor(() => world.repo.get('AG-1').startSendonDone);
 
-  // acordo final (resultado definitivo): um novo pedido deixa de ser "o mesmo"
+  // acordo final (resultado definitivo): deixa de ser "aberto", mas o fluxo continua vendo o dele (findLatestByWorkflow)
   world.repo.upsert('AG-1', { finalKind: 'final_ok', state: 'signed' });
   assert.equal(world.repo.findOpenByWorkflow('3003', '3004', '1001'), null);
+  assert.equal(world.repo.findLatestByWorkflow('3003', '3004', '1001').id, 'AG-1');
   assert.equal(world.repo.findOpenByWorkflow('3003', '3004', '5555'), null);
+  assert.equal(world.repo.findLatestByWorkflow('3003', '3004', '5555'), null);
 
   // outro documento no mesmo workflow cria outro acordo (a tarefa de início volta a "current" no modelo)
   world.otcs.workflows = {};
@@ -684,7 +688,8 @@ test('/start em sub-workflow: tarefa no usuário humano => 409 REASSIGN_REQUIRED
     handoff: handoffOf({ subworkflowId: 3004 })
   });
   assert.equal(world.adobe.created.length, 0);
-  assert.equal(world.adobe.calls.length, 0, 'nenhuma chamada ao Adobe nem ao download');
+  // a pré-checagem (dicas do corpo) baixa o nó, mas não toca o Adobe
+  assert.deepEqual(world.adobe.calls, [['otcs.download', '1001']], 'só o download da pré-checagem, nada no Adobe');
   assert.equal(modelCalled(world, 'getWorkflowAttributes'), 0, 'status/info só traz os atributos do pai');
   assert.equal(modelCalled(world, 'getTaskForm'), 0);
 
@@ -762,6 +767,505 @@ test('/start pelo caminho dos atributos: erros do OTCS (404 => 409, 5xx => 503);
   r = await authThenStart(world, STANDALONE);
   assert.equal(r.status, 503);
   assert.ok(world.logger.has('error', /getCurrentUser falhou/));
+  assert.equal(world.adobe.created.length, 0);
+  await world.close();
+});
+
+/* ---------- validação do PDF antes do Adobe (NOT_PDF) ---------- */
+
+const HTML_DOC = Buffer.from('<!DOCTYPE html>\n<html><body>CONTEUDO-SECRETO</body></html>');
+const DOCX_DOC = Buffer.concat([Buffer.from([0x50, 0x4b, 0x03, 0x04, 0x14, 0x00]), Buffer.from('word/document.xml CONTEUDO-SECRETO')]);
+const NOT_PDF_BODY = { error: 'El documento a firmar no es un PDF válido.', code: 'NOT_PDF' };
+const adobeCalls = (world) => world.adobe.calls.filter(([name]) => name.startsWith('adobe.'));
+const allLogs = (world) => [...world.logger.lines.info, ...world.logger.lines.warn, ...world.logger.lines.error];
+
+test('/start verificado: nó HTML no lugar do PDF => 422 NOT_PDF, nada no Adobe, sem vazar o conteúdo; com o PDF o reenvio funciona', async () => {
+  const world = await verifyWorld();
+  seedStartFlow(world);
+  world.otcs.nodeContents['1001'] = HTML_DOC;
+
+  let r = await authThenStart(world);
+  assert.equal(r.status, 422);
+  assert.deepEqual(await r.json(), NOT_PDF_BODY);
+  assert.deepEqual(adobeCalls(world), [], 'nem documento transitório nem acordo');
+  assert.equal(world.adobe.created.length, 0);
+  assert.equal(world.repo.list().length, 0);
+  assert.deepEqual(world.otcs.downloads, ['1001']);
+  assert.equal(world.otcs.sendons.length, 0, 'a tarefa de início fica como estava');
+  assert.ok(world.logger.has('warn', new RegExp(`nodo 1001 no es un PDF válido \\(${HTML_DOC.length} bytes; tipo detectado: HTML\\)`)));
+  assert.ok(allLogs(world).every((line) => !/CONTEUDO-SECRETO/.test(line)), 'o conteúdo não vai para o log');
+
+  // o usuário sobe uma versão PDF no mesmo nó e tenta de novo: a chave em andamento foi liberada
+  delete world.otcs.nodeContents['1001'];
+  r = await authThenStart(world);
+  assert.equal(r.status, 200, await r.clone().text());
+  assert.equal(world.adobe.created.length, 1);
+  await waitFor(() => world.repo.get('AG-1').startSendonDone);
+  await world.close();
+});
+
+test('/start verificado: DOCX/zip, texto, vazio ou binário desconhecido => 422 NOT_PDF com o tipo no log', async () => {
+  const world = await verifyWorld();
+  seedStartFlow(world);
+  for (const [content, label] of [
+    [DOCX_DOC, 'ZIP\\/Office'],
+    [Buffer.from('apenas um texto qualquer'), 'texto'],
+    [Buffer.alloc(0), 'vacío'],
+    [Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00]), 'desconocido']
+  ]) {
+    world.otcs.nodeContents['1001'] = content;
+    const r = await authThenStart(world);
+    assert.equal(r.status, 422, label);
+    assert.deepEqual(await r.json(), NOT_PDF_BODY);
+    assert.ok(world.logger.has('warn', new RegExp(`\\(${content.length} bytes; tipo detectado: ${label}`)), label);
+  }
+  assert.equal(world.adobe.created.length, 0);
+  assert.deepEqual(adobeCalls(world), []);
+  await world.close();
+});
+
+test('/start verificado: PDF com bytes antes do %PDF- é aceito se o cabeçalho está nos primeiros 1024 bytes', async () => {
+  const world = await verifyWorld();
+  seedStartFlow(world);
+  // cabeçalho depois do byte 1024: não é PDF
+  world.otcs.nodeContents['1001'] = Buffer.concat([Buffer.alloc(1100, 0x20), Buffer.from('%PDF-1.7\n')]);
+  let r = await authThenStart(world);
+  assert.equal(r.status, 422);
+  assert.equal(world.adobe.created.length, 0);
+
+  // lixo (BOM, espaços) antes do cabeçalho, dentro da janela
+  world.otcs.nodeContents['1001'] = Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.alloc(900, 0x20), Buffer.from('%PDF-1.7\n%resto')]);
+  r = await authThenStart(world);
+  assert.equal(r.status, 200, await r.clone().text());
+  assert.equal(world.adobe.created.length, 1);
+  await waitFor(() => world.repo.get('AG-1').startSendonDone);
+  await world.close();
+});
+
+test('/start sem validação do workflow (legado): o nó HTML também é barrado antes do Adobe', async () => {
+  const world = await buildWorld({ listen: true });
+  world.otcs.nodeContents['1001'] = HTML_DOC;
+  const r = await post(world, '/start', startBody(world));
+  assert.equal(r.status, 422);
+  assert.deepEqual(await r.json(), NOT_PDF_BODY);
+  assert.equal(world.adobe.created.length, 0);
+  await world.close();
+});
+
+/* ---------- o mesmo fluxo sempre vê o acordo dele, mesmo final ---------- */
+
+test('incidente: o acordo do próprio fluxo virou final (conversão) antes da confirmação => 200 existing + final, não o 409 de duplicidade', async () => {
+  const world = await verifyWorld();
+  seedStartFlow(world, { subprocessId: '3003', assignee: HUMAN_USER_ID }); // mapa Firma puro: WORKID == SUBWORKID
+
+  // 1) o /start cria o acordo A; a tarefa ainda está no usuário: nenhum SendOn
+  let r = await authThenStart(world, STANDALONE);
+  assert.equal(r.status, 200, await r.clone().text());
+  assert.equal((await r.json()).id, 'AG-1');
+  await waitFor(() => world.repo.get('AG-1').attempts === 1);
+
+  // 2) o Adobe cancela A por problema de conversão; o pipeline espera a reatribuição
+  world.adobe.agreements['AG-1'].status = 'CANCELLED';
+  const ev = world.reconciliation.handleEvent(
+    parseWebhookPayload(webhookPayload('AGREEMENT_AUTO_CANCELLED_CONVERSION_PROBLEM', 'AG-1'))
+  );
+  await ev.processing;
+  assert.equal(world.repo.get('AG-1').finalKind, 'final_conversion_failed');
+  assert.equal(world.otcs.sendons.length, 0);
+
+  // 3) a página reatribui a tarefa de envio e chama o /start de confirmação (a de firma é do usuário de integração no mapa real)
+  world.otcs.assign(3003, 2, INTEGRATION_USER_ID);
+  world.otcs.assign(3003, 3, INTEGRATION_USER_ID);
+  r = await authThenStart(world, STANDALONE);
+  assert.equal(r.status, 200, await r.clone().text());
+  const body = await r.json();
+  const message = 'Adobe Sign no pudo procesar el documento (verifique que sea un PDF válido). '
+    + 'El flujo continuará automáticamente según el resultado.';
+  assert.deepEqual(body, {
+    message,
+    id: 'AG-1',
+    existing: true,
+    final: { kind: 'final_conversion_failed', state: 'cancelled', message },
+    handoff: handoffOf({ assigned: true })
+  });
+
+  // 4) o kick do /start retoma a reconciliação: SendOn pendente da tarefa de início e depois a disposição
+  await waitFor(() => world.repo.get('AG-1').sendonDone);
+  assert.deepEqual(world.otcs.sendons.map((s) => s.disposition || 'sendon'), ['sendon', 'Rechazado']);
+  assert.equal(world.repo.get('AG-1').startSendonDone, true);
+  assert.equal(world.adobe.created.length, 1, 'nenhum acordo novo');
+  assert.deepEqual(world.otcs.downloads, ['1001'], 'não baixou o PDF de novo');
+  assert.deepEqual(world.logger.lines.error, []);
+  await world.close();
+});
+
+test('/start verificado: acordo final do próprio fluxo com a tarefa de início ainda ativa => existing + final e retoma a reconciliação (kick)', async () => {
+  const world = await verifyWorld();
+  seedStartFlow(world);
+  world.repo.upsert('AG-1', {
+    nodeId: '1001', attachId: '2002', fileName: 'contrato.pdf', workflowId: '3003', subworkflowId: '3004', taskId: 2,
+    emails: ['one@example.com', 'two@example.com'], state: 'rejected', finalKind: 'final_rejected', startSendonDone: false
+  });
+  world.adobe.agreements['AG-1'] = { id: 'AG-1', status: 'CANCELLED' };
+  world.adobe.events['AG-1'] = [{ type: 'REJECTED' }];
+
+  const r = await authThenStart(world);
+  assert.equal(r.status, 200, await r.clone().text());
+  const body = await r.json();
+  assert.equal(body.existing, true);
+  assert.deepEqual(body.final, {
+    kind: 'final_rejected',
+    state: 'rejected',
+    message: 'El firmante rechazó la solicitud de firma en Adobe Sign. El flujo continuará automáticamente según el resultado.'
+  });
+  assert.equal(body.handoff.assigned, true);
+
+  // o kick seguiu para o reconcile: início (SendOn) e depois a disposição Rechazado
+  await waitFor(() => world.repo.get('AG-1').sendonDone);
+  assert.deepEqual(world.otcs.sendons.map((s) => s.disposition || 'sendon'), ['sendon', 'Rechazado']);
+  assert.equal(world.adobe.created.length, 0);
+  await world.close();
+});
+
+test('/start verificado: tarefa de início já não é current e o fluxo tem acordo final => existing + final (não o 409 "paso de envío")', async () => {
+  const world = await verifyWorld();
+  seedStartFlow(world, { stage: 'sign' }); // a tarefa de início já foi concluída
+  const base = {
+    nodeId: '1001', attachId: '2002', fileName: 'contrato.pdf', workflowId: '3003', subworkflowId: '3004', taskId: 2,
+    emails: ['one@example.com', 'two@example.com'], startSendonDone: true
+  };
+
+  // sem acordo: continua o 409 de sempre
+  let r = await authThenStart(world);
+  assert.equal(r.status, 409);
+  assert.deepEqual(await r.json(), { error: 'El flujo no está en el paso de envío a firma.' });
+
+  // acordo final com a disposição ainda pendente
+  world.repo.upsert('AG-1', { ...base, state: 'expired', finalKind: 'final_expired' });
+  r = await authThenStart(world);
+  assert.equal(r.status, 200, await r.clone().text());
+  let body = await r.json();
+  assert.equal(body.existing, true);
+  assert.equal(body.id, 'AG-1');
+  assert.equal('handoff' in body, false, 'a tarefa de início já avançou: nada a reatribuir');
+  assert.deepEqual(body.final, {
+    kind: 'final_expired',
+    state: 'expired',
+    message: 'La solicitud de firma expiró en Adobe Sign. El flujo continuará automáticamente según el resultado.'
+  });
+  assert.equal(body.message, body.final.message);
+
+  // acordo concluído (disposição enviada)
+  world.repo.upsert('AG-1', { sendonDone: true, state: 'expired' });
+  body = await (await authThenStart(world)).json();
+  assert.equal(body.final.message, 'La solicitud de firma expiró en Adobe Sign. El flujo ya continuó según el resultado.');
+
+  // acordo ainda aberto: existing sem final, como antes
+  world.repo.upsert('AG-1', { sendonDone: false, finalKind: null, state: 'pending' });
+  body = await (await authThenStart(world)).json();
+  assert.deepEqual(body, { message: 'Signature already requested. ID: AG-1', id: 'AG-1', existing: true });
+
+  // sem a dica do documento não há como achar o acordo
+  r = await authThenStart(world, { workflowId: '3003', subworkflowId: '3004' });
+  assert.equal(r.status, 409);
+  assert.equal(world.adobe.created.length, 0);
+  await world.close();
+});
+
+/* ---------- trava de 15 min: só acordo ABERTO de OUTRO fluxo ---------- */
+
+const OTHER_FLOW = {
+  nodeId: '1001', attachId: '2002', fileName: 'contrato.pdf', workflowId: '9999', subworkflowId: '9998', taskId: 2,
+  emails: ['one@example.com', 'two@example.com'], startSendonDone: true
+};
+
+test('/start verificado: acordo FINAL ou concluído do mesmo documento e destinatários em OUTRO fluxo não bloqueia', async () => {
+  const world = await verifyWorld();
+  seedStartFlow(world);
+  world.repo.upsert('AG-FINAL', { ...OTHER_FLOW, state: 'rejected', finalKind: 'final_rejected' });
+  world.repo.upsert('AG-DONE', { ...OTHER_FLOW, state: 'completed', finalKind: 'final_ok', sendonDone: true });
+
+  const r = await authThenStart(world);
+  assert.equal(r.status, 200, await r.clone().text());
+  assert.equal((await r.json()).id, 'AG-1');
+  assert.equal(world.adobe.created.length, 1);
+  await waitFor(() => world.repo.get('AG-1').startSendonDone);
+  await world.close();
+});
+
+test('/start verificado: acordo ABERTO do mesmo documento e destinatários em outro fluxo dentro de 15 min => 409 DUPLICATE_OPEN', async () => {
+  const world = await verifyWorld();
+  seedStartFlow(world);
+  world.repo.upsert('AG-OTHER', { ...OTHER_FLOW, state: 'pending' });
+
+  let r = await authThenStart(world);
+  assert.equal(r.status, 409);
+  assert.deepEqual(await r.json(), {
+    error: 'Este documento ya tiene una solicitud de firma abierta para este destinatario en otro flujo.',
+    code: 'DUPLICATE_OPEN',
+    id: 'AG-OTHER',
+    workflowId: '9999'
+  });
+  assert.equal(world.adobe.created.length, 0);
+  assert.deepEqual(world.otcs.downloads, [], 'barrado antes de baixar o documento');
+  assert.ok(world.logger.has('warn', /AG-OTHER.*otro flujo/));
+
+  // passada a janela, deixa de bloquear
+  world.clock.advance(16 * 60 * 1000);
+  r = await authThenStart(world);
+  assert.equal(r.status, 200, await r.clone().text());
+  await waitFor(() => world.repo.get('AG-1').startSendonDone);
+  await world.close();
+});
+
+test('repo.findOpenRecent: só aberto, conjunto de e-mails sem caixa/ordem, janela e exceção do próprio fluxo', () => {
+  const clock = makeClock();
+  const db = openDatabase(':memory:');
+  const repo = createAgreementRepository(db, { now: clock.now });
+  const base = { nodeId: '1001', workflowId: '10', subworkflowId: '11', emails: ['A@x.com', 'b@x.com'], state: 'pending' };
+  repo.upsert('OPEN', base);
+  repo.upsert('FINAL', { ...base, nodeId: '2002', finalKind: 'final_ok' });
+  repo.upsert('DONE', { ...base, nodeId: '3003', sendonDone: true });
+  const win = 15 * 60 * 1000;
+
+  assert.equal(repo.findOpenRecent('1001', ['b@X.com', 'a@x.com'], win).id, 'OPEN');
+  assert.equal(repo.findOpenRecent('1001', ['a@x.com', 'a@x.com', 'b@x.com'], win).id, 'OPEN', 'repetição não muda o conjunto');
+  assert.equal(repo.findOpenRecent('1001', ['a@x.com'], win), null, 'outro conjunto de destinatários');
+  assert.equal(repo.findOpenRecent('2002', ['a@x.com', 'b@x.com'], win), null, 'final não bloqueia');
+  assert.equal(repo.findOpenRecent('3003', ['a@x.com', 'b@x.com'], win), null, 'concluído não bloqueia');
+  assert.equal(repo.findOpenRecent('1001', ['a@x.com', 'b@x.com'], win, { workflowId: 10, subworkflowId: '11' }), null, 'o próprio fluxo é excluído');
+  assert.equal(repo.findOpenRecent('1001', ['a@x.com', 'b@x.com'], win, { workflowId: '10', subworkflowId: '12' }).id, 'OPEN');
+
+  clock.advance(win + 1000);
+  assert.equal(repo.findOpenRecent('1001', ['a@x.com', 'b@x.com'], win), null, 'fora da janela');
+  db.close();
+});
+
+test('repo.findLatestByWorkflow: o mais recente do workflow + subprocesso + documento, em qualquer estado', () => {
+  const clock = makeClock();
+  const db = openDatabase(':memory:');
+  const repo = createAgreementRepository(db, { now: clock.now });
+  const base = { nodeId: '1001', workflowId: '10', subworkflowId: '11', emails: ['a@x.com'], state: 'pending' };
+  repo.upsert('OLD', { ...base, state: 'rejected', finalKind: 'final_rejected', createdAt: '2026-06-22T10:00:00.000Z' });
+  repo.upsert('NEW', { ...base, state: 'cancelled', finalKind: 'final_conversion_failed', createdAt: '2026-06-22T11:00:00.000Z' });
+  repo.upsert('OTHERDOC', { ...base, nodeId: '2002', createdAt: '2026-06-22T12:00:00.000Z' });
+  repo.upsert('OTHERSUB', { ...base, subworkflowId: '12', createdAt: '2026-06-22T12:00:00.000Z' });
+
+  assert.equal(repo.findLatestByWorkflow('10', '11', '1001').id, 'NEW');
+  assert.equal(repo.findLatestByWorkflow(10, 11, 1001).id, 'NEW');
+  assert.equal(repo.findLatestByWorkflow('10', '11', '2002').id, 'OTHERDOC');
+  assert.equal(repo.findLatestByWorkflow('10', '11', '9999'), null);
+  assert.equal(repo.findOpenByWorkflow('10', '11', '1001'), null, 'findOpenByWorkflow continua só com o não final');
+  db.close();
+});
+
+test('finalNotice: mensagem por kind, variação por estado e null para o acordo aberto', () => {
+  const rec = (over) => ({ id: 'X', state: 'cancelled', sendonDone: false, finalKind: null, ...over });
+  const tail = ' El flujo continuará automáticamente según el resultado.';
+  assert.equal(finalNotice(rec()), null);
+  assert.equal(finalNotice(null), null);
+  const expected = {
+    final_ok: 'Este documento ya fue firmado en Adobe Sign.',
+    final_rejected: 'El firmante rechazó la solicitud de firma en Adobe Sign.',
+    final_expired: 'La solicitud de firma expiró en Adobe Sign.',
+    final_recalled: 'La solicitud de firma fue cancelada en Adobe Sign.',
+    final_conversion_failed: 'Adobe Sign no pudo procesar el documento (verifique que sea un PDF válido).'
+  };
+  for (const [kind, text] of Object.entries(expected)) {
+    assert.deepEqual(finalNotice(rec({ finalKind: kind })), { kind, state: 'cancelled', message: text + tail });
+  }
+  assert.equal(finalNotice(rec({ finalKind: 'final_ok', sendonDone: true, state: 'completed' })).message,
+    expected.final_ok + ' El flujo ya continuó según el resultado.');
+  assert.equal(finalNotice(rec({ finalKind: 'final_ok', state: 'needs_attention' })).message,
+    expected.final_ok + ' El flujo requiere revisión del administrador.');
+  // concluído sem kind (dado antigo): mensagem genérica
+  assert.match(finalNotice(rec({ sendonDone: true })).message, /^La solicitud de firma de este documento ya terminó en Adobe Sign\./);
+});
+
+/* ---------- ciclo novo: acordo concluído + tarefa de início current de novo ---------- */
+
+const hoursAgo = (world, h) => new Date(world.clock.ms() - h * 60 * 60 * 1000).toISOString();
+const SAME_FLOW = {
+  nodeId: '1001', attachId: '2002', fileName: 'contrato.pdf', workflowId: '3003', subworkflowId: '3004', taskId: 2,
+  emails: ['one@example.com', 'two@example.com'], startSendonDone: true
+};
+
+test('/start verificado: acordo CONCLUÍDO do mesmo workflow/sub/nó e a tarefa de início current de novo => ciclo novo, cria acordo novo (não existing)', async () => {
+  for (const old of [
+    { state: 'rejected', finalKind: 'final_rejected', disposition: 'Rechazado', sendonDone: true },
+    { state: 'completed', finalKind: 'final_ok', disposition: null, sendonDone: true, completedExternally: true }
+  ]) {
+    const world = await verifyWorld();
+    seedStartFlow(world); // o mapa voltou ao passo de envio: a tarefa de início está current
+    world.repo.upsert('AG-OLD', { ...SAME_FLOW, ...old, createdAt: hoursAgo(world, 2) });
+
+    // o PDF vale normalmente no ciclo novo: nó HTML => 422, nada criado
+    world.otcs.nodeContents['1001'] = HTML_DOC;
+    let r = await authThenStart(world);
+    assert.equal(r.status, 422);
+    assert.deepEqual(await r.json(), NOT_PDF_BODY);
+    assert.equal(world.adobe.created.length, 0);
+
+    // a trava vale normalmente: acordo aberto do mesmo documento em outro fluxo => 409
+    delete world.otcs.nodeContents['1001'];
+    world.repo.upsert('AG-OTHER', { ...OTHER_FLOW, state: 'pending' });
+    r = await authThenStart(world);
+    assert.equal(r.status, 409);
+    assert.equal((await r.json()).code, 'DUPLICATE_OPEN');
+    assert.equal(world.adobe.created.length, 0);
+    world.repo.upsert('AG-OTHER', { finalKind: 'final_ok', state: 'completed' });
+
+    // o acordo antigo é ignorado: nasce um acordo novo, aberto, sem `existing` nem `final`
+    r = await authThenStart(world);
+    assert.equal(r.status, 200, await r.clone().text());
+    const body = await r.json();
+    assert.equal(body.id, 'AG-1');
+    assert.equal('existing' in body, false);
+    assert.equal('final' in body, false);
+    assert.equal(body.message, 'Signature requested. ID: AG-1');
+    assert.equal(world.adobe.created.length, 1);
+    assert.equal(world.repo.get('AG-1').sendonDone, false);
+    assert.equal(world.repo.get('AG-OLD').sendonDone, true, 'o acordo antigo não é tocado');
+    await waitFor(() => world.repo.get('AG-1').startSendonDone);
+
+    // recarregar: agora o acordo do ciclo é o novo (a tarefa de início já avançou)
+    assert.deepEqual(await (await authThenStart(world)).json(), {
+      message: 'Signature already requested. ID: AG-1', id: 'AG-1', existing: true
+    });
+    assert.equal(world.adobe.created.length, 1);
+    await world.close();
+  }
+});
+
+test('/start verificado: final com sendonDone=false e a tarefa de início current => continua existing + final, mesmo com um acordo concluído mais antigo', async () => {
+  const world = await verifyWorld();
+  seedStartFlow(world);
+  world.repo.upsert('AG-OLD', { ...SAME_FLOW, state: 'rejected', finalKind: 'final_rejected', sendonDone: true, createdAt: hoursAgo(world, 2) });
+  world.repo.upsert('AG-NEW', {
+    ...SAME_FLOW, state: 'cancelled', finalKind: 'final_conversion_failed', startSendonDone: false, createdAt: hoursAgo(world, 1)
+  });
+  world.adobe.agreements['AG-NEW'] = { id: 'AG-NEW', status: 'CANCELLED' };
+
+  const r = await authThenStart(world);
+  assert.equal(r.status, 200, await r.clone().text());
+  const body = await r.json();
+  assert.equal(body.id, 'AG-NEW');
+  assert.equal(body.existing, true);
+  assert.equal(body.final.kind, 'final_conversion_failed');
+  assert.equal(world.adobe.created.length, 0, 'nenhum acordo novo');
+  await waitFor(() => world.repo.get('AG-NEW').sendonDone);
+  await world.close();
+});
+
+test('/start em sub-workflow: com acordo CONCLUÍDO do mesmo nó a pré-checagem roda (nó HTML => 422; PDF => REASSIGN_REQUIRED)', async () => {
+  const world = await verifyWorld();
+  seedStartFlow(world, { assignee: HUMAN_USER_ID }); // processo 3003, subprocesso 3004
+  world.repo.upsert('AG-OLD', { ...SAME_FLOW, state: 'rejected', finalKind: 'final_rejected', disposition: 'Rechazado', sendonDone: true });
+
+  world.otcs.nodeContents['1001'] = HTML_DOC;
+  let r = await authThenStart(world);
+  assert.equal(r.status, 422);
+  assert.deepEqual(await r.json(), NOT_PDF_BODY);
+  assert.deepEqual(world.otcs.downloads, ['1001'], 'a pré-checagem baixou o nó');
+  assert.deepEqual(world.otcs.task(3003, 2, 3004).assignees, [HUMAN_USER_ID], 'a tarefa não foi reatribuída');
+
+  delete world.otcs.nodeContents['1001'];
+  r = await authThenStart(world);
+  assert.equal(r.status, 409);
+  assert.equal((await r.json()).code, 'REASSIGN_REQUIRED');
+  assert.deepEqual(world.otcs.downloads, ['1001', '1001']);
+  await world.close();
+});
+
+/* ---------- sub-workflow: pré-checagem antes do REASSIGN_REQUIRED ---------- */
+
+test('/start em sub-workflow: nó HTML nas dicas => 422 NOT_PDF e a tarefa NÃO é reatribuída (sem REASSIGN_REQUIRED)', async () => {
+  const world = await verifyWorld();
+  seedStartFlow(world, { assignee: HUMAN_USER_ID }); // processo 3003, subprocesso 3004
+  world.otcs.nodeContents['1001'] = HTML_DOC;
+
+  const r = await authThenStart(world);
+  assert.equal(r.status, 422);
+  assert.deepEqual(await r.json(), NOT_PDF_BODY);
+  assert.deepEqual(adobeCalls(world), []);
+  assert.equal(world.adobe.created.length, 0);
+  assert.equal(modelCalled(world, 'getTaskForm'), 0);
+  assert.deepEqual(world.otcs.task(3003, 2, 3004).assignees, [HUMAN_USER_ID], 'a tarefa continua com o usuário');
+  assert.ok(world.logger.has('warn', /no es un PDF válido/));
+
+  // com o PDF de volta, a pré-checagem passa e o servidor pede a reatribuição
+  delete world.otcs.nodeContents['1001'];
+  const again = await authThenStart(world);
+  assert.equal(again.status, 409);
+  assert.equal((await again.json()).code, 'REASSIGN_REQUIRED');
+  await world.close();
+});
+
+test('/start em sub-workflow: acordo aberto do mesmo documento em outro fluxo => 409 DUPLICATE_OPEN antes de pedir a reatribuição', async () => {
+  const world = await verifyWorld();
+  seedStartFlow(world, { assignee: HUMAN_USER_ID });
+  world.repo.upsert('AG-OTHER', { ...OTHER_FLOW, state: 'pending' });
+
+  let r = await authThenStart(world);
+  assert.equal(r.status, 409);
+  const body = await r.json();
+  assert.equal(body.code, 'DUPLICATE_OPEN');
+  assert.deepEqual([body.id, body.workflowId], ['AG-OTHER', '9999']);
+  assert.deepEqual(world.otcs.downloads, [], 'a trava vem antes do download');
+
+  // acordo final de outro fluxo não bloqueia: segue para o REASSIGN_REQUIRED
+  world.repo.upsert('AG-OTHER', { finalKind: 'final_ok', state: 'completed' });
+  r = await authThenStart(world);
+  assert.equal(r.status, 409);
+  assert.equal((await r.json()).code, 'REASSIGN_REQUIRED');
+  await world.close();
+});
+
+test('/start em sub-workflow: sem dicas, ou com acordo do próprio fluxo, ou com falha do OTCS no download', async () => {
+  const world = await verifyWorld();
+  seedStartFlow(world, { assignee: HUMAN_USER_ID });
+  world.otcs.nodeContents['1001'] = HTML_DOC;
+
+  // sem nodeId/e-mails no pedido não há o que validar: segue para o REASSIGN_REQUIRED, sem baixar nada
+  let r = await authThenStart(world, { workflowId: '3003', subworkflowId: '3004' });
+  assert.equal(r.status, 409);
+  assert.equal((await r.json()).code, 'REASSIGN_REQUIRED');
+  assert.deepEqual(world.otcs.downloads, []);
+  assert.ok(world.logger.has('info', /se omite la prevalidación/));
+
+  // o fluxo já tem acordo deste documento: a página pode reatribuir (o /start seguinte devolve existing); nada a validar
+  world.repo.upsert('AG-1', { ...OTHER_FLOW, workflowId: '3003', subworkflowId: '3004', state: 'cancelled', finalKind: 'final_conversion_failed' });
+  r = await authThenStart(world);
+  assert.equal((await r.json()).code, 'REASSIGN_REQUIRED');
+  assert.deepEqual(world.otcs.downloads, []);
+
+  // falha do OTCS ao baixar: erro genérico, sem reatribuição
+  world.repo.upsert('AG-1', { nodeId: '5555' });
+  world.otcs.downloadNode = async () => { throw httpError(502, 'bad gateway'); };
+  r = await authThenStart(world);
+  assert.equal(r.status, 500);
+  assert.deepEqual(await r.json(), { error: 'Error al solicitar la firma.' });
+  assert.ok(world.logger.has('error', /\[START ERROR\].*HTTP 502/));
+  assert.deepEqual(world.otcs.task(3003, 2, 3004).assignees, [HUMAN_USER_ID]);
+  await world.close();
+});
+
+test('/start em sub-workflow com a pré-checagem ok: REASSIGN_REQUIRED como antes e, depois da reatribuição, valida de novo com o formulário', async () => {
+  const world = await verifyWorld();
+  seedStartFlow(world, { assignee: HUMAN_USER_ID });
+  let r = await authThenStart(world);
+  assert.equal(r.status, 409);
+  assert.equal((await r.json()).code, 'REASSIGN_REQUIRED');
+  assert.deepEqual(world.otcs.downloads, ['1001'], 'a pré-checagem baixou o nó das dicas');
+  assert.equal(world.adobe.created.length, 0);
+
+  // a reatribuição aconteceu, mas agora o formulário (fonte da verdade) aponta para um nó HTML: valida de novo
+  world.otcs.assign(3003, 2, INTEGRATION_USER_ID);
+  world.otcs.formFields.DocID.value = '7777';
+  world.otcs.nodeContents['7777'] = HTML_DOC;
+  r = await authThenStart(world, { ...FIELDS, nodeId: '7777' });
+  assert.equal(r.status, 422);
+  assert.deepEqual(await r.json(), NOT_PDF_BODY);
   assert.equal(world.adobe.created.length, 0);
   await world.close();
 });

@@ -354,14 +354,19 @@ test('/start: sem SIGNATURE_SECRET configurado falha fechado', async () => {
   await world.close();
 });
 
-test('/start: duplicado (mesmo documento e destinatários em 15 min) => 409', async () => {
+test('/start: duplicado (acordo ABERTO do mesmo documento e destinatários em 15 min) => 409 DUPLICATE_OPEN', async () => {
   const world = await buildWorld({ listen: true });
   assert.equal((await post(world, '/start', startBody(world))).status, 200);
 
   world.clock.advance(5 * 60 * 1000);
   const dup = await post(world, '/start', startBody(world));
   assert.equal(dup.status, 409);
-  assert.match((await dup.json()).error, /ya he sido enviado recientemente/);
+  assert.deepEqual(await dup.json(), {
+    error: 'Este documento ya tiene una solicitud de firma abierta para este destinatario en otro flujo.',
+    code: 'DUPLICATE_OPEN',
+    id: 'AG-1',
+    workflowId: '3003'
+  });
   assert.equal(world.adobe.created.length, 1);
 
   // destinatários em outra ordem continuam duplicados; outros destinatários não
@@ -436,22 +441,26 @@ test('/start: duas requisições concorrentes iguais => só uma cria o acordo, a
   world.otcs.downloadNode = async (id) => { await gate; return download(id); };
 
   const first = world.signatureService.start(startBody(world));
-  // mesma chave com e-mails em outra ordem: ainda é a mesma requisição
-  const second = world.signatureService.start(startBody(world, { userEmail1: 'two@example.com', userEmail2: 'one@example.com' }));
-  await assert.rejects(second, (e) => e.status === 409 && /ya he sido enviado recientemente/.test(e.body.error));
-  assert.equal(world.otcs.downloads.length, 0, 'a segunda nem chegou ao OTCS');
+  try {
+    // mesma chave com e-mails em outra ordem: ainda é a mesma requisição
+    const second = world.signatureService.start(startBody(world, { userEmail1: 'two@example.com', userEmail2: 'one@example.com' }));
+    await assert.rejects(second, (e) => e.status === 409 && e.body.code === 'START_IN_PROGRESS' && /envío en curso/.test(e.body.error));
+    assert.equal(world.otcs.downloads.length, 0, 'a segunda nem chegou ao OTCS');
 
-  // outro documento ou outros destinatários não são bloqueados
-  const other = world.signatureService.start(startBody(world, { nodeId: 2002, userEmail2: 'other@example.com' }));
-  release();
-  const [a, b] = await Promise.all([first, other]);
-  assert.notEqual(a.id, b.id);
-  assert.equal(world.adobe.created.length, 2);
-  await Promise.all([a.sendOn, b.sendOn]);
+    // outro documento ou outros destinatários não são bloqueados
+    const other = world.signatureService.start(startBody(world, { nodeId: 2002, userEmail2: 'other@example.com' }));
+    release();
+    const [a, b] = await Promise.all([first, other]);
+    assert.notEqual(a.id, b.id);
+    assert.equal(world.adobe.created.length, 2);
+    await Promise.all([a.sendOn, b.sendOn]);
 
-  // depois de concluída, a chave foi liberada e quem barra é o findRecent (mesmo 409)
-  await assert.rejects(world.signatureService.start(startBody(world)), (e) => e.status === 409);
-  await world.close();
+    // depois de concluída, a chave foi liberada e quem barra é a trava de acordo aberto (DUPLICATE_OPEN)
+    await assert.rejects(world.signatureService.start(startBody(world)), (e) => e.status === 409 && e.body.code === 'DUPLICATE_OPEN');
+  } finally {
+    release(); // um assert que falhe não pode deixar o primeiro envio preso no gate
+    await world.close();
+  }
 });
 
 test('/start: a chave em andamento é liberada em caso de erro (nova tentativa é permitida)', async () => {

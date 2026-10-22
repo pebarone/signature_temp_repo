@@ -15,6 +15,8 @@ const { createApp } = require('../../server/app');
 const { sign, signStart } = require('../../server/http/middleware/hmac');
 
 const PDF = Buffer.from('%PDF-1.4\n% fake signed pdf\n');
+// Conteúdo padrão de qualquer nó baixado do OTCS falso (precisa ter o cabeçalho %PDF-: o /start confere antes do Adobe)
+const ORIGINAL_PDF = Buffer.from('%PDF-1.4 original');
 const T0 = Date.parse('2026-06-22T12:00:00.000Z');
 
 function makeClock(start = T0) {
@@ -136,6 +138,7 @@ const HUMAN_USER_ID = 279463;
   define o dono das tarefas e `assign(processId, taskId, userId)` reatribui (o REASSIGN da página). Com a tarefa fora do
   usuário de integração, getTaskForm e sendOnWorkflow respondem 403, como no OTCS.
   Atributos do workflow (status/info): `workflowAttributes[processId]` ({ rótulo: valor }); sem entrada, vêm de `formFields`.
+  Conteúdo baixado: `nodeContents[nodeId]` (Buffer; padrão um PDF) simula um HTML/DOCX no lugar do PDF.
   Nós: `missingNodes` (inexistentes; addVersion falha com `missingNodeStatus`, 404 por padrão; a spec do OTCS usa 400) e
   `lockedNodes` (existem, mas addVersion falha com `lockedNodeStatus`, 409). `nodeExists` consulta `missingNodes`;
   `nodeExistsFailures` faz as próximas N sondagens falharem com `nodeExistsFailStatus`.
@@ -159,6 +162,7 @@ function makeOtcs(calls = []) {
     nodeExistsFailStatus: 500,
     sendons: [],
     downloads: [],
+    nodeContents: {},        // nodeId -> Buffer devolvido por downloadNode (padrão: ORIGINAL_PDF); simula HTML/DOCX no lugar do PDF
     sendOnFailsAlways: false,
     sendOnFailures: 0,       // próximos N SendOn (de qualquer tipo) falham
     sendOnFailStatus: 500,
@@ -222,7 +226,7 @@ function makeOtcs(calls = []) {
     async downloadNode(nodeId) {
       calls.push(['otcs.download', String(nodeId)]);
       otcs.downloads.push(String(nodeId));
-      return Buffer.from('%PDF-1.4 original');
+      return otcs.nodeContents[String(nodeId)] ?? ORIGINAL_PDF;
     },
     async uploadToFolder(folderId, buffer, fileName, { agreementId } = {}) {
       calls.push(['otcs.upload', String(folderId), fileName]);
@@ -515,6 +519,6 @@ function seedStartFlow(world, { processId = '3003', subprocessId = '3004', stage
 const basicHeader = (user, pass) => 'Basic ' + Buffer.from(`${user}:${pass}`).toString('base64');
 
 module.exports = {
-  PDF, T0, START_TASK_NAME, SIGN_TASK_NAME, INTEGRATION_USER_ID, HUMAN_USER_ID, makeClock, makeLogger, makeAdobe, makeOtcs, makeTokenStore, httpError, tmpDir, buildWorld,
+  PDF, ORIGINAL_PDF, T0, START_TASK_NAME, SIGN_TASK_NAME, INTEGRATION_USER_ID, HUMAN_USER_ID, makeClock, makeLogger, makeAdobe, makeOtcs, makeTokenStore, httpError, tmpDir, buildWorld,
   seedAdobeForEvent, seedAgreement, webhookPayload, waitFor, startBody, startBodyV1, seedStartFlow, basicHeader
 };

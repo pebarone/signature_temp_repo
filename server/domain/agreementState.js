@@ -159,6 +159,36 @@ function failurePatch(rec, stage, message, nowMs, backoff, { permanent = false }
   };
 }
 
+// Acordo aberto: sem resultado final e sem a disposição enviada (o mesmo critério de agreementRepository.openByWorkflow)
+const isOpenAgreement = (rec) => !rec.finalKind && !rec.sendonDone;
+
+// O que a página mostra quando o /start encontra o acordo do próprio fluxo já final (por kind)
+const FINAL_NOTICES = {
+  [KINDS.FINAL_OK]: 'Este documento ya fue firmado en Adobe Sign.',
+  [KINDS.FINAL_REJECTED]: 'El firmante rechazó la solicitud de firma en Adobe Sign.',
+  [KINDS.FINAL_EXPIRED]: 'La solicitud de firma expiró en Adobe Sign.',
+  [KINDS.FINAL_RECALLED]: 'La solicitud de firma fue cancelada en Adobe Sign.',
+  [KINDS.FINAL_CONVERSION_FAILED]: 'Adobe Sign no pudo procesar el documento (verifique que sea un PDF válido).'
+};
+const FINAL_NOTICE_FALLBACK = 'La solicitud de firma de este documento ya terminó en Adobe Sign.';
+
+/*
+  { kind, state, message } de um acordo que já tem resultado final (ou a disposição enviada); null se ainda está aberto.
+  A frase final diz o que acontece com o fluxo: continua sozinho (pipeline pendente), já continuou (disposição enviada)
+  ou precisa de revisão (needs_attention não se resolve sozinho).
+*/
+function finalNotice(rec) {
+  if (!rec || isOpenAgreement(rec)) return null;
+  const outcome = rec.state === STATES.NEEDS_ATTENTION
+    ? 'El flujo requiere revisión del administrador.'
+    : (rec.sendonDone ? 'El flujo ya continuó según el resultado.' : 'El flujo continuará automáticamente según el resultado.');
+  return {
+    kind: rec.finalKind || null,
+    state: rec.state || null,
+    message: `${FINAL_NOTICES[rec.finalKind] || FINAL_NOTICE_FALLBACK} ${outcome}`
+  };
+}
+
 // Etapa start pendente: o pedido de firma ainda não foi enviado (SendOn da tarefa de início)
 const isStartPending = (rec) => !rec.startSendonDone && !rec.sendonDone && !!rec.workflowId;
 
@@ -193,5 +223,5 @@ function shouldPoll(rec, nowMs, maxAgeDays = 0) {
 module.exports = {
   STATES, ATTENTION_KINDS, FINAL_PLANS, planFor, dispositionFor, finalPatch, attentionPatch, reopenPatch,
   pdfDeliveredPatch, completedPatch, startDonePatch, backoffDelay, isPermanentHttpError, failurePatch,
-  isStartPending, hasPendingWork, isDue, isRetryable, shouldPoll
+  isStartPending, hasPendingWork, isDue, isRetryable, shouldPoll, isOpenAgreement, finalNotice
 };

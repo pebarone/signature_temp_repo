@@ -204,7 +204,22 @@ while it is still assigned to the human user (`task_assignees` of `/v2/workflows
   `GET /v2/workflows/status/info?workid={id}` (same labels, validation and payload check);
 - still with the human user, **sub-workflow**: `409` `{ error: "La tarea debe asignarse al usuario de integración antes del envío.",
   code: "REASSIGN_REQUIRED", handoff }` and nothing is created (`status/info` only returns the parent's attributes and the form
-  needs the task assigned to the integration user). The page must reassign first and call `/auth` + `/start` again.
+  needs the task assigned to the integration user). The page must reassign first and call `/auth` + `/start` again. Before
+  answering `REASSIGN_REQUIRED` the server **pre-checks** with the request body, which here are only *hints* (never used to
+  create an agreement; needs a numeric `nodeId` and at least one e-mail): it downloads the node and runs the PDF validation and
+  the open-agreement lock below. If either fails the error is returned (`NOT_PDF` / `DUPLICATE_OPEN`) and the task is **not**
+  reassigned. After the reassignment the normal path re-reads the form (the source of truth) and validates everything again.
+  *Open item:* a strict "agreement before reassignment" order in a sub-workflow needs a way to read the sub-workflow attributes
+  without owning the task; the candidate `GET /v2/workflows/status/info?workid=<subworkflow id>` has not been validated yet.
+
+The rule is **agreement → reassignment → SendOn**: the page only reassigns once an agreement exists (the `SendOn` is the
+server's, in the background).
+
+**PDF validation.** After downloading the `DocID` node and before creating anything in Adobe, the content must have `%PDF-`
+within its first 1024 bytes (the PDF spec tolerates leading garbage). Otherwise `422 { error: "El documento a firmar no es un
+PDF válido.", code: "NOT_PDF" }`, nothing is created in Adobe and the task is untouched. The `warn` log (Spanish) has the nodeId,
+the size and a simple sniffed type (HTML, ZIP/Office, text, empty, unknown), never the content. (Adobe would accept the bytes as
+`application/pdf` and only cancel the agreement later with a conversion problem.)
 
 Every `200` carries `handoff: { workflowId, subworkflowId, taskId, integrationUserId, assigned }` (numbers): what the page
 reassigns when `assigned` is `false`. It is also returned with `existing: true` while the start task is still current (it is
@@ -213,11 +228,37 @@ user the background `SendOn` waits (no error log, normal retry backoff; when the
 `needs_attention` asking to reopen the page). Repeating `/start` after the REASSIGN (`existing: true`) resumes the start
 step immediately instead of waiting for the backoff.
 
-**Idempotency** (only with the validation): if there is already a non-final agreement (no final result and no disposition
-sent) for the same `workflowId` + resolved `subworkflowId` + `nodeId`, `/start` returns `200`
-`{ message: "Signature already requested. ID: ...", id, existing: true }` and creates nothing (page reload after a network
-error); it also applies when the start task has already advanced. With `START_VERIFY_WORKFLOW=false` the previous behaviour
-is kept (the 15 min duplicate check applies in both modes).
+**Idempotency** (only with the validation): the same flow sees the agreement of its current cycle, even when it is already final.
+`/start` looks up the **most recent** agreement for the same `workflowId` + resolved `subworkflowId` + `nodeId` and creates
+nothing if there is one (page reload after a network error):
+
+- while the start task is still `current`, it is the most recent one that is **not completed** (`sendonDone=false`): open, or final
+  with the result not yet applied to the flow (the QA incident). **New cycle exception:** if the most recent one is **completed**
+  (`sendonDone=true`, including `completedExternally`), its result was already applied and the map went back to the send step
+  (e.g. `Rechazado` looping back, same `DocID`): the old agreement is ignored and the send proceeds normally, creating a new
+  agreement (the lock and the PDF validation apply as usual). The sub-workflow pre-check likewise only skips when there is an
+  agreement of the current (not completed) cycle;
+- once the start task has advanced (reload after the `SendOn`), it is the most recent in any state, completed included.
+
+When there is one:
+
+- still open (no final result and no disposition sent): `200 { message: "Signature already requested. ID: ...", id, existing: true, handoff? }`;
+- already final or completed: `200 { message, id, existing: true, final: { kind, state, message }, handoff? }` instead of a
+  `409`. `final.message` (Spanish, also used as the response `message`) explains the result by `kind` (`final_ok`: already signed;
+  `final_rejected`: the signer rejected it; `final_expired`; `final_recalled`: cancelled in Adobe; `final_conversion_failed`:
+  "Adobe Sign no pudo procesar el documento (verifique que sea un PDF válido)") plus "El flujo continuará automáticamente según el
+  resultado." (or "already continued" once the disposition was sent, or "requires administrator review" for `needs_attention`).
+  The `handoff` still applies (the agreement exists, so the page can reassign) and the start/reconcile kick still happens: with the
+  start step pending, the reconciliation sends the pending start-task `SendOn` and then the disposition.
+
+**Duplicate lock (15 min).** It only blocks an **open** agreement (no final result, no disposition sent) with the same
+`nodeId` and the same *set* of e-mails (case and order ignored) created within the window in **another** workflow/subworkflow:
+`409 { error: "Este documento ya tiene una solicitud de firma abierta para este destinatario en otro flujo.", code: "DUPLICATE_OPEN", id, workflowId }`
+(the id/workflow of the open agreement). A final or completed agreement never blocks. With `START_VERIFY_WORKFLOW=false` (no flow
+identity) only the "open" criterion applies. A concurrent identical request still being processed answers
+`409 { code: "START_IN_PROGRESS" }`.
+
+Other `/start` errors: `422 NOT_PDF` (above), `409 DUPLICATE_OPEN`, `409 REASSIGN_REQUIRED` (+ `handoff`), `409 START_IN_PROGRESS`.
 
 **Legacy (migration window of the WebReports, OFF by default).** `START_LEGACY_SIGNATURE=true` accepts `GET /auth`
 (timestamp only) and the v1 signature on `POST /start`; `START_LEGACY_GET_ENABLED=true` accepts the old
@@ -312,7 +353,7 @@ it does not provide an atomic lock against other processes writing the same node
     ├── index.js          # entrypoint: wires real dependencies, poller, listen, keepalive
     ├── app.js            # createApp(deps): Express app with injected dependencies
     ├── config/           # env -> config, storage selection per platform
-    ├── domain/           # pure functions: eventPolicy (events), agreementState (state machine), workflowSteps (task lookup by name), externalId
+    ├── domain/           # pure functions: eventPolicy (events), agreementState (state machine), workflowSteps (task lookup by name), externalId, documentType (PDF header check)
     ├── infra/            # SQLite (db, agreementRepository, legacyImport), tokenStore, adobeClient, otcsClient, logger
     ├── services/         # reconciliationService (start -> verify -> PDF -> disposition), signatureService (/start), poller
     ├── http/             # routes (webhook, start, admin, logs) and middleware (hmac, basicAuth)

@@ -1,7 +1,8 @@
 // infra/agreementRepository.js
 // Repositório de acordos/eventos sobre SQLite (better-sqlite3, síncrono).
 // Interface usada pelos services: get, has, upsert, list, listPending, listPollable, listAttentionToReopen, recordEvent,
-// listEvents, findRecent, findOpenByWorkflow, consumeNonce (nonces do /start), countByState, transaction.
+// listEvents, findOpenRecent, findOpenByWorkflow, findLatestByWorkflow, consumeNonce (nonces do /start), countByState,
+// transaction.
 
 // [chave JS, coluna SQL, tipo]
 const COLUMNS = [
@@ -62,6 +63,9 @@ function fromSql(value, type) {
   return value === undefined ? null : value;
 }
 
+// Conjunto de e-mails sem caixa nem ordem (e sem repetição): a identidade dos destinatários na trava anti-duplicidade
+const emailSetKey = (emails) => [...new Set(emails.map((e) => String(e).trim().toLowerCase()))].sort().join('|');
+
 function createAgreementRepository(db, { now = () => new Date(), maxEvents = 50 } = {}) {
   const nowIso = () => now().toISOString();
 
@@ -98,11 +102,19 @@ function createAgreementRepository(db, { now = () => new Date(), maxEvents = 50 
       `SELECT * FROM agreements WHERE final_kind IS NULL AND sendon_done = 0 AND state != 'needs_attention'
        ORDER BY created_at, id`
     ),
-    recent: db.prepare('SELECT * FROM agreements WHERE node_id = ? AND created_at > ?'),
+    // Acordos ABERTOS (sem resultado final e sem SendOn do resultado) do documento criados depois do corte
+    recentOpen: db.prepare(
+      `SELECT * FROM agreements WHERE node_id = ? AND created_at > ? AND final_kind IS NULL AND sendon_done = 0`
+    ),
     // Acordo ainda não final (sem resultado final e sem SendOn do resultado) do mesmo workflow/subprocesso/documento
     openByWorkflow: db.prepare(
       `SELECT * FROM agreements WHERE workflow_id = ? AND subworkflow_id = ? AND node_id = ?
          AND final_kind IS NULL AND sendon_done = 0 ORDER BY created_at DESC, id DESC LIMIT 1`
+    ),
+    // O acordo mais recente do mesmo workflow/subprocesso/documento, em qualquer estado
+    latestByWorkflow: db.prepare(
+      `SELECT * FROM agreements WHERE workflow_id = ? AND subworkflow_id = ? AND node_id = ?
+         ORDER BY created_at DESC, id DESC LIMIT 1`
     ),
     purgeNonces: db.prepare('DELETE FROM start_nonces WHERE expires_at < ?'),
     insertNonce: db.prepare('INSERT OR IGNORE INTO start_nonces (nonce, expires_at) VALUES (?, ?)'),
@@ -199,17 +211,30 @@ function createAgreementRepository(db, { now = () => new Date(), maxEvents = 50 
       }));
     },
 
-    // Mesmo documento + mesmos destinatários criados dentro da janela (anti-duplicidade do /start)
-    findRecent(nodeId, emails, thresholdMs) {
+    /*
+      Trava anti-duplicidade do /start: acordo ABERTO (sem resultado final e sem SendOn do resultado) do mesmo documento + mesmos
+      destinatários (conjunto, sem caixa nem ordem) criado dentro da janela. exceptFlow ({ workflowId, subworkflowId }) exclui
+      o próprio fluxo: só vale o acordo aberto de OUTRO fluxo. Acordo final ou concluído nunca é devolvido.
+    */
+    findOpenRecent(nodeId, emails, thresholdMs, exceptFlow = null) {
       const cutoff = new Date(now().getTime() - thresholdMs).toISOString();
-      const key = [...emails].sort().join('|');
-      return stmts.recent.all(String(nodeId), cutoff).map(rowToRecord).find((r) =>
-        Array.isArray(r.emails) && [...r.emails].sort().join('|') === key) || null;
+      const key = emailSetKey(emails);
+      return stmts.recentOpen.all(String(nodeId), cutoff).map(rowToRecord).find((r) =>
+        Array.isArray(r.emails) && emailSetKey(r.emails) === key
+        && !(exceptFlow
+          && String(r.workflowId ?? '') === String(exceptFlow.workflowId ?? '')
+          && String(r.subworkflowId ?? '') === String(exceptFlow.subworkflowId ?? ''))) || null;
     },
 
     // Idempotência do /start: acordo não final do mesmo workflow + subprocesso + documento (ou null)
     findOpenByWorkflow(workflowId, subworkflowId, nodeId) {
       const row = stmts.openByWorkflow.get(String(workflowId), String(subworkflowId), String(nodeId));
+      return row ? rowToRecord(row) : null;
+    },
+
+    // O acordo mais recente do mesmo workflow + subprocesso + documento, final ou não (ou null)
+    findLatestByWorkflow(workflowId, subworkflowId, nodeId) {
+      const row = stmts.latestByWorkflow.get(String(workflowId), String(subworkflowId), String(nodeId));
       return row ? rowToRecord(row) : null;
     },
 

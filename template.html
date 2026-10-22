@@ -27,6 +27,8 @@ REASIGNADO_OK
       --ok-suave: #e7f6ee;
       --error: #b42318;
       --error-suave: #fdecea;
+      --aviso: #b54708;
+      --aviso-suave: #fef0c7;
       --pendiente: #7a8494;
       --radio: 12px;
     }
@@ -93,6 +95,7 @@ REASIGNADO_OK
     .paso[data-estado="activo"], .paso[data-estado="hecho"] { color: var(--texto); }
     .paso[data-estado="activo"] { font-weight: 600; }
     .paso[data-estado="error"] { color: var(--error); font-weight: 600; }
+    .paso[data-estado="aviso"] { color: var(--aviso); font-weight: 600; }
     .paso-icono {
       display: inline-flex;
       flex: 0 0 22px;
@@ -120,6 +123,8 @@ REASIGNADO_OK
     }
     .paso[data-estado="error"] .paso-icono { background: var(--error); border-color: var(--error); color: #fff; }
     .paso[data-estado="error"] .paso-icono::before { content: "!"; font-size: 14px; font-weight: 700; line-height: 1; }
+    .paso[data-estado="aviso"] .paso-icono { background: var(--aviso); border-color: var(--aviso); color: #fff; }
+    .paso[data-estado="aviso"] .paso-icono::before { content: "!"; font-size: 14px; font-weight: 700; line-height: 1; }
     @keyframes girar { to { transform: rotate(360deg); } }
     .resultado { display: flex; justify-content: center; margin-top: 24px; }
     .insignia {
@@ -144,9 +149,12 @@ REASIGNADO_OK
     @keyframes marcar { to { transform: rotate(45deg) scale(1); } }
     .insignia.error { background: var(--error-suave); color: var(--error); font-size: 30px; font-weight: 700; line-height: 1; }
     .insignia.error::before { content: "!"; }
+    .insignia.aviso { background: var(--aviso-suave); color: var(--aviso); font-size: 30px; font-weight: 700; line-height: 1; }
+    .insignia.aviso::before { content: "!"; }
     .estado { min-height: 1.5em; margin: 16px 0 0; text-align: center; font-weight: 600; overflow-wrap: anywhere; }
     .estado.ok { color: var(--ok); }
     .estado.error { color: var(--error); }
+    .estado.aviso { color: var(--aviso); }
     .acuerdo { margin: 6px 0 0; text-align: center; font-size: 13px; color: var(--texto-suave); overflow-wrap: anywhere; }
     .acciones { display: grid; margin-top: 24px; }
     .btn {
@@ -256,7 +264,7 @@ REASIGNADO_OK
   const TEXTO_PASO = { envio: 'Enviando a Adobe Sign...', asignar: 'Asignando la tarea...' };
 
   /* Unico estado de la pagina. */
-  const state = { ocupado: false, paso: 'envio', acuerdoId: null, existente: false, handoff: null };
+  const state = { ocupado: false, paso: 'envio', acuerdoId: null, existente: false, handoff: null, final: null };
 
   /* ---------- Utilidades ---------- */
 
@@ -282,6 +290,25 @@ REASIGNADO_OK
   }
 
   const reasignaRequerido = (r) => !r.ok && r.data.code === 'REASSIGN_REQUIRED';
+
+  /* Resultado final del acuerdo que el flujo ya tenia ({ kind, state, message }); null si el acuerdo sigue abierto. */
+  function finalDe(data) {
+    return data.final && typeof data.final === 'object' && typeof data.final.message === 'string' ? data.final : null;
+  }
+
+  /* Error de una respuesta del servidor. Conserva el codigo para mostrarlo bien:
+       NOT_PDF: el documento no es un PDF. Se puede subir una version PDF y reintentar (Reintentar visible);
+       DUPLICATE_OPEN: ya hay una solicitud abierta del mismo documento en otro flujo (muestra su ID y flujo). */
+  function errorServidor(r, porDefecto) {
+    const err = new Error(mensajeDeError(r.data) || porDefecto);
+    err.codigo = typeof r.data.code === 'string' ? r.data.code : '';
+    if (err.codigo === 'NOT_PDF') {
+      err.detalle = 'Suba una versión PDF del documento y presione "Reintentar".';
+    } else if (err.codigo === 'DUPLICATE_OPEN' && r.data.id) {
+      err.detalle = 'Acuerdo abierto: ' + r.data.id + (r.data.workflowId ? ' (flujo ' + r.data.workflowId + ')' : '');
+    }
+    return err;
+  }
 
   /* ---------- Interfaz ---------- */
 
@@ -346,24 +373,39 @@ REASIGNADO_OK
     if (EMAIL_2) lista.appendChild(filaFirmante('Firmante 2', EMAIL_2));
   }
 
+  /* Linea secundaria bajo el estado (ID del acuerdo, ayuda del error). */
+  function mostrarDetalle(texto) {
+    const el = document.getElementById('acuerdo');
+    el.textContent = texto;
+    el.hidden = false;
+  }
+
   function mostrarExito() {
     ORDEN_PASOS.forEach((p) => pintarPaso(p, 'hecho'));
     mostrarInsignia('ok');
     setEstado(state.existente ? 'La solicitud de firma ya estaba enviada.' : 'Documento enviado a firma.', 'ok');
-    if (state.acuerdoId) {
-      const el = document.getElementById('acuerdo');
-      el.textContent = 'ID del acuerdo: ' + state.acuerdoId;
-      el.hidden = false;
-    }
+    if (state.acuerdoId) mostrarDetalle('ID del acuerdo: ' + state.acuerdoId);
     document.getElementById('btn-volver').hidden = false;
   }
 
-  /* Los errores de datos no se reintentan: repetir la misma validacion no cambia nada. */
+  /* El acuerdo del flujo ya termino en Adobe Sign (firmado, rechazado, expirado, cancelado o error de conversion):
+     se muestra su resultado y NO el exito del envio. El servidor sigue el flujo solo segun ese resultado. */
+  function mostrarAviso() {
+    ORDEN_PASOS.forEach((p) => pintarPaso(p, p === 'listo' ? 'aviso' : 'hecho'));
+    mostrarInsignia('aviso');
+    setEstado(state.final.message, 'aviso');
+    if (state.acuerdoId) mostrarDetalle('ID del acuerdo: ' + state.acuerdoId);
+    document.getElementById('btn-volver').hidden = false;
+  }
+
+  /* Los errores de datos no se reintentan: repetir la misma validacion no cambia nada.
+     NOT_PDF y DUPLICATE_OPEN si dejan Reintentar: el usuario puede subir un PDF o cerrar la otra solicitud. */
   function mostrarError(err) {
     console.error('[firma]', err);
     if (!err.sinReintento) pintarPaso(state.paso, 'error');
     mostrarInsignia('error');
     setEstado(err.message || 'No se pudo completar el envío.', 'error');
+    if (err.detalle) mostrarDetalle(err.detalle);
     document.getElementById('btn-reintentar').hidden = Boolean(err.sinReintento);
   }
 
@@ -451,12 +493,17 @@ REASIGNADO_OK
       return;
     }
     if (reasignaRequerido(r)) throw new Error(MSG_ASIGNAR);
-    if (!r.ok) throw new Error(mensajeDeError(r.data) || MSG_ASIGNAR);
+    if (!r.ok) throw errorServidor(r, MSG_ASIGNAR);
     if (r.data.handoff && r.data.handoff.assigned === false) throw new Error(MSG_ASIGNAR);
     state.handoff = r.data.handoff || null;
+    state.final = finalDe(r.data) || state.final;
   }
 
-  /* Envio del acuerdo. Si el servidor exige reasignar antes (sub-flujo), reasigna y repite /start una sola vez. */
+  /* Envio del acuerdo. Si el servidor exige reasignar antes (sub-flujo), reasigna y repite /start una sola vez.
+     Orden: acuerdo, luego reasignacion, luego el SendOn (lo hace el servidor). En el sub-flujo el servidor valida antes
+     lo que puede (PDF y solicitud abierta en otro flujo): si falla, responde el error y NO pide reasignar.
+     Si el flujo ya tiene su acuerdo (existing), el servidor lo devuelve aunque ya sea final (data.final):
+     la tarea se reasigna igual (el acuerdo existe) y al final se muestra ese resultado. */
   async function enviar() {
     let r = await iniciar();
     if (reasignaRequerido(r) && r.data.handoff) {
@@ -466,10 +513,11 @@ REASIGNADO_OK
       r = await iniciar();
       if (reasignaRequerido(r)) throw new Error(MSG_ASIGNAR);
     }
-    if (!r.ok) throw new Error(mensajeDeError(r.data) || 'No se pudo enviar la solicitud de firma.');
+    if (!r.ok) throw errorServidor(r, 'No se pudo enviar la solicitud de firma.');
     state.acuerdoId = r.data.id || null;
     state.existente = r.data.existing === true;
     state.handoff = r.data.handoff || null;
+    state.final = finalDe(r.data);
   }
 
   function validarDatos() {
@@ -494,7 +542,8 @@ REASIGNADO_OK
         await reasignar();
         await confirmarAsignacion();
       }
-      mostrarExito();
+      if (state.final) mostrarAviso();
+      else mostrarExito();
     } catch (err) {
       mostrarError(err);
     } finally {

@@ -25,14 +25,20 @@ function startRoutes({ config, logger, signatureService, startBasicAuth, verifyS
 
   async function runStart(fields, res, options) {
     try {
-      const { id, existing, handoff } = await signatureService.start(fields, options);
+      const { id, existing, handoff, final } = await signatureService.start(fields, options);
       // `message` mantém a compatibilidade com o template.html. `handoff` (quando há) diz à página o que reatribuir
       // ao usuário de integração depois do envio: { workflowId, subworkflowId, taskId, integrationUserId, assigned }.
       const extra = handoff ? { handoff } : {};
-      if (existing) return res.json({ message: `Signature already requested. ID: ${id}`, id, existing: true, ...extra });
+      if (existing) {
+        // Acordo do próprio fluxo já final (ou concluído): `final` = { kind, state, message } e a `message` da resposta é a
+        // dele (uma página antiga que só exibe `message` não anuncia um sucesso que não houve)
+        if (final) return res.json({ message: final.message, id, existing: true, final, ...extra });
+        return res.json({ message: `Signature already requested. ID: ${id}`, id, existing: true, ...extra });
+      }
       res.json({ message: `Signature requested. ID: ${id}`, id, ...extra });
     } catch (e) {
-      // Corpos de ServiceError são fixos e genéricos; o 409 REASSIGN_REQUIRED leva também { code, handoff }
+      // Corpos de ServiceError são fixos: 409 REASSIGN_REQUIRED leva { code, handoff }; 422 NOT_PDF e 409 START_IN_PROGRESS
+      // levam { code }; 409 DUPLICATE_OPEN leva { code, id, workflowId } do acordo aberto em outro fluxo
       if (e instanceof ServiceError) return res.status(e.status).json(e.body);
       logger.error(`[START ERROR] ${describeError(e)}`);
       res.status(500).json({ error: START_ERROR_MESSAGE });

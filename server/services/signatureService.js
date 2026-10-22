@@ -1,9 +1,11 @@
 // services/signatureService.js
-// Caso de uso do POST /start: valida o pedido contra o workflow do OTCS, baixa o PDF, cria o acordo no Adobe
-// e registra o mapeamento.
+// Caso de uso do POST /start: valida o pedido contra o workflow do OTCS, baixa o PDF (e confere que é um PDF), cria o acordo
+// no Adobe e registra o mapeamento.
 const { describeError } = require('../infra/util');
 const { buildExternalId } = require('../domain/externalId');
 const { locate, normalizeName } = require('../domain/workflowSteps');
+const { isPdf, sniffType, TYPE_LABELS } = require('../domain/documentType');
+const { finalNotice } = require('../domain/agreementState');
 
 class ServiceError extends Error {
   constructor(status, body) {
@@ -16,8 +18,20 @@ class ServiceError extends Error {
 const DUPLICATE_WINDOW_MS = 15 * 60 * 1000;
 const START_ERROR_MESSAGE = 'Error al solicitar la firma.';
 
-const duplicateError = () =>
-  new ServiceError(409, { error: 'El documento ya he sido enviado recientemente a este destinatario.' });
+// Trava de 15 min: só um acordo ABERTO do mesmo documento + destinatários em OUTRO fluxo (id e workflowId dele no corpo)
+const duplicateOpenError = (dup) => new ServiceError(409, {
+  error: 'Este documento ya tiene una solicitud de firma abierta para este destinatario en otro flujo.',
+  code: 'DUPLICATE_OPEN',
+  id: dup.id,
+  workflowId: dup.workflowId || null
+});
+// Requisição igual ainda em processamento neste servidor (o acordo dela ainda não está no repositório)
+const startInProgressError = () => new ServiceError(409, {
+  error: 'Ya hay un envío en curso para este documento y destinatario; espere unos segundos e intente nuevamente.',
+  code: 'START_IN_PROGRESS'
+});
+const notPdfError = () =>
+  new ServiceError(422, { error: 'El documento a firmar no es un PDF válido.', code: 'NOT_PDF' });
 const flowNotFound = () => new ServiceError(409, { error: 'Flujo no encontrado.' });
 const otcsUnavailable = () =>
   new ServiceError(503, { error: 'Content Server no disponible; intente nuevamente.' });
@@ -63,17 +77,79 @@ function createSignatureService({ repo, adobe, otcs, logger, config, now = () =>
     });
   }
 
+  // Baixa o documento do OTCS e confere que é um PDF (cabeçalho nos primeiros 1024 bytes). Não toca no Adobe: um HTML ou
+  // DOCX enviado como application/pdf só falharia depois, com o acordo cancelado por problema de conversão.
+  async function fetchPdf(nodeId) {
+    const content = Buffer.from(await otcs.downloadNode(nodeId));
+    if (!isPdf(content)) {
+      logger.warn(
+        `[START] El nodo ${nodeId} no es un PDF válido (${content.length} bytes; tipo detectado: ${TYPE_LABELS[sniffType(content)]}); `
+        + 'no se envía a Adobe Sign'
+      );
+      throw notPdfError();
+    }
+    return content;
+  }
+
+  // Acordo DESTE ciclo do fluxo, com a tarefa de início current: o mais recente de (workflow, subprocesso, nó) que ainda não foi
+  // concluído (sendonDone=false): aberto, ou final com o resultado ainda não aplicado ao fluxo (o caso do incidente de QA).
+  // Um acordo CONCLUÍDO (sendonDone=true, inclusive completedExternally) já teve o resultado aplicado: se a tarefa de início
+  // voltou a ser current, o mapa voltou ao envio e é um ciclo NOVO; o acordo antigo é ignorado.
+  function currentCycleAgreement(workflowId, subworkflowId, nodeId) {
+    const latest = repo.findLatestByWorkflow(workflowId, subworkflowId, nodeId);
+    return latest && !latest.sendonDone ? latest : null;
+  }
+
+  // Trava anti-duplicidade: acordo ABERTO do mesmo documento + destinatários criado na janela de 15 min. Com `flow`, só vale o
+  // de OUTRO fluxo; sem `flow` (caminho legado, sem validação do workflow), qualquer acordo aberto.
+  function assertNoOpenElsewhere(nodeId, emails, flow) {
+    const dup = repo.findOpenRecent(nodeId, emails, DUPLICATE_WINDOW_MS, flow);
+    if (!dup) return;
+    logger.warn(
+      `[START] El documento ${nodeId} ya tiene la solicitud de firma abierta ${dup.id} (workflow ${dup.workflowId || '-'}/${dup.subworkflowId || '-'}) `
+      + `para los mismos destinatarios${flow ? ` en otro flujo (este: ${flow.workflowId}/${flow.subworkflowId})` : ''}`
+    );
+    throw duplicateOpenError(dup);
+  }
+
+  /*
+    Sub-workflow com a tarefa ainda no usuário humano: o servidor não consegue ler o formulário (só quem tem a tarefa o lê) e
+    pede a reatribuição ANTES de existir acordo. Antes de pedir, valida o que dá com as DICAS do corpo (nodeId numérico e ao menos
+    um e-mail; nunca usadas para criar acordo): o documento é um PDF e não há acordo aberto dele em outro fluxo. Se falhar, o
+    erro sai aqui e a tarefa NÃO é reatribuída. Depois da reatribuição, o caminho normal relê o formulário e valida tudo de novo.
+    Sem dicas (ou com o acordo deste ciclo do fluxo já existente, não concluído) não há o que validar: segue para o
+    REASSIGN_REQUIRED. Um acordo concluído é de um ciclo anterior: a pré-checagem roda normalmente.
+  */
+  async function precheckBeforeReassign(input, handoff) {
+    const nodeHint = clean(input.nodeId);
+    const emailHints = dedupeEmails(parseEmails(input.userEmail1, input.userEmail2));
+    if (!/^\d+$/.test(nodeHint) || !emailHints.length) {
+      logger.info(`[START] Workflow ${handoff.workflowId}/${handoff.subworkflowId}: el pedido no trae nodeId/correos; se omite la prevalidación antes de reasignar`);
+      return;
+    }
+    if (currentCycleAgreement(handoff.workflowId, handoff.subworkflowId, nodeHint)) return;
+    assertNoOpenElsewhere(nodeHint, emailHints, { workflowId: handoff.workflowId, subworkflowId: handoff.subworkflowId });
+    try {
+      await fetchPdf(nodeHint);
+    } catch (e) {
+      if (e instanceof ServiceError) throw e;
+      logger.error(`[START ERROR] ${describeError(e)}`);
+      throw new ServiceError(500, { error: START_ERROR_MESSAGE });
+    }
+  }
+
   /*
     START_VERIFY_WORKFLOW: o OTCS é a fonte da verdade. Localiza a tarefa de início (precisa estar "current") e lê
     DocID/AttachID/nome/e-mails do OTCS; devolve { workflowId, subworkflowId, taskId, nodeId, attachId, docName, emails, handoff }.
     Origem dos atributos:
       - tarefa atribuída ao usuário de integração: formulário da tarefa (como sempre);
       - tarefa ainda no usuário humano + fluxo puro (subprocesso == processo): GET status/info do workflow;
-      - tarefa ainda no usuário humano + sub-workflow: 409 REASSIGN_REQUIRED (status/info só traz os atributos do pai).
+      - tarefa ainda no usuário humano + sub-workflow: 409 REASSIGN_REQUIRED (status/info só traz os atributos do pai), depois
+        da pré-checagem com as dicas do corpo (PDF e trava; ver precheckBeforeReassign).
     handoff = { workflowId, subworkflowId, taskId, integrationUserId, assigned } (números): o que a página deve
     reatribuir ao usuário de integração depois do envio (só quando assigned=false).
     O payload do navegador só é conferido (divergência => 409, detalhe só no log).
-    Se a tarefa de início já avançou mas o acordo deste documento ainda está aberto (recarga da página), devolve
+    Se a tarefa de início já avançou mas este fluxo já tem acordo do documento (recarga da página; aberto ou já final), devolve
     { existing: <registro> } (sem handoff: não há mais nada a reatribuir) em vez de 409.
   */
   async function resolveFromWorkflow(input) {
@@ -94,10 +170,12 @@ function createSignatureService({ repo, adobe, otcs, logger, config, now = () =>
       subprocessHint: clean(input.subworkflowId), processId: workflowId, latest: true
     });
     if (where !== 'current') {
-      // Recarga da página depois de um envio já processado: a tarefa de início pode já ter avançado (SendOn em background)
+      // Recarga da página depois de um envio já processado: a tarefa de início pode já ter avançado (SendOn em background).
+      // Aqui a tarefa de início NÃO está current: o acordo mais recente do fluxo vale em qualquer estado, inclusive concluído
+      // (já ficou final, ex.: conversão falhou, e a página o mostra)
       const nodeHint = clean(input.nodeId);
-      const open = where !== 'absent' && nodeHint ? repo.findOpenByWorkflow(workflowId, task.subprocessId, nodeHint) : null;
-      if (open) return { existing: open };
+      const known = where !== 'absent' && nodeHint ? repo.findLatestByWorkflow(workflowId, task.subprocessId, nodeHint) : null;
+      if (known) return { existing: known };
       logger.warn(`[START] Workflow ${workflowId}: tarefa de início ${where === 'absent' ? 'não encontrada' : `em "${where}"`}`);
       throw new ServiceError(409, { error: 'El flujo no está en el paso de envío a firma.' });
     }
@@ -154,7 +232,9 @@ function createSignatureService({ repo, adobe, otcs, logger, config, now = () =>
       }
       fields = Object.fromEntries(Object.entries(attrs || {}).map(([label, value]) => [label, { value }]));
     } else {
-      // Sub-workflow: status/info só devolve os atributos do pai e o formulário exige a tarefa no usuário de integração
+      // Sub-workflow: status/info só devolve os atributos do pai e o formulário exige a tarefa no usuário de integração.
+      // A regra é reatribuir só com acordo gerado: aqui ainda não há, então valida antes o que as dicas do corpo permitem
+      await precheckBeforeReassign(input, handoff);
       logger.info(`[START] Workflow ${workflowId}/${task.subprocessId}: tarefa ${task.taskId} ainda no usuário; a página deve reatribuí-la antes do envio`);
       throw new ServiceError(409, {
         error: 'La tarea debe asignarse al usuario de integración antes del envío.',
@@ -205,13 +285,40 @@ function createSignatureService({ repo, adobe, otcs, logger, config, now = () =>
     };
   }
 
+  // Resposta para o acordo que este fluxo já tem. Aberto: como sempre. Já final (ou concluído): leva também `final`
+  // ({ kind, state, message }), para a página explicar o resultado em vez do sucesso do envio. Em ambos, o acordo existe,
+  // então a página pode reatribuir (handoff) e o pipeline faz o SendOn pendente da tarefa de início e a disposição.
+  function existingResult(rec, handoff) {
+    const final = finalNotice(rec);
+    logger.info(final
+      ? `[START] Workflow ${rec.workflowId}/${rec.subworkflowId}: la solicitud de firma ${rec.id} ya terminó (${final.kind}, estado ${final.state}); no se crea otra`
+      : `[START] Workflow ${rec.workflowId}/${rec.subworkflowId}: ya existe la solicitud de firma ${rec.id}`);
+    // Etapa start ainda pendente (ex.: aguardando a reatribuição da página): retoma agora, sem esperar o backoff.
+    // Com resultado final, essa retomada reconcilia: SendOn da tarefa de início e depois a disposição.
+    const pending = !!rec.workflowId && !rec.startSendonDone && !rec.sendonDone;
+    return {
+      id: rec.id,
+      existing: true,
+      sendOn: pending ? kickStart(rec.id, { existing: true }) : Promise.resolve(),
+      handoff,
+      ...(final ? { final } : {})
+    };
+  }
+
   /*
     options.forceVerify: valida contra o OTCS mesmo com START_VERIFY_WORKFLOW=false (autenticação legada que não
     vincula o payload: assinatura v1 e GET /start).
-    Devolve { id, sendOn, handoff? } ou, se já existe acordo não final do mesmo workflow + subprocesso + documento
-    (só com validação do OTCS), { id, existing: true, sendOn, handoff? } sem criar outro. `handoff` só vem com a
-    validação do OTCS e com a tarefa de início ainda ativa. No caso existing e com o SendOn ainda pendente, a etapa start
-    é retomada (onCreated(id, { existing: true })): depois do REASSIGN da página, o segundo /start dispara o SendOn já.
+    Devolve { id, sendOn, handoff? } ou, se este fluxo já tem acordo do documento (mesmo workflow + subprocesso + documento,
+    só com validação do OTCS), { id, existing: true, sendOn, handoff?, final? } sem criar outro: com a tarefa de início ainda
+    current, o acordo mais recente deste ciclo (aberto, ou final com sendonDone=false); com ela já avançada, o mais recente em
+    qualquer estado. Já final ou concluído leva `final` ({ kind, state, message }). Com a tarefa current e o acordo mais recente
+    CONCLUÍDO (sendonDone=true), o fluxo voltou ao envio: ciclo novo, o antigo é ignorado e o envio segue normal (trava e PDF
+    valem). `handoff` só vem com a validação do OTCS
+    e com a tarefa de início ainda ativa. No caso existing e com o SendOn ainda pendente, a etapa start é retomada
+    (onCreated(id, { existing: true })): depois do REASSIGN da página, o segundo /start dispara o SendOn já.
+    Ordem: o acordo existe antes da reatribuição e do SendOn (a página só reatribui com acordo gerado).
+    NOT_PDF (422): o documento baixado não é um PDF; nada é criado no Adobe. DUPLICATE_OPEN (409): o mesmo documento e
+    destinatários já têm um acordo ABERTO, criado há menos de 15 min, em OUTRO fluxo (final ou concluído nunca bloqueia).
   */
   async function start(input, { forceVerify = false } = {}) {
     input = input || {};
@@ -219,16 +326,14 @@ function createSignatureService({ repo, adobe, otcs, logger, config, now = () =>
     let { docName } = input;
     let emails;
     let handoff;
-    if (config.startVerifyWorkflow || forceVerify) {
+    const verified = config.startVerifyWorkflow || forceVerify;
+    if (verified) {
       const resolved = await resolveFromWorkflow(input);
       handoff = resolved.handoff;
-      const open = resolved.existing || repo.findOpenByWorkflow(resolved.workflowId, resolved.subworkflowId, resolved.nodeId);
-      if (open) {
-        logger.info(`[START] Workflow ${open.workflowId}/${open.subworkflowId}: ya existe la solicitud de firma ${open.id}`);
-        // Etapa start ainda pendente (ex.: aguardando a reatribuição da página): retoma agora, sem esperar o backoff
-        const pending = !!open.workflowId && !open.startSendonDone && !open.sendonDone;
-        return { id: open.id, existing: true, sendOn: pending ? kickStart(open.id, { existing: true }) : Promise.resolve(), handoff };
-      }
+      // O mesmo fluxo vê o acordo do ciclo dele, mesmo se já for final mas ainda não concluído (a trava de 15 min abaixo só olha
+      // OUTROS fluxos). resolved.existing: a tarefa de início já avançou, o mais recente em qualquer estado
+      const known = resolved.existing || currentCycleAgreement(resolved.workflowId, resolved.subworkflowId, resolved.nodeId);
+      if (known) return existingResult(known, handoff);
       ({ workflowId, subworkflowId, taskId, nodeId, attachId, docName, emails } = resolved);
     } else {
       emails = parseEmails(input.userEmail1, input.userEmail2);
@@ -236,14 +341,15 @@ function createSignatureService({ repo, adobe, otcs, logger, config, now = () =>
       if (!attachId || isNaN(+attachId)) throw new ServiceError(400, { error: 'attachId is mandatory.' });
     }
 
-    // Evita reenvio duplicado (mesmo documento + mesmos destinatários) dentro da janela
-    if (repo.findRecent(nodeId, emails, DUPLICATE_WINDOW_MS)) throw duplicateError();
+    // Evita reenvio duplicado: acordo ABERTO do mesmo documento + destinatários dentro da janela. Com a validação do
+    // workflow só vale o de OUTRO fluxo (o deste já voltou como existing); sem ela (sem identidade de fluxo), qualquer aberto.
+    assertNoOpenElsewhere(nodeId, emails, verified ? { workflowId, subworkflowId } : null);
 
-    // Requisições concorrentes iguais (ainda sem registro no repo) caem aqui; findRecent não as enxerga
+    // Requisições concorrentes iguais (ainda sem registro no repo) caem aqui; findOpenRecent não as enxerga
     const keys = [`${nodeId}|${[...emails].sort().join('|')}`];
     // O formulário pode mudar entre duas consultas concorrentes: a identidade do workflow também precisa de trava.
-    if (config.startVerifyWorkflow || forceVerify) keys.push(`workflow|${workflowId}|${subworkflowId}|${nodeId}`);
-    if (keys.some((key) => inflight.has(key))) throw duplicateError();
+    if (verified) keys.push(`workflow|${workflowId}|${subworkflowId}|${nodeId}`);
+    if (keys.some((key) => inflight.has(key))) throw startInProgressError();
     for (const key of keys) inflight.add(key);
     try {
       try {
@@ -253,10 +359,11 @@ function createSignatureService({ repo, adobe, otcs, logger, config, now = () =>
       }
 
       try {
-        const original = await otcs.downloadNode(nodeId);
+        // Antes de qualquer coisa no Adobe: o conteúdo precisa ser um PDF (senão 422 NOT_PDF)
+        const content = await fetchPdf(nodeId);
         const fileName = String(docName || '').trim() || `node_${nodeId}.pdf`;
 
-        const transientDocumentId = await adobe.createTransientDocument(Buffer.from(original), fileName);
+        const transientDocumentId = await adobe.createTransientDocument(content, fileName);
         const subId = String(subworkflowId || workflowId || '');
         const ag = await adobe.createAgreement({
           name: `Documento ${fileName}`,

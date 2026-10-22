@@ -1,6 +1,13 @@
+[// Requisicion de Firma_Contratacion (WebReport 702040 en QA, 796139 en PROD): sub-flujos de contratacion. Ver webreports/README.md. /]
+[// La pagina YA NO reasigna la tarea al renderizar (antes habia un WFTASKACTION:REASSIGN aqui, antes de existir el acuerdo). /]
+[// Orden: la pagina pide el envio (/auth + /start); solo cuando el servidor confirma que el acuerdo existe, ella misma pide este ramo. /]
+[// Ramo reasignar: mismo origen, sesion del usuario. La URL solo trae los IDs de la tarea (workid, subworkid, taskid). El destino es fijo en este ramo; la URL no lo elige. /]
+[LL_WEBREPORT_IF "[LL_REPTAG_&ACCION /]" == "reasignar" /]
 [// 11742766 = ID do usuario de integracao (OTCS_USER do orquestrador) NESTE ambiente: QA = AdminKeralty (11742766), PROD = a confirmar. /]
-[// A tarefa Enviar solicitud de firma precisa estar atribuida a esse usuario: o orquestrador le o formulario dela. /]
-[LL_REPTAG_{'[LL_REPTAG_&WORKID /]','[LL_REPTAG_&SUBWORKID /]', 2} WFTASKACTION:REASSIGN:11742766 /]
+[// A tarefa Enviar solicitud de firma precisa estar atribuida a esse usuario: o orquestrador le o formulario dela e faz o SendOn com ele. /]
+[LL_REPTAG_{'[LL_REPTAG_&WORKID /]','[LL_REPTAG_&SUBWORKID /]','[LL_REPTAG_&TASKID /]'} WFTASKACTION:REASSIGN:11742766 /]
+REASIGNADO_OK
+[LL_WEBREPORT_ELSE /]
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -121,6 +128,7 @@
     .status.success { background: linear-gradient(90deg, #eaf9f2 60%, #f1fff9); color: var(--success);}
     .status.error   { background: linear-gradient(90deg, #fff2f3 60%, #fff0f1); color: var(--danger); }
     .status.active  { background: linear-gradient(90deg,#e4eafd 70%,#e3f3ff); color: #476bcf; }
+    .status.warning { background: linear-gradient(90deg, #fff4e0 60%, #fff9ee); color: #b54708; }
     @keyframes status-in { to {opacity: 1; pointer-events: auto;} }
     .progress-bar {
       width: 0;
@@ -266,7 +274,21 @@ const lottieCheckJSON =
 
 
 
+/* ============================================================
+   CONFIGURACION POR AMBIENTE (unico bloque a cambiar al publicar)
+   Valores que cambian por ambiente:
+     - SERVER_URL, BASIC_USER, BASIC_PASS y REPORT_ID (aqui abajo);
+     - REPORT_ID: ID de ESTE WebReport en el ambiente (QA: 702040, PROD: 796139). WebReports no tiene una tag
+       para el ID del propio reporte (la tag REPORTID no existe);
+     - usuario de integracion (11742766 en QA, AdminKeralty): NO va en este script.
+       Esta fijado en la linea WFTASKACTION:REASSIGN del ramo reasignar, al inicio del archivo, con su comentario.
+   BASIC_USER / BASIC_PASS son placeholders: el valor real entra solo en el WebReport publicado, nunca en este archivo.
+   ============================================================ */
 const SERVER_URL  = 'https://signature-orchestrator-api-2gim.onrender.com';
+const BASIC_USER = 'ADOBE-LOGS';
+const BASIC_PASS = 'ADOBE-LOGS-PASS';
+const REPORT_ID = '702040';
+/* ============================ fin de la configuracion ============================ */
 const NODE_ID     = '[LL_REPTAG_&SUBWORKID WFATTR:"DocID":DISPLAY /]';
 const ATTACH_ID   = '[LL_REPTAG_&SUBWORKID WFATTR:"AttachID":DISPLAY /]';
 const DOC_NAME    = '[LL_REPTAG_&SUBWORKID WFATTR:"Nombre del Documento":DISPLAY /]';
@@ -274,6 +296,13 @@ const DOC_NAME    = '[LL_REPTAG_&SUBWORKID WFATTR:"Nombre del Documento":DISPLAY
 const WORKFLOW_ID = '[LL_REPTAG_&WORKID /]';
 const SUBWORKFLOW_ID = '[LL_REPTAG_&SUBWORKID /]';
 const TASK_ID = '2';
+const OTCS_URL = '[LL_REPTAG_URLPREFIXFULL /]'.replace(/\/+$/, '');
+/* Marca que devuelve el ramo reasignar. Se arma en JS para no aparecer en la pagina normal. */
+const MARCA_REASIGNADO = 'REASIGNADO' + '_OK';
+const MSG_ASIGNAR = 'No fue posible asignar la tarea. Intente de nuevo.';
+const CABECERAS = { 'Content-Type': 'application/json', 'ngrok-skip-browser-warning': 'true' };
+/* Unico estado de la pagina: ocupado evita ejecuciones en paralelo; acuerdoId/handoff/final vienen de /start. */
+const flujo = { ocupado: false, acuerdoId: null, mensaje: '', handoff: null, final: null };
 const statusEl   = document.getElementById('status');
 const spinner    = document.getElementById('loading-spinner');
 const progressEl = document.getElementById('progress-bar');
@@ -294,6 +323,24 @@ docLink.className = 'doc-link-discreto';
 docLink.innerText = docName || 'Abrir documento';
 const h2 = mainContainer.querySelector('h2');
 mainContainer.insertBefore(docLink, h2.nextSibling);
+
+function removeButton() {
+    const old = document.querySelector('.btn-premium');
+    if (old) old.remove();
+}
+
+/* Reintentar: repite el envio desde el punto correcto (si el acuerdo ya existe, solo reasigna y confirma). */
+function createRetryButton() {
+    if(document.querySelector('.btn-premium')) return;
+    const btn = document.createElement('button');
+    btn.innerText = 'Reintentar';
+    btn.className = 'btn-premium';
+    btn.onclick = function() {
+        btn.blur();
+        startProcess();
+    };
+    mainContainer.appendChild(btn);
+}
 
 function createSendOnButton() {
     if(document.querySelector('.btn-premium')) return;
@@ -337,8 +384,12 @@ function showStatus(msg, state = "info") {
     } else if (state === "error") {
         statusEl.classList.add('error','flash-error');
         setTimeout(()=>statusEl.classList.remove('flash-error'), 1200);
+    } else if (state === "warning") {
+        // el acuerdo del flujo ya termino en Adobe Sign: no es exito del envio ni un error
+        statusEl.classList.remove('active');
+        statusEl.classList.add('warning');
     } else if (state === "active") {
-        statusEl.classList.remove('success','error');
+        statusEl.classList.remove('success','error','warning');
         progressEl.style.opacity = "1";
         setTimeout(() => { progressEl.style.width = "90%"; }, 160);
     }
@@ -353,11 +404,145 @@ function triggerSuccessFeedback() {
 }
 /*
   Protocolo v2:
-   1) POST /auth (Basic) com os campos do envio => { timestamp, nonce, signature } vinculados a ESTES campos (2 min, uso unico);
-   2) POST /start com os mesmos campos + timestamp, nonce e signature.
-  O orquestrador revalida tudo contra o fluxo no OTCS (DocID, AttachID, e-mails): o navegador so confirma o que viu.
+   1) POST /auth (Basic) con los campos del envio => { timestamp, nonce, signature } vinculados a ESTOS campos (2 min, uso unico);
+   2) POST /start con los mismos campos + timestamp, nonce y signature.
+  El orquestador revalida todo contra el flujo en OTCS (DocID, AttachID, e-mails): el navegador solo confirma lo que vio.
+  Orden: acuerdo, luego reasignacion de la tarea al usuario de integracion, luego el SendOn (lo hace el servidor).
+  La pagina NO reasigna al abrir: solo cuando /start confirma que el acuerdo existe (handoff.assigned = false).
+  Respuestas de /start que esta pagina trata:
+   - 200 { id, handoff }                  acuerdo creado
+   - 200 { id, existing: true }           el flujo ya tenia su acuerdo (abierto)
+   - 200 { id, existing, final }          el acuerdo del flujo ya termino en Adobe (final.message explica el resultado)
+   - 409 REASSIGN_REQUIRED + handoff      sub-flujo con la tarea aun en el usuario: reasigna y repite una sola vez
+   - 422 NOT_PDF                          el documento no es un PDF: se puede subir un PDF y reintentar
+   - 409 DUPLICATE_OPEN { id, workflowId } hay una solicitud abierta del mismo documento en otro flujo
 */
+function esDigitos(v) {
+  return /^\d+$/.test(String(v));
+}
+
+function mensajeDeError(data) {
+  if (typeof data.error === 'string') return data.error;
+  if (data.error && typeof data.error.message === 'string') return data.error.message;
+  return typeof data.message === 'string' ? data.message : '';
+}
+
+const reasignaRequerido = (r) => !r.ok && r.data.code === 'REASSIGN_REQUIRED';
+
+/* Resultado final del acuerdo que el flujo ya tenia ({ kind, state, message }); null si el acuerdo sigue abierto. */
+function finalDe(data) {
+  return data.final && typeof data.final === 'object' && typeof data.final.message === 'string' ? data.final : null;
+}
+
+/* Error de una respuesta del servidor. Conserva el codigo y una linea de ayuda:
+   NOT_PDF (se puede subir una version PDF y reintentar) y DUPLICATE_OPEN (ID y flujo de la solicitud abierta). */
+function errorServidor(r, porDefecto) {
+  const err = new Error(mensajeDeError(r.data) || porDefecto);
+  err.codigo = typeof r.data.code === 'string' ? r.data.code : '';
+  if (err.codigo === 'NOT_PDF') {
+    err.detalle = 'Suba una versión PDF del documento y presione "Reintentar".';
+  } else if (err.codigo === 'DUPLICATE_OPEN' && r.data.id) {
+    err.detalle = 'Acuerdo abierto: ' + r.data.id + (r.data.workflowId ? ' (flujo ' + r.data.workflowId + ')' : '');
+  }
+  return err;
+}
+
+async function postJson(url, cuerpo, cabeceras) {
+  let resp;
+  try {
+    resp = await fetch(url, { method: 'POST', headers: cabeceras, body: JSON.stringify(cuerpo) });
+  } catch (_) {
+    const err = new Error('No se pudo conectar con el servidor de firmas.');
+    err.sinRed = true;
+    throw err;
+  }
+  const data = await resp.json().catch(() => ({}));
+  return { ok: resp.ok, status: resp.status, data: data && typeof data === 'object' ? data : {} };
+}
+
+/* /auth + /start con los mismos campos (la firma los cubre). Devuelve la respuesta de /start tal cual. */
+async function iniciar(fields) {
+  const cabeceras = { ...CABECERAS, Authorization: 'Basic ' + btoa(BASIC_USER + ':' + BASIC_PASS) };
+  const auth = await postJson(SERVER_URL + '/auth', fields, cabeceras);
+  if (!auth.ok || !auth.data.signature) {
+    throw new Error('Não foi possível obter credenciais de autenticação');
+  }
+  const { timestamp, nonce, signature } = auth.data;
+  // taskId es informativo: el servidor usa la tarea que encuentra en el flujo
+  return postJson(SERVER_URL + '/start', { ...fields, taskId: TASK_ID, timestamp, nonce, signature }, CABECERAS);
+}
+
+/* Reasigna la tarea al usuario de integracion fijado en el ramo reasignar de este WebReport.
+   La URL solo lleva los IDs de la tarea: el destino no lo elige la URL. */
+async function reasignar() {
+  const h = flujo.handoff || {};
+  if (![h.workflowId, h.subworkflowId, h.taskId, REPORT_ID].every(esDigitos)) {
+    throw new Error('Datos de reasignación inválidos.');
+  }
+  const params = new URLSearchParams({
+    func: 'll',
+    objAction: 'RunReport',
+    objId: REPORT_ID,
+    workid: h.workflowId,
+    subworkid: h.subworkflowId,
+    taskid: h.taskId,
+    accion: 'reasignar'
+  });
+  let resp;
+  try {
+    resp = await fetch(OTCS_URL + '?' + params.toString(), { credentials: 'same-origin', cache: 'no-store' });
+  } catch (_) {
+    throw new Error('No se pudo reasignar la tarea: sin conexión con OpenText.');
+  }
+  const texto = await resp.text().catch(() => '');
+  if (!resp.ok || !texto.includes(MARCA_REASIGNADO)) {
+    throw new Error('No se pudo asignar la tarea. Verifique su sesión en OpenText y reintente.');
+  }
+}
+
+/* Confirma con /auth + /start que la tarea ya esta asignada. Solo entonces hay resultado.
+   Un fallo de red no bloquea (el servidor reintenta); cualquier otra respuesta sin asignacion es error. */
+async function confirmarAsignacion(fields) {
+  let r;
+  try {
+    r = await iniciar(fields);
+  } catch (err) {
+    if (!err.sinRed) throw err;
+    console.error('confirmación sin red:', err);
+    return;
+  }
+  if (reasignaRequerido(r)) throw new Error(MSG_ASIGNAR);
+  if (!r.ok) throw errorServidor(r, MSG_ASIGNAR);
+  if (r.data.handoff && r.data.handoff.assigned === false) throw new Error(MSG_ASIGNAR);
+  flujo.handoff = r.data.handoff || null;
+  flujo.final = finalDe(r.data) || flujo.final;
+}
+
+/* Envio del acuerdo. Si el servidor exige reasignar antes (sub-flujo), reasigna y repite /start una sola vez.
+   En el sub-flujo el servidor valida antes lo que puede (PDF y solicitud abierta en otro flujo): si falla, responde
+   el error y NO pide reasignar. Si el flujo ya tiene su acuerdo (existing), el servidor lo devuelve aunque ya sea
+   final (data.final): la tarea se reasigna igual (el acuerdo existe) y al final se muestra ese resultado. */
+async function enviar(fields) {
+  let r = await iniciar(fields);
+  if (reasignaRequerido(r) && r.data.handoff) {
+    flujo.handoff = r.data.handoff;
+    showStatus('Asignando la tarea...', 'active');
+    await reasignar();
+    r = await iniciar(fields);
+    if (reasignaRequerido(r)) throw new Error(MSG_ASIGNAR);
+  }
+  if (!r.ok) {
+    // 409 (fluxo fora do passo de envio / dados divergentes / DUPLICATE_OPEN), 422 (NOT_PDF), 503... trazem a mensagem do servidor
+    throw errorServidor(r, 'Erro desconhecido');
+  }
+  flujo.acuerdoId = r.data.id || null;
+  flujo.mensaje = typeof r.data.message === 'string' ? r.data.message : '';
+  flujo.handoff = r.data.handoff || null;
+  flujo.final = finalDe(r.data);
+}
+
 async function startProcess() {
+  if (flujo.ocupado) return;
   // 1) coleta e valida e-mails e IDs
   const e1 = document.getElementById('email1').innerText.trim();
   const e2 = document.getElementById('email2').innerText.trim();
@@ -371,6 +556,8 @@ async function startProcess() {
     return showStatus('AttachID inválido', 'error');
   }
 
+  flujo.ocupado = true;
+  removeButton();
   // 2) mostra loading e progress
   spinner.classList.add('is-visible');
   showStatus('Buscando las credenciales', 'active');
@@ -387,35 +574,15 @@ async function startProcess() {
       userEmail2: e2
     };
 
-    // 4) obtém timestamp + nonce + signature do servidor (assinatura vinculada aos campos)
-    const BASIC_USER = 'ADOBE-LOGS';
-    const BASIC_PASS = 'ADOBE-LOGS-PASS';
-    const BASIC_HEADER = 'Basic ' + btoa(`${BASIC_USER}:${BASIC_PASS}`);
+    // 4) acuerdo (/auth + /start); si ya existe (reintento), salta directo a la reasignacion pendiente
+    if (!flujo.acuerdoId) await enviar(fields);
 
-    const authResp = await fetch(`${SERVER_URL}/auth`, {
-      method: 'POST',
-      headers: {
-        'Authorization': BASIC_HEADER,
-        'Content-Type': 'application/json',
-        'ngrok-skip-browser-warning': 'true'
-      },
-      body: JSON.stringify(fields)
-    });
-    if (!authResp.ok) {
-      throw new Error('Não foi possível obter credenciais de autenticação');
+    // 5) el acuerdo existe: solo ahora la pagina reasigna la tarea al usuario de integracion y confirma
+    if (flujo.handoff && flujo.handoff.assigned !== true) {
+      showStatus('Asignando la tarea...', 'active');
+      await reasignar();
+      await confirmarAsignacion(fields);
     }
-    const { timestamp, nonce, signature } = await authResp.json();
-
-    // 5) envia para /start (taskId e informativo: o servidor usa a tarefa que encontra no fluxo)
-    const startResp = await fetch(`${SERVER_URL}/start`, {
-      method: 'POST',
-      headers: {
-        'ngrok-skip-browser-warning': 'true',
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({ ...fields, taskId: TASK_ID, timestamp, nonce, signature })
-    });
-    const data = await startResp.json().catch(() => ({}));
 
     // 6) limpa loading e mostra resultado
     spinner.classList.remove('is-visible');
@@ -423,24 +590,25 @@ async function startProcess() {
     progressEl.style.opacity = '1';
     setTimeout(() => progressEl.style.opacity = '0', 850);
 
-    if (startResp.ok) {
-      // 200 tambem quando o acordo ja tinha sido solicitado (existing: true): a mensagem do servidor traz o ID
-      showStatus(data.message || 'Documento enviado com sucesso!', 'success');
-      createSendOnButton();
+    if (flujo.final) {
+      // el acuerdo del flujo ya termino en Adobe Sign: se muestra su resultado, no el exito del envio
+      showStatus(flujo.final.message + (flujo.acuerdoId ? '\nID del acuerdo: ' + flujo.acuerdoId : ''), 'warning');
     } else {
-      // 409 (fluxo fora do passo de envio / dados divergentes), 422, 503... trazem a mensagem do servidor
-      const errMsg = typeof data.error === 'string'
-        ? data.error
-        : (data.error?.message || data.message || 'Erro desconhecido');
-      showStatus(errMsg, 'error');
+      // 200 tambem quando o acordo ja tinha sido solicitado (existing: true): a mensagem do servidor traz o ID
+      showStatus(flujo.mensaje || 'Documento enviado com sucesso!', 'success');
     }
+    createSendOnButton();
 
   } catch (err) {
-    // erro de rede ou interno
+    // erro do servidor (mensagem em err.message), de rede ou interno
     spinner.classList.remove('is-visible');
     progressEl.style.width = '0';
-    showStatus(err.message || 'Falha inesperada', 'error');
+    showStatus((err.message || 'Falha inesperada') + (err.detalle ? '\n' + err.detalle : ''), 'error');
     console.error(err);
+    // NOT_PDF, DUPLICATE_OPEN y fallos de red/asignacion se pueden reintentar
+    createRetryButton();
+  } finally {
+    flujo.ocupado = false;
   }
 }
 
@@ -460,3 +628,4 @@ window.onload = () => {
 </script>
 </body>
 </html>
+[LL_WEBREPORT_ENDIF /]

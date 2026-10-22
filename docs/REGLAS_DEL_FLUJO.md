@@ -62,11 +62,19 @@ fora da integração), `sign_subprocess_id`/`sign_task_id` (tarefa de firma reso
 ## 4. Etapas
 
 ### 4.1 start — envio do pedido de firma
-- Ordem nova do WebReport: **enviar → confirmar → reatribuir**. A página chama o `/start` primeiro; só depois que ele
-  confirma o acordo no Adobe a própria página (na sessão do usuário humano) reatribui a tarefa ao usuário de integração
-  (`WFTASKACTION:REASSIGN`). Se o envio falha ou a página fecha, a tarefa continua na caixa do usuário e ele pode repetir.
-  O WebReport antigo (REASSIGN na renderização, depois `/start`) continua funcionando: tarefa já atribuída → caminho do
-  formulário → SendOn imediato.
+- Ordem do WebReport: **acordo → reatribuição → SendOn**. A regra é: só reatribuir com acordo gerado; com o acordo gerado, o
+  SendOn pode sair. A página chama o `/start` primeiro; só depois que ele confirma o acordo no Adobe a própria página (na sessão
+  do usuário humano) reatribui a tarefa ao usuário de integração (`WFTASKACTION:REASSIGN`); o SendOn é do servidor, em
+  background. Se o envio falha ou a página fecha, a tarefa continua na caixa do usuário e ele pode repetir. Nunca deixar a
+  tarefa com o usuário de integração sem acordo, se der para evitar. Os dois WebReports (fluxo puro e Contratación) seguem
+  esta ordem; o antigo de Contratación (REASSIGN na renderização, antes de qualquer acordo) continua funcionando (tarefa já
+  atribuída → caminho do formulário → SendOn imediato), mas não respeita a regra.
+- **Validação do PDF (antes do Adobe).** Depois de baixar o `DocID` e antes de criar o documento transitório, o conteúdo
+  precisa ter `%PDF-` nos primeiros 1024 bytes (a especificação do PDF tolera lixo antes do cabeçalho; função pura em
+  `domain/documentType.js`). Senão: `422 { error: "El documento a firmar no es un PDF válido.", code: "NOT_PDF" }`, **nada** é criado
+  no Adobe e a tarefa não é tocada; o log `warn` (espanhol) traz nodeId, tamanho e o tipo detectado por sniff simples (HTML,
+  ZIP/Office, texto, vacío, desconocido), nunca o conteúdo. Sem isso o Adobe aceitaria os bytes como `application/pdf` e só
+  cancelaria o acordo depois, por problema de conversão. O usuário pode subir uma versão PDF no mesmo nó e repetir.
 - O `/start` só cria o acordo (com `externalId`), grava o registro com `start_sendon_done=false` e dispara a etapa em
   background; responde sem esperá-la.
 - Origem dos atributos (`DocID`, `AttachID`, nome, e-mails), conforme quem está com a tarefa de início
@@ -76,12 +84,48 @@ fora da integração), `sign_subprocess_id`/`sign_task_id` (tarefa de firma reso
     (rótulos = `START_FIELD_*`; o mesmo conjunto de validações 422/409);
   - com o usuário humano + **sub-workflow** → `409` `REASSIGN_REQUIRED` (o `status/info` só devolve os atributos do
     **pai**, e o formulário exige a tarefa no usuário de integração): a página reatribui antes e repete o `/start`
-    (com novo `/auth`: o nonce é de uso único).
+    (com novo `/auth`: o nonce é de uso único). Antes de pedir a reatribuição há a **pré-checagem** (abaixo).
   - `task_assignees` ausente na resposta do OTCS → trata como atribuída (caminho antigo), sem consultar `GET /v1/auth`
     (`handoff.integrationUserId` vem `null`; o SendOn é tentado direto).
 - A resposta do `/start` leva `handoff` = `{ workflowId, subworkflowId, taskId, integrationUserId, assigned }` (números):
   o que a página deve reatribuir quando `assigned=false`. Também vem no `existing: true` enquanto a tarefa de início
   ainda está `current`; com ela já avançada, `handoff` é omitido (nada a reatribuir). Sem `START_VERIFY_WORKFLOW`, não há `handoff`.
+- **Pré-checagem do sub-workflow (antes do `REASSIGN_REQUIRED`).** Aqui o servidor não consegue ler o formulário (só quem tem a
+  tarefa o lê) e, por isso, hoje pede a reatribuição **antes** de existir acordo. Para não reatribuir à toa, usa os valores do
+  corpo, que aqui são só **dicas** (nunca usadas para criar acordo): se houver `nodeId` numérico e ao menos um e-mail, baixa o nó,
+  roda a validação de PDF e a trava de duplicidade (abaixo). Se algo falhar, devolve o erro (`NOT_PDF`, `DUPLICATE_OPEN`, ou o 500
+  genérico se o OTCS falhar ao baixar) e **não** pede a reatribuição. Sem dicas, ou se o fluxo já tem acordo **deste ciclo** desse documento (não
+  concluído; o `/start` seguinte o devolve como `existing`), segue direto para o `REASSIGN_REQUIRED`. Um acordo **concluído** é de um ciclo
+  anterior: a pré-checagem roda normalmente. Depois da reatribuição, o caminho normal
+  relê o formulário (a fonte da verdade) e valida tudo de novo. Custo: um download extra do documento por abertura da página.
+  - **Pendência (não validada):** a ordem estrita "acordo antes de reatribuir" no sub-fluxo depende de uma forma de ler os
+    atributos do sub-fluxo **sem ser o responsável pela tarefa**. A candidata é `GET /v2/workflows/status/info?workid=<subworkid>`
+    (com o ID do subprocesso no lugar do pai); ainda não foi testada no OTCS. Enquanto isso, a pré-checagem com as dicas é a
+    mitigação: o dado que ela confere pode divergir do formulário, mas a validação definitiva roda depois da reatribuição.
+- **O mesmo fluxo vê o acordo do ciclo dele, mesmo se já for final.** Com a validação do OTCS, o `/start` procura o acordo **mais
+  recente** de (`workflowId`, `subworkflowId`, `nodeId`) (`findLatestByWorkflow`):
+  - tarefa de início `current`: vale o acordo **deste ciclo**, isto é, o mais recente que não foi concluído (`sendonDone=false`): aberto,
+    ou final com o resultado ainda não aplicado ao fluxo (o caso do incidente de QA). **Exceção, ciclo novo:** se o mais recente está
+    **concluído** (`sendonDone=true`, inclusive `completedExternally`), o resultado já foi aplicado e o mapa voltou ao passo de envio
+    (ex.: `Rechazado` com retorno ao envio, mesmo `DocID`); o acordo antigo é ignorado e o envio segue normal, criando um acordo novo,
+    com a trava de duplicidade e a validação do PDF valendo como sempre;
+  - tarefa de início já fora de `current` (recarga depois do SendOn): o mais recente em qualquer estado, inclusive concluído.
+
+  Se existe um acordo (nesses casos):
+  - aberto (sem resultado final e sem a disposição enviada): `200 { message: "Signature already requested. ID: ...", id, existing: true, handoff? }`;
+  - já final ou concluído: `200 { message, id, existing: true, final: { kind, state, message }, handoff? }`, em vez do 409. `final.message`
+    (espanhol, e também a `message` da resposta) diz o resultado por `kind`: `final_ok` já firmado; `final_rejected` o firmante rechazó;
+    `final_expired` expirou; `final_recalled` cancelado no Adobe; `final_conversion_failed` "Adobe Sign no pudo procesar el documento
+    (verifique que sea un PDF válido)"; mais a frase "El flujo continuará automáticamente según el resultado." (ou "ya continuó..." se
+    a disposição já foi enviada, ou "requiere revisión del administrador" se o acordo está em `needs_attention`).
+  - O `handoff` segue valendo (o acordo existe: a página pode reatribuir) e o kick continua: acordo com a etapa start pendente
+    → `resumeStart` → `reconcile`, que com o resultado final faz o SendOn pendente da tarefa de início e depois a disposição.
+- **Trava anti-duplicidade (15 min).** Só bloqueia um acordo **aberto** (sem resultado final e sem a disposição enviada) com o mesmo
+  `DocID` e o mesmo **conjunto** de e-mails (sem caixa nem ordem), criado dentro da janela, em **outro** workflow/subprocesso:
+  `409 { error: "Este documento ya tiene una solicitud de firma abierta para este destinatario en otro flujo.", code: "DUPLICATE_OPEN", id, workflowId }`
+  (`id` e `workflowId` são os do acordo aberto). Acordo final ou concluído **nunca** bloqueia. Sem a validação do workflow
+  (caminho legado, sem identidade de fluxo) vale só o critério "aberto". Uma requisição igual ainda em processamento neste servidor
+  responde `409 { code: "START_IN_PROGRESS" }` (outra mensagem: o acordo dela ainda não existe).
 - Repetir o `/start` (`existing: true`) com a etapa start ainda pendente retoma a reconciliação do acordo na hora
   (`resumeStart`: ignora o backoff e reabre um `needs_attention` `retries_exhausted`), então o SendOn sai logo após o
   REASSIGN da página. A reconciliação é serializada por acordo; repetir é seguro.
