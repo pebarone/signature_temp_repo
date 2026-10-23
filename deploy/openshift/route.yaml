@@ -1,5 +1,6 @@
 # Route HTTPS pública do orquestrador (roteador do OpenShift).
-# O host deve ser o mesmo de PUBLIC_URL (configmap.yaml): https://<host-da-rota>.
+# O host deve ser o mesmo de PUBLIC_URL (configmap.yaml). É o host do orquestrador atual de PROD: enquanto a Route antiga
+# existir, esta fica sem admissão (HostAlreadyClaimed). Ver README, seção 2.7 (troca do orquestrador antigo).
 apiVersion: route.openshift.io/v1
 kind: Route
 metadata:
@@ -10,7 +11,7 @@ metadata:
     # Timeout do roteador: maior que OTCS_TIMEOUT_MS e ADOBE_TIMEOUT_MS (60s por padrão)
     haproxy.router.openshift.io/timeout: 120s
 spec:
-  host: <host-da-rota>
+  host: co-saphcm-ms-md-co-sign-empcontract-prod.apps.osftd4.colsanitas.com
   to:
     kind: Service
     name: signature-orchestrator

@@ -8,3 +8,10 @@ resources:
   - deployment.yaml
   - service.yaml
   - route.yaml
+# Único lugar da imagem (ver README, passo 2.5). Registry interno do OpenShift:
+#   image-registry.openshift-image-registry.svc:5000/<namespace>/signature-orchestrator
+# Para trocar sem editar: kustomize edit set image signature-orchestrator=<registry>/<namespace>/signature-orchestrator:<tag>
+images:
+  - name: signature-orchestrator
+    newName: <registry>/<namespace>/signature-orchestrator
+    newTag: <tag>

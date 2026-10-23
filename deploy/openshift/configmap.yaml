@@ -7,8 +7,10 @@ metadata:
   labels:
     app: signature-orchestrator
 data:
-  # URL pública (Route) do orquestrador: base do redirect OAuth (<PUBLIC_URL>/admin/callback) e do webhook (<PUBLIC_URL>/webhook)
-  PUBLIC_URL: "https://<host-da-rota>"
+  # URL pública (Route) do orquestrador: base do redirect OAuth (<PUBLIC_URL>/admin/callback) e do webhook (<PUBLIC_URL>/webhook).
+  # É o host do orquestrador atual de PROD: o webhook do Adobe e o WebReport de envio já apontam para ele. Se o deploy usar
+  # outro host, troque aqui e em route.yaml e atualize o webhook, o redirect URI e o SERVER_URL dos WebReports (README, seção 3).
+  PUBLIC_URL: "https://co-saphcm-ms-md-co-sign-empcontract-prod.apps.osftd4.colsanitas.com"
   # Base da API do Content Server (OTCS); o código acrescenta /v1 e /v2
   OTCS_BASE: "https://otcs.g115.opentext.cloud/cs/cs/api"
   # Região Adobe Sign de produção (NA4): API
@@ -17,6 +19,11 @@ data:
   ADOBE_AUTH_BASE: "https://secure.na4.adobesign.com"
   # Timeout (ms) de cada chamada ao Adobe, inclusive refresh e troca de token
   ADOBE_TIMEOUT_MS: "60000"
+  # Tentativas de baixar o PDF assinado (o Adobe responde 403 por alguns segundos logo depois da assinatura)
+  ADOBE_DOWNLOAD_ATTEMPTS: "8"
+  # Atraso inicial (ms) e teto (ms) entre essas tentativas
+  ADOBE_DOWNLOAD_RETRY_DELAY_MS: "3000"
+  ADOBE_DOWNLOAD_RETRY_MAX_DELAY_MS: "30000"
   # Timeout (ms) de cada chamada ao OTCS
   OTCS_TIMEOUT_MS: "60000"
   # Liga o polling de acordos sem resultado final
@@ -76,9 +83,11 @@ data:
   START_FIELD_EMAILS: "Email Firmante 1,Email Firmante 2"
   # Origens com CORS em /auth e /start (lista). Vazio => a origem de OTCS_BASE. Em PROD, a do OTCS de produção
   CORS_ORIGINS: "https://otcs.g115.opentext.cloud"
-  # SÓ durante a migração dos WebReports (ver webreports/README.md, índice dos WebReports por fluxo): ligar "true" no deploy, publicar os WebReports novos,
-  # testar e voltar para "false". Aceitam GET /auth + assinatura v1 e o GET /start antigo (sempre validados contra o OTCS)
-  START_LEGACY_SIGNATURE: "false"
-  START_LEGACY_GET_ENABLED: "false"
+  # Transição dos WebReports (passo 1 da ordem de rollout em webreports/README.md, índice dos WebReports por fluxo): LIGADAS
+  # no primeiro deploy, porque o WebReport de PROD ainda pode chamar o GET /start antigo. Aceitam GET /auth + assinatura v1 e o
+  # GET /start antigo, sempre validados contra o OTCS; cada uso gera warn no log. Depois de publicar e testar os WebReports
+  # novos, troque para "false" e rode `oc apply -k deploy/openshift && oc rollout restart deploy/signature-orchestrator`.
+  START_LEGACY_SIGNATURE: "true"
+  START_LEGACY_GET_ENABLED: "true"
   # false: aceita POST /webhook sem ClientId conhecido; true: exige CLIENT_ID ou um dos WEBHOOK_CLIENT_IDS
   WEBHOOK_REQUIRE_CLIENT_ID: "false"

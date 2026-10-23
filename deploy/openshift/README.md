@@ -6,9 +6,25 @@ Este diretório traz os artefatos para rodar o orquestrador no OpenShift:
 - `secret.example.yaml`: modelo do Secret. **Não** é aplicado pelo `kustomization.yaml`;
 - `Containerfile`: imagem do orquestrador.
 
-Antes de aplicar, troque todos os valores `<...>`: namespace, registry e tag da imagem, host da rota, `PUBLIC_URL` e `storageClassName`.
-Valores com `<` ou `>` não são válidos em nomes de host ou de imagem. A `OTCS_BASE` do `configmap.yaml` já aponta para o
-Content Server de produção; troque se o alvo for outro.
+## Já preenchido e o que falta
+
+Já vem preenchido para PROD (confira, mas não precisa trocar):
+
+| Item | Valor | Onde |
+|---|---|---|
+| Host público | `co-saphcm-ms-md-co-sign-empcontract-prod.apps.osftd4.colsanitas.com`, o host do orquestrador atual, para onde já apontam o webhook do Adobe e o WebReport de envio | `PUBLIC_URL` (`configmap.yaml`) e `host` (`route.yaml`) |
+| Content Server | `https://otcs.g115.opentext.cloud/cs/cs/api`; CORS para `https://otcs.g115.opentext.cloud` | `configmap.yaml` |
+| Adobe Sign | região NA4 (`api.na4` / `secure.na4`); o padrão do código é EU1 | `configmap.yaml` |
+| Transição dos WebReports | `START_LEGACY_SIGNATURE` e `START_LEGACY_GET_ENABLED` **ligadas** (passo 1 da ordem de rollout de `webreports/README.md`) | `configmap.yaml` |
+| Storage, réplicas e probes | PVC RWO de 2Gi, 1 réplica, `Recreate`, `/health` | `pvc.yaml`, `deployment.yaml` |
+
+Falta preencher (os valores `<...>` não são válidos como host ou imagem):
+
+- [ ] **Secret** `signature-orchestrator-env`: credenciais do Adobe, do OTCS, do Basic Auth e o segredo HMAC (passo 2.2).
+- [ ] **Imagem**: `<registry>/<namespace>` e `<tag>` em `kustomization.yaml` (`images:`), o único lugar da imagem (passo 2.5).
+- [ ] **Namespace**: `oc project <namespace>` antes de aplicar (passo 2.1).
+- [ ] **`storageClassName`** em `pvc.yaml`: opcional. Comentado, vale a classe `(default)` do cluster, que também precisa ser de bloco (seção 1.4).
+- [ ] **Troca do orquestrador antigo**: Route que hoje tem o host e acordos em andamento no serviço antigo (passo 2.7).
 
 ## Resumo do storage (leia antes do restante)
 
@@ -144,12 +160,13 @@ o SQLite se recupera pelo WAL desde que os três arquivos sejam restaurados junt
 (`oc scale deploy/signature-orchestrator --replicas=0`) e suba de novo depois.
 
 **Opção B: backup lógico com a API de backup do `better-sqlite3`.** O `sqlite3` CLI pode não existir na imagem (a runtime é minimal),
-por isso a receita usa o próprio módulo instalado no contêiner. O backup vai para `/tmp`, e não para o volume:
+por isso a receita usa o próprio módulo instalado no contêiner. O backup vai para `/tmp`, e não para o volume. Os arquivos
+passam por `oc exec ... cat` e não por `oc cp`, que exige `tar` dentro do contêiner (a imagem minimal pode não ter):
 
 ```bash
 oc exec deploy/signature-orchestrator -- node -e "const Database = require('better-sqlite3'); const db = new Database('/data/state/orchestrator.db'); db.backup('/tmp/orchestrator-backup.db').then(() => { db.close(); console.log('backup ok'); });"
 POD=$(oc get pod -l app=signature-orchestrator -o jsonpath='{.items[0].metadata.name}')
-oc cp "$POD:/tmp/orchestrator-backup.db" ./orchestrator-backup.db
+oc exec "$POD" -- cat /tmp/orchestrator-backup.db > ./orchestrator-backup.db
 oc exec "$POD" -- rm -f /tmp/orchestrator-backup.db
 ```
 
@@ -186,7 +203,7 @@ Guarde o arquivo em local restrito: ele contém dados pessoais.
    oc apply -f restore.yaml
    oc wait --for=condition=Ready pod/restore-orchestrator --timeout=120s
    oc exec restore-orchestrator -- rm -f /data/state/orchestrator.db-wal /data/state/orchestrator.db-shm
-   oc cp ./orchestrator-backup.db restore-orchestrator:/data/state/orchestrator.db
+   oc exec -i restore-orchestrator -- sh -c 'cat > /data/state/orchestrator.db' < ./orchestrator-backup.db
    oc delete pod restore-orchestrator
    ```
 
@@ -227,10 +244,10 @@ oc create secret generic signature-orchestrator-env \
 
 ### 2.3 Ajustar os arquivos antes de aplicar
 
-- `configmap.yaml`: `PUBLIC_URL` deve ser `https://<host-da-rota>`, exatamente o host da Route.
-- `route.yaml`: `host` (o mesmo de `PUBLIC_URL`).
-- `deployment.yaml`: `image` (ver passo 2.5).
-- `pvc.yaml`: `storageClassName`, conforme as seções 1.2 e 1.4.
+- `kustomization.yaml`: `images:` com o registry, o namespace e a tag da imagem (ver passo 2.5).
+- `pvc.yaml`: `storageClassName`, conforme as seções 1.2 e 1.4 (opcional).
+- Só se o host público mudar: `PUBLIC_URL` (`configmap.yaml`) e `host` (`route.yaml`) precisam ser o mesmo host
+  (`PUBLIC_URL` = `https://` + host).
 
 ### 2.4 Aplicar
 
@@ -249,6 +266,16 @@ Rode a partir da **raiz** do repositório (o contexto de build é a raiz):
 podman build -f deploy/openshift/Containerfile -t <registry>/<namespace>/signature-orchestrator:<tag> .
 podman push <registry>/<namespace>/signature-orchestrator:<tag>
 ```
+
+Depois, registre a mesma imagem no `kustomization.yaml` (`newName` e `newTag` em `images:`), à mão ou com:
+
+```bash
+cd deploy/openshift && kustomize edit set image signature-orchestrator=<registry>/<namespace>/signature-orchestrator:<tag>
+```
+
+Com o registry interno do OpenShift, o push usa a rota externa do registry, e o `newName` do kustomization usa
+`image-registry.openshift-image-registry.svc:5000/<namespace>/signature-orchestrator`. Sugestão de tag: o hash curto do commit
+(`git rev-parse --short HEAD`), para saber qual código está no ar.
 
 Use `docker` no lugar de `podman` se preferir. A imagem usa `ubi9/nodejs-22` no build e `ubi9/nodejs-22-minimal` no runtime, ambos com Node 22
 (o `package.json` exige Node 20 ou mais novo).
@@ -270,11 +297,55 @@ oc get pvc signature-orchestrator-data                       # STATUS: Bound; AC
 oc rollout status deploy/signature-orchestrator
 oc logs deploy/signature-orchestrator | grep -E "SQLite ready|Server started"
 oc logs deploy/signature-orchestrator | grep "\[STORAGE\]"   # não deve retornar nenhuma linha
-curl -s https://<host-da-rota>/health                        # {"status":"ok"}
+oc get route signature-orchestrator                          # HOST/PORT preenchido; sem HostAlreadyClaimed
+curl -s https://co-saphcm-ms-md-co-sign-empcontract-prod.apps.osftd4.colsanitas.com/health   # {"status":"ok"}
 ```
 
 Esperado: `SQLite ready: /data/state/orchestrator.db (schema vN)` e `Server started successfully`. Não deve aparecer nenhuma linha com `[STORAGE]`.
-Se aparecer, o `DATA_DIR` ou o PVC não estão corretos.
+Se aparecer, o `DATA_DIR` ou o PVC não estão corretos. Enquanto a Route antiga tiver o host (passo 2.7), o `curl` ainda
+responde pelo orquestrador antigo: confira com `oc get route` qual Route foi admitida.
+
+### 2.7 Troca do orquestrador antigo
+
+O host público já pertence ao orquestrador em produção. Há três pontos a combinar antes da troca.
+
+**1. Route.** Duas Routes com o mesmo host não convivem: a mais antiga fica com o host e a nova aparece com
+`HostAlreadyClaimed` em `oc describe route signature-orchestrator`. Para descobrir quem tem o host:
+
+```bash
+oc get route -A | grep co-saphcm-ms-md-co-sign-empcontract-prod
+```
+
+Na janela de troca, remova a Route antiga (guarde antes o YAML dela com `oc get route <rota-antiga> -o yaml`) e aplique esta
+(`oc apply -k deploy/openshift`), ou aponte a Route antiga para o Service `signature-orchestrator` na porta `http`. Depois,
+pare o deployment antigo, para que só um orquestrador responda pelo webhook e pelo `/start`. Rollback: recriar a Route antiga
+a partir do YAML guardado.
+
+**2. Adobe e WebReports.** Com o mesmo host, o webhook (`<PUBLIC_URL>/webhook`) e o `SERVER_URL` dos WebReports continuam
+valendo. O WebReport de PROD ainda pode chamar o `GET /start` antigo: por isso as flags `START_LEGACY_*` vêm ligadas. Desligue-as
+só depois do passo 4 da ordem de rollout de `webreports/README.md`. Cadastre `<PUBLIC_URL>/admin/callback` como redirect URI da
+aplicação do Adobe antes de autorizar em `/admin/login` (seção 3).
+
+**3. Acordos em andamento no orquestrador antigo.** O banco novo começa vazio, e os acordos criados pelo serviço antigo não têm
+o `externalId` que permite a adoção automática pelo webhook. Sem ação, ninguém conclui esses acordos. Há duas saídas:
+
+- **Importar o mapa antigo.** No código de referência, o mapa fica em `/tmp/agreements.json` do contêiner antigo; confirme
+  no binário de produção. Copiado para `/data/state/agreements.json`, ele é importado no próximo start: o arquivo vira
+  `.migrated`, e ids já existentes não são sobrescritos.
+
+  ```bash
+  oc exec <pod-antigo> -- cat /tmp/agreements.json > ./agreements.json   # guardar em local restrito: tem e-mails
+  POD=$(oc get pod -l app=signature-orchestrator -o jsonpath='{.items[0].metadata.name}')
+  oc exec -i "$POD" -- sh -c 'cat > /data/state/agreements.json' < ./agreements.json
+  oc rollout restart deploy/signature-orchestrator
+  oc logs deploy/signature-orchestrator | grep "Legacy import"
+  ```
+
+  **Atenção:** os acordos importados sem `sendonDone` são reconciliados de verdade. O orquestrador grava o PDF assinado e
+  conclui a tarefa de assinatura, e o workflow segue para a distribuição ao workspace. Antes de importar, tire do arquivo os
+  acordos que já foram tratados à mão (PDF colocado no workspace, tarefa concluída por outra via), senão o documento pode
+  ser duplicado. Entradas sem `workflowId` vão para `needs_attention`.
+- **Não importar** e tratar os pendentes pela operação, um a um, com `POST /admin/adopt/:id` (seção "Admin endpoints" do `readme.md` da raiz).
 
 ---
 
@@ -296,9 +367,11 @@ Se aparecer, o `DATA_DIR` ou o PVC não estão corretos.
 - **Janela de indisponibilidade:** `Recreate` derruba o pod atual antes de subir o novo. São poucos segundos (start do Node e readiness).
   Nesse intervalo o orquestrador não responde 2xx ao Adobe. O Adobe reenvia as notificações não confirmadas, e o poller revisa os acordos sem
   resultado final quando o serviço volta. Essa indisponibilidade é aceitável para o fluxo.
-- **Atualizar:** gere uma nova tag, envie a imagem e troque o `image` do `deployment.yaml` (mantendo o repositório sincronizado com o cluster),
-  depois rode `oc apply -k deploy/openshift`. Alternativa sem editar o arquivo:
+- **Atualizar:** gere uma nova tag, envie a imagem e troque o `newTag` em `kustomization.yaml` (mantendo o repositório
+  sincronizado com o cluster), depois rode `oc apply -k deploy/openshift`. Alternativa sem editar o arquivo:
   `oc set image deploy/signature-orchestrator signature-orchestrator=<registry>/<namespace>/signature-orchestrator:<nova-tag>`.
+- **Mudou só ConfigMap ou Secret** (por exemplo, ao desligar as flags `START_LEGACY_*`): o pod não relê variáveis sozinho.
+  Rode `oc apply -k deploy/openshift` (ou atualize o Secret) e depois `oc rollout restart deploy/signature-orchestrator`.
 - **Antes de atualizar**, faça o backup da seção 1.8 se a versão nova acrescentar uma migração de schema. O log de start mostra `schema vN`: compare o número com o da versão anterior.
 - **Rollback:** `oc rollout undo deploy/signature-orchestrator` volta para a réplica anterior (imagem e configuração do pod). Os dados do PVC permanecem.
   O rollback **não desfaz migração de banco**. As migrações só são acrescentadas ao final (`PRAGMA user_version`), mas uma imagem antiga sobre

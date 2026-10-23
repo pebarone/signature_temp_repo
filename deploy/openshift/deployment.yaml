@@ -1,5 +1,5 @@
 # Deployment do orquestrador. Requisitos de storage em README.md: um pod, PVC RWO, estratégia Recreate.
-# Antes de aplicar: trocar a imagem pelo build feito com deploy/openshift/Containerfile.
+# A imagem é definida em kustomization.yaml (images:), não aqui: aplique sempre com `oc apply -k deploy/openshift`.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -9,6 +9,7 @@ metadata:
 spec:
   # PVC RWO + SQLite: exatamente uma réplica. Não aumentar sem rever o storage.
   replicas: 1
+  revisionHistoryLimit: 5
   strategy:
     # Recreate: o pod antigo termina antes de o novo subir (nunca dois processos sobre o mesmo volume).
     type: Recreate
@@ -20,11 +21,14 @@ spec:
       labels:
         app: signature-orchestrator
     spec:
+      # O shutdown do Node (SIGTERM) fecha HTTP e SQLite em até 10 s; 30 s dão folga antes do SIGKILL
       terminationGracePeriodSeconds: 30
+      # A aplicação não usa a API do Kubernetes: sem token da service account no pod
+      automountServiceAccountToken: false
       containers:
         - name: signature-orchestrator
-          # Substituir pela imagem construída e enviada ao registry (ver README, passo 2.5).
-          image: <registry>/<namespace>/signature-orchestrator:<tag>
+          # Nome lógico: o kustomization.yaml (images:) troca pelo registry/tag reais
+          image: signature-orchestrator
           command: ["node", "server/index.js"]
           ports:
             - name: http

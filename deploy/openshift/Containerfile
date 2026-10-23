@@ -8,12 +8,14 @@
 # Estágio 1: instala só as dependências de produção (o prebuild do better-sqlite3 é baixado aqui)
 FROM registry.access.redhat.com/ubi9/nodejs-22 AS build
 WORKDIR /opt/app-root/src
-COPY package.json package-lock.json ./
-RUN npm ci --omit=dev
+# A imagem roda como 1001: os arquivos copiados precisam ser dele para o npm escrever node_modules ao lado
+COPY --chown=1001:0 package.json package-lock.json ./
+RUN npm ci --omit=dev --no-audit --no-fund
 
 # Estágio 2: runtime enxuto, com node_modules do estágio 1 e o código da aplicação
 FROM registry.access.redhat.com/ubi9/nodejs-22-minimal
 WORKDIR /opt/app-root/src
+ENV NODE_ENV=production
 COPY --from=build /opt/app-root/src/node_modules ./node_modules
 # Subpastas de server/ listadas uma a uma: server/serverModules e server/logs são locais, ignorados pelo Git,
 # e não devem entrar na imagem

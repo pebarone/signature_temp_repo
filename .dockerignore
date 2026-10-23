@@ -11,3 +11,9 @@ inProcess
 test
 docs
 content-server-rest-api-2.0.2.yaml
+# Arquivos locais e de teste que não entram na imagem
+**/*.pdf
+AGENTS.md
+CLAUDE.md
+.claude
+start.bat
