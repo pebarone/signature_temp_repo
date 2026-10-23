@@ -342,24 +342,18 @@ REASIGNADO_OK
       <p class="intro">Busque los flujos que están en "Aguardar Firma" y márquelos (máximo <span id="max-flujos"></span>). Al pulsar "Revisar" se guarda la selección en esta tarea y se consulta el estado de cada acuerdo en Adobe Sign; todavía no se cancela nada.</p>
 
       <h2 class="seccion">Buscar</h2>
-      <form id="form-busqueda" method="get" action="">
-        <!-- Parametros fijos de la URL del WebReport. Los valores se completan por script desde la configuracion y las tags de OTCS. -->
-        <input type="hidden" name="func" value="ll">
-        <input type="hidden" name="objAction" value="RunReport">
-        <input type="hidden" name="objId" id="f-objid" value="">
-        <input type="hidden" name="workid" id="f-workid" value="">
-        <input type="hidden" name="subworkid" id="f-subworkid" value="">
-        <input type="hidden" name="taskid" id="f-taskid" value="">
+      <form id="form-busqueda" action="" novalidate>
+        <!-- Filtros en la pagina: el LiveReport trae todos los flujos en "Aguardar Firma" y aqui solo se ocultan filas (sin recargar). -->
         <div class="filtros">
-          <label class="campo">ID empleado<input type="text" name="idempleado" id="q-idempleado" autocomplete="off" inputmode="numeric"></label>
-          <label class="campo">Nombre<input type="text" name="nombre" id="q-nombre" autocomplete="off"></label>
-          <label class="campo">Cédula<input type="text" name="cedula" id="q-cedula" autocomplete="off" inputmode="numeric"></label>
-          <label class="campo">Documento<input type="text" name="documento" id="q-documento" autocomplete="off"></label>
-          <label class="campo">Desde<input type="date" name="desde" id="q-desde"></label>
-          <label class="campo">Hasta<input type="date" name="hasta" id="q-hasta"></label>
+          <label class="campo">Flujo<input type="text" id="q-flujo" autocomplete="off" inputmode="numeric"></label>
+          <label class="campo">Empleado (usuario)<input type="text" id="q-empleado" autocomplete="off"></label>
+          <label class="campo">Nombre<input type="text" id="q-nombre" autocomplete="off"></label>
+          <label class="campo">Documento<input type="text" id="q-documento" autocomplete="off"></label>
+          <label class="campo">Desde<input type="date" id="q-desde"></label>
+          <label class="campo">Hasta<input type="date" id="q-hasta"></label>
         </div>
         <div class="barra">
-          <button class="btn chico" type="submit">Buscar</button>
+          <button class="btn chico" type="submit">Filtrar</button>
           <button class="btn secundario chico" type="button" id="btn-limpiar-filtros">Limpiar filtros</button>
         </div>
       </form>
@@ -374,9 +368,8 @@ REASIGNADO_OK
               <th class="num">Subflujo</th>
               <th>Título</th>
               <th>Fecha</th>
-              <th class="num">ID empleado</th>
+              <th>Empleado</th>
               <th>Nombre</th>
-              <th class="num">Cédula</th>
               <th>Documento</th>
             </tr>
           </thead>
@@ -525,20 +518,14 @@ REASIGNADO_OK
   <div hidden>
     <textarea id="dato-flujo" hidden readonly>[LL_REPTAG_&SUBWORKID WFATTR:"ID Flujo a Cancelar":DISPLAY /]</textarea>
     <textarea id="dato-subflujo" hidden readonly>[LL_REPTAG_&SUBWORKID WFATTR:"ID Subflujo a Cancelar":DISPLAY /]</textarea>
-    <!-- Filas devueltas por el LiveReport (columnas en este orden: WorkID, SubWorkID, Titulo, Fecha, IDEmpleado, Nombre, Cedula, Documento, DataID).
-         Cada valor va en un textarea y el script lo lee como texto literal. VALIDAR EN QA: marcadores de fila y tags de columna por numero. -->
+    <!-- Filas devueltas por el LiveReport (columnas en este orden: WorkID, SubWorkID, TituloFlujo, TituloFirma, Mapa, Fecha,
+         EstadoSubflujo, Atributos en JSON). Cada valor va en un textarea y el script lo lee como texto literal.
+         VALIDAR EN QA: marcadores de fila y tags de columna por numero. -->
     <table id="origen"><tbody>
 [LL_WEBREPORT_STARTROW /]
       <tr><td><textarea>[LL_REPTAG_1 /]</textarea></td><td><textarea>[LL_REPTAG_2 /]</textarea></td><td><textarea>[LL_REPTAG_3 /]</textarea></td><td><textarea>[LL_REPTAG_4 /]</textarea></td><td><textarea>[LL_REPTAG_5 /]</textarea></td><td><textarea>[LL_REPTAG_6 /]</textarea></td><td><textarea>[LL_REPTAG_7 /]</textarea></td><td><textarea>[LL_REPTAG_8 /]</textarea></td></tr>
 [LL_WEBREPORT_ENDROW /]
     </tbody></table>
-    <!-- Valores actuales de los filtros (parametros de la URL) para volver a mostrarlos tras buscar. -->
-    <textarea id="p-idempleado">[LL_REPTAG_&IDEMPLEADO /]</textarea>
-    <textarea id="p-nombre">[LL_REPTAG_&NOMBRE /]</textarea>
-    <textarea id="p-cedula">[LL_REPTAG_&CEDULA /]</textarea>
-    <textarea id="p-documento">[LL_REPTAG_&DOCUMENTO /]</textarea>
-    <textarea id="p-desde">[LL_REPTAG_&DESDE /]</textarea>
-    <textarea id="p-hasta">[LL_REPTAG_&HASTA /]</textarea>
   </div>
 
 <script>
@@ -551,6 +538,9 @@ REASIGNADO_OK
        - REPORT_ID: ID de ESTE WebReport en el ambiente (QA/PROD: por asignar al publicarlo). WebReports no tiene una tag
          para el ID del propio reporte (la tag REPORTID no existe). Lo usan los ramos guardar, leer y reasignar;
        - MAX_FLUJOS: tope de flujos por cancelacion. Debe ser IGUAL a CANCEL_MAX_TARGETS del orquestador (por defecto 20);
+       - ATRIBUTOS_FIRMA: wf_attrid de los atributos del sub-flujo de firma que muestra la tabla. Son los mismos en todos
+         los mapas de firma (clones del mapa Firma usados como sub-flujo en Contratacion y Documental): 4 Empleado (usuario),
+         7 Nombre del Documento, 6 DocID. Si un mapa no los tiene con ese tipo, la columna queda vacia;
        - ATRIBUTO: nombre del atributo de destino. Es solo texto para el usuario: el nombre que manda esta en las tags
          SETWFATTR / WFATTR del WebReport (arriba) y debe ser igual a CANCEL_FIELD_TARGET_WORKFLOW del servidor;
        - usuario de integracion (11742766 en QA, AdminKeralty): NO va en este script.
@@ -566,6 +556,7 @@ REASIGNADO_OK
   const REPORT_ID = 'REPORT_ID_POR_ASIGNAR';
   const MAX_FLUJOS = 20;
   const ATRIBUTO = 'ID Flujo a Cancelar';
+  const ATRIBUTOS_FIRMA = { empleado: 4, documento: 7, docId: 6 };
   /* ============================ fin de la configuracion ============================ */
 
   /* Valores de OTCS. WORKFLOW_ID / SUBWORKFLOW_ID son los del workflow de CANCELACION (la tarea donde corre este WebReport).
@@ -583,7 +574,8 @@ REASIGNADO_OK
   const MARCA_GUARDADO = 'GUARDADO' + '_OK';
   const MARCA_LEIDO = 'LEIDO' + '_OK';
   const CLAVE_SEL = 'cancelar-sel-' + WORKFLOW_ID;
-  const COLUMNAS = ['workId', 'subWorkId', 'titulo', 'fecha', 'idEmpleado', 'nombre', 'cedula', 'documento'];
+  const COLUMNAS = ['workId', 'subWorkId', 'tituloFlujo', 'tituloFirma', 'mapa', 'fecha', 'estado', 'atributos'];
+  const FILTROS = ['flujo', 'empleado', 'nombre', 'documento', 'desde', 'hasta'];
   const MSG_ASIGNAR = 'No fue posible asignar la tarea. Intente de nuevo.';
   const CABECERAS = { 'Content-Type': 'application/json', 'ngrok-skip-browser-warning': 'true' };
   const ORDEN_PASOS = ['guardar', 'asignar', 'trabajo', 'listo'];
@@ -683,7 +675,7 @@ REASIGNADO_OK
   const state = {
     modo: 'seleccion', ocupado: false, intentado: false, paso: 'trabajo', handoff: null, reasignado: false, ultima: 'revisar',
     destinoIds: [], destinoSubflujo: '', cancelables: 0, hayParcial: false, stopOriginal: false, yaEjecutado: false,
-    filas: [], seleccion: new Map()
+    filas: [], visibles: [], seleccion: new Map()
   };
 
   /* ---------- Utilidades ---------- */
@@ -734,13 +726,6 @@ REASIGNADO_OK
       el.appendChild(typeof c === 'string' ? document.createTextNode(c) : c);
     });
     return el;
-  }
-
-  /* Valor de un parametro de la URL leido por la tag. Si OTCS no lo resuelve puede dejar vacio, "?" o la propia tag. */
-  function parametro(id) {
-    const v = valorDe(id);
-    if (!v || v === '?' || v.charAt(0) === '&' || v.indexOf('LL_REPTAG') >= 0) return '';
-    return v;
   }
 
   /* Valor de una celda del LiveReport: "?" es como OTCS muestra vacio. */
@@ -1312,7 +1297,26 @@ REASIGNADO_OK
     try { window.sessionStorage.removeItem(CLAVE_SEL); } catch (_) { /* idem */ }
   }
 
-  /* Une filas con el mismo WorkID (un flujo con varios subflujos): la seleccion es por WorkID. */
+  /* Atributos del sub-flujo (JSON del LiveReport: [{id, t, n, s, i, login, nombre}]) => { empleado, nombre, documento, docId }.
+     Solo usa un atributo si el tipo coincide (14 usuario, -1 texto): en un mapa distinto la columna queda vacia, no errada. */
+  function leerAtributos(json) {
+    let lista = [];
+    try { lista = JSON.parse(json || '[]'); } catch (_) { lista = []; }
+    if (!Array.isArray(lista)) lista = [];
+    const de = (id, tipo) => lista.find((a) => esObjeto(a) && Number(a.id) === id && Number(a.t) === tipo) || null;
+    const texto = (v) => (v === null || v === undefined ? '' : celda(String(v)));
+    const emp = de(ATRIBUTOS_FIRMA.empleado, 14);
+    const doc = de(ATRIBUTOS_FIRMA.documento, -1);
+    const docId = de(ATRIBUTOS_FIRMA.docId, -1);
+    return {
+      empleado: emp ? texto(emp.login) : '',
+      nombre: emp ? texto(emp.nombre) || texto(emp.login) : '',
+      documento: doc ? texto(doc.s) : '',
+      docId: docId ? texto(docId.s) : ''
+    };
+  }
+
+  /* Une filas con el mismo WorkID (un flujo con varios subflujos): la seleccion es por WorkID (se cancela y detiene el padre). */
   function leerFilas() {
     const porId = new Map();
     document.querySelectorAll('#origen tbody tr').forEach((tr) => {
@@ -1321,6 +1325,8 @@ REASIGNADO_OK
       const f = {};
       COLUMNAS.forEach((c, i) => { f[c] = celdas[i]; });
       if (!esDigitos(f.workId)) return;
+      Object.assign(f, leerAtributos(f.atributos));
+      f.titulo = f.tituloFlujo || f.tituloFirma;
       const previa = porId.get(f.workId);
       if (previa) {
         if (f.subWorkId && previa.subs.indexOf(f.subWorkId) < 0) previa.subs.push(f.subWorkId);
@@ -1336,10 +1342,33 @@ REASIGNADO_OK
     return [f.nombre, f.documento].filter(Boolean).join(' - ');
   }
 
+  /* Filtros de la etapa A, aplicados sobre las filas ya cargadas. Texto: contiene, sin distinguir mayusculas ni acentos.
+     Fechas: AAAA-MM-DD (input date) comparadas con el inicio del sub-flujo (Fecha sale del LiveReport como AAAA-MM-DD HH24:MI). */
+  function normal(v) {
+    return String(v || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toUpperCase().trim();
+  }
+
+  function filtrar() {
+    const q = {};
+    FILTROS.forEach((n) => { q[n] = $('q-' + n).value.trim(); });
+    const contiene = (valor, buscado) => !buscado || normal(valor).indexOf(normal(buscado)) >= 0;
+    state.visibles = state.filas.filter((f) => {
+      const dia = String(f.fecha || '').slice(0, 10);
+      return contiene([f.workId].concat(f.subs).join(' '), q.flujo)
+        && contiene(f.empleado, q.empleado)
+        && contiene(f.nombre + ' ' + f.empleado, q.nombre)
+        && contiene(f.documento, q.documento)
+        && (!q.desde || (dia && dia >= q.desde))
+        && (!q.hasta || (dia && dia <= q.hasta));
+    });
+    pintarTabla();
+    refrescar();
+  }
+
   function pintarTabla() {
     const tbody = $('tbody');
     tbody.textContent = '';
-    state.filas.forEach((f) => {
+    state.visibles.forEach((f) => {
       const marcada = state.seleccion.has(f.workId);
       const chk = h('input', { type: 'checkbox', class: 'chk-fila', 'data-id': f.workId, 'aria-label': 'Seleccionar el flujo ' + f.workId });
       chk.checked = marcada;
@@ -1348,16 +1377,16 @@ REASIGNADO_OK
         h('td', { class: 'col-check' }, chk),
         h('td', { class: 'num' }, f.workId),
         h('td', { class: 'num' }, f.subs.join(', ')),
-        h('td', { class: 'largo' }, f.titulo),
+        h('td', { class: 'largo', title: f.tituloFirma || null }, f.titulo),
         h('td', null, f.fecha),
-        h('td', { class: 'num' }, f.idEmpleado),
+        h('td', null, f.empleado),
         h('td', { class: 'largo' }, f.nombre),
-        h('td', { class: 'num' }, f.cedula),
         h('td', { class: 'largo' }, f.documento)));
     });
-    $('tabla-caja').hidden = state.filas.length === 0;
-    $('vacio').hidden = state.filas.length !== 0;
-    $('total-resultados').textContent = state.filas.length ? '(' + state.filas.length + ')' : '';
+    const n = state.visibles.length;
+    $('tabla-caja').hidden = n === 0;
+    $('vacio').hidden = n !== 0;
+    $('total-resultados').textContent = n === state.filas.length ? (n ? '(' + n + ')' : '') : '(' + n + ' de ' + state.filas.length + ')';
   }
 
   function pintarSeleccion() {
@@ -1380,8 +1409,8 @@ REASIGNADO_OK
 
   /* Casilla "seleccionar todos" de las filas visibles: marcada si todas lo estan, intermedia si algunas. */
   function pintarTodos() {
-    const total = state.filas.length;
-    const marcadas = state.filas.filter((f) => state.seleccion.has(f.workId)).length;
+    const total = state.visibles.length;
+    const marcadas = state.visibles.filter((f) => state.seleccion.has(f.workId)).length;
     [$('chk-todos'), $('chk-todos-2')].forEach((el) => {
       el.checked = total > 0 && marcadas === total;
       el.indeterminate = marcadas > 0 && marcadas < total;
@@ -1419,7 +1448,7 @@ REASIGNADO_OK
 
   function alternarTodos(marcar) {
     let recortado = false;
-    state.filas.forEach((f) => {
+    state.visibles.forEach((f) => {
       if (marcar) {
         if (state.seleccion.has(f.workId)) return;
         if (state.seleccion.size >= MAX_FLUJOS) { recortado = true; return; }
@@ -1569,14 +1598,8 @@ REASIGNADO_OK
 
   function iniciar() {
     $('max-flujos').textContent = String(MAX_FLUJOS);
-    $('f-objid').value = REPORT_ID;
-    $('f-workid').value = WORKFLOW_ID;
-    $('f-subworkid').value = SUBWORKFLOW_ID;
-    $('f-taskid').value = TASK_ID;
-    $('form-busqueda').setAttribute('action', OTCS_URL);
-    ['idempleado', 'nombre', 'cedula', 'documento', 'desde', 'hasta'].forEach((n) => { $('q-' + n).value = parametro('p-' + n); });
-
     state.filas = leerFilas();
+    state.visibles = state.filas.slice();
     pintarTabla();
 
     /* Lo que ya hay en el atributo (reapertura: pendientes de un lote anterior, o IDs pegados a mano). */
@@ -1588,8 +1611,11 @@ REASIGNADO_OK
     $('chk-todos-2').addEventListener('change', (e) => alternarTodos(e.target.checked));
     $('btn-revisar-sel').addEventListener('click', abrirModal);
     $('btn-limpiar-seleccion').addEventListener('click', () => { state.seleccion.clear(); setEstadoSel('', ''); refrescar(); });
+    $('form-busqueda').addEventListener('submit', (e) => { e.preventDefault(); filtrar(); });
+    FILTROS.forEach((n) => $('q-' + n).addEventListener('input', filtrar));
     $('btn-limpiar-filtros').addEventListener('click', () => {
-      ['idempleado', 'nombre', 'cedula', 'documento', 'desde', 'hasta'].forEach((n) => { $('q-' + n).value = ''; });
+      FILTROS.forEach((n) => { $('q-' + n).value = ''; });
+      filtrar();
     });
     $('btn-volver-guardados').addEventListener('click', irARevision);
     $('modal-volver').addEventListener('click', cerrarModal);

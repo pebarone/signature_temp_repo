@@ -8,6 +8,7 @@ reatribuição: [`../README.md`](../README.md). Nada daqui foi publicado nem exe
 |---|---|---|
 | [`Cancelar Flujo de Firma.html`](Cancelar%20Flujo%20de%20Firma.html) | **página única** da tarefa "Cancelar Flujo de Firma" (`CANCEL_TASK_NAMES`): seleção, gravação, revisão e cancelamento | sim: `/auth`, `/cancel/preview`, `/cancel` |
 | [`Cancelar Flujo de Firma.sql`](Cancelar%20Flujo%20de%20Firma.sql) | LiveReport que alimenta a etapa de seleção (fonte de dados do WebReport) | não |
+| [`Cancelar Flujo de Firma - diagnostico.sql`](Cancelar%20Flujo%20de%20Firma%20-%20diagnostico.sql) | LiveReport de diagnóstico, só leitura e sem parâmetros: confere no destino as premissas da query acima | não |
 
 Modelo da página: [`../firma-flujo-puro/Requisicion de Firma.html`](../firma-flujo-puro/Requisicion%20de%20Firma.html)
 (mesma estrutura, mesmo bloco de configuração, mesmo ramo `reasignar`, mesmo estilo).
@@ -28,8 +29,10 @@ página (ELSE). Fonte de dados = o LiveReport. As etapas ficam na mesma página,
 - atributo **com IDs** (reabertura, por exemplo pendentes de um lote anterior, ou IDs colados à mão): mostra os IDs e oferece
   **"Revisar flujos"** (direto para a etapa C, sem regravar) e **"Cambiar selección"** (etapa A, já com esses IDs marcados).
 
-**A. Buscar e marcar.** O LiveReport lista as tarefas "Aguardar Firma" ativas. Filtros: ID do empregado, nome, cédula, documento,
-desde e hasta (parâmetros de URL `idempleado`, `nombre`, `cedula`, `documento`, `desde`, `hasta`; vazio = sem filtro). Tabela com
+**A. Buscar e marcar.** O LiveReport traz todas as tarefas "Aguardar Firma" ativas (sub-fluxos de firma) e a página filtra na
+hora, sem recarregar: flujo (WorkID ou SubWorkID), empregado (login), nome, documento (contém, sem distinguir maiúsculas nem
+acentos), desde e hasta (início do sub-fluxo, inclusivos); vazio = sem filtro. Empregado, nome, documento e DocID saem do JSON
+de atributos com os `wf_attrid` de `ATRIBUTOS_FIRMA` (4, 7, 6, iguais em todos os clones do mapa Firma). Tabela com
 checkboxes, "Seleccionar todos" e contador "Seleccionados: N de 20" (`MAX_FLUJOS`; passando dele a página não deixa marcar mais).
 A seleção fica em sessionStorage entre buscas (sem ele, só em memória). Um aviso diz que a revisão pode transferir a tarefa ao
 usuário de integração.
@@ -107,6 +110,16 @@ Textos em espanhol, como na página. "Reintentar" diz se o botão faz sentido. O
 
 ## Parada do fluxo original (`CANCEL_STOP_ORIGINAL`)
 
+**Decisão (23/10/2026):** o fluxo original parado é o **processo inteiro** (`WorkID`). Em sub-fluxos de firma de
+Contratación e Documental, o `WorkID` é o **pai**: a Contratación/Documental inteira é encerrada, não só a firma. Base: o
+ticket 2026060410003715 (`Casos Keralty.docx`) pede "detener completamente un flujo que no se necesite ejecutar" e, depois
+do cancelamento no Adobe, "envíe la cancelación del flujo en el content y demos por cerrado los dos flujos"; não fala de
+sub-fluxo, e o usuário definiu que, sem especificação, o fluxo fecha. **O fluxo de firma nunca roda sozinho** em produção:
+é sempre sub-fluxo, e devem parar **os dois** (pai e firma). No OTCS o sub-fluxo pertence ao mesmo processo do pai
+(`wsubwork.subwork_workid` = `WorkID` do pai), e o stop (`PUT /v2/processes/{WorkID}/status`) é sobre esse processo.
+VALIDAR NO QA: depois do stop do pai, a tarefa "Aguardar Firma" do sub-fluxo sai do status 2 (o LiveReport deixa de listá-la).
+Se não sair, o servidor precisa parar também o sub-fluxo.
+
 - Com `CANCEL_STOP_ORIGINAL=true` o orquestrador **para** (stop, nunca exclui nem arquiva) o fluxo original no Content, item a
   item, logo depois de o Adobe confirmar o cancelamento. Então o passo "Detener flujos originales" do mapa **não é necessário** (e
   não deve rodar junto, para não parar duas vezes). O texto da prévia diz: "Al confirmar, los flujos se cancelan en Adobe Sign y se
@@ -128,6 +141,7 @@ e linha `WFTASKACTION:REASSIGN`):
 |---|---|---|
 | `REPORT_ID` | script | ID do nó deste WebReport no ambiente; usado pelos ramos `guardar`, `leer` e `reasignar`. Placeholder `REPORT_ID_POR_ASIGNAR`: sem ID numérico, a gravação e a reatribuição não rodam |
 | `MAX_FLUJOS` | script | Deve ser igual a `CANCEL_MAX_TARGETS` do servidor (padrão 20) |
+| `ATRIBUTOS_FIRMA` | script | `wf_attrid` do sub-fluxo de firma: empleado 4 (tipo 14), documento 7 e docId 6 (tipo -1). Iguais em todos os mapas de firma (clones); só mudam se o formulário do mapa mudar |
 | `SERVER_URL`, `BASIC_USER`, `BASIC_PASS` | script | por ambiente; `ADOBE-LOGS` / `ADOBE-LOGS-PASS` são placeholders |
 | usuário de integração | linha `WFTASKACTION:REASSIGN` do ramo `reasignar` | QA: 11742766 (AdminKeralty); PROD: ID do AdminKeralty de PROD |
 | nomes dos atributos | tags `WFATTR` / `SETWFATTR` e constante `ATRIBUTO` | `ID Flujo a Cancelar` / `ID Subflujo a Cancelar` iguais a `CANCEL_FIELD_TARGET_*` do servidor |
@@ -139,14 +153,42 @@ Lado do servidor (ConfigMap): `CANCEL_ENABLED`, `CANCEL_TASK_NAMES`, `CANCEL_FIE
 
 ## LiveReport (`Cancelar Flujo de Firma.sql`)
 
-- **Não foi executado em nenhum OTCS.** Os placeholders `<<TABLA_ATRIBUTOS>>`, `<<STATUS_TAREA_ACTIVA>>` e `<<ATTR_*>>` são
-  propositais: o arquivo não é SQL válido até serem preenchidos. As consultas de ajuda no fim do arquivo servem para
-  descobri-los no QA, uma a uma, com um WorkID conhecido.
-- Colunas, na ordem (a página lê por posição, `[LL_REPTAG_1]` a `[LL_REPTAG_8]`): 1 `WorkID`, 2 `SubWorkID`, 3 `Titulo`,
-  4 `Fecha`, 5 `IDEmpleado`, 6 `Nombre`, 7 `Cedula`, 8 `Documento`. A coluna 9 `DataID` existe só para a checagem de
-  permissão do LiveReport; a página não a usa.
-- Parâmetros `:A1` a `:A6` (idempleado, nombre, cedula, documento, desde, hasta). Todos aceitam vazio (sem filtro).
-- Dialeto: a versão Oracle está ativa; as linhas de SQL Server estão comentadas. Falta validar qual banco o ambiente usa.
+**Divisão:** o LiveReport só traz dados, genérico para qualquer mapa e **sem parâmetros**; filtros, escolha dos atributos por
+mapa e regras ficam no WebReport, que pode ser editado no destino (o LiveReport não pode: só é transportado pelo Warehouse).
+Assim os IDs que mudam entre instâncias e mapas não ficam no SQL.
+
+- **Versão genérica ainda não executada.** A versão anterior (só mapa Firma, com parâmetros) rodou em 23/10/2026 na
+  instância de origem e confirmou tabelas, junções e o status de tarefa ativa.
+- Lista **todas** as tarefas "Aguardar Firma" ativas (`subworktask_status = 2`), de qualquer mapa. Em produção a firma é
+  sempre sub-fluxo de Contratación ou Documental (`WorkID` = pai, `SubWorkID` = sub-fluxo); `WorkID = SubWorkID` só aparece
+  quando o mapa de firma é iniciado sozinho para teste.
+- Colunas, na ordem:
+  1. `WorkID`: processo pai (é o ID que vai para "ID Flujo a Cancelar" e o que é parado);
+  2. `SubWorkID`: subprocesso onde está a tarefa (os atributos ficam nele);
+  3. `TituloFlujo`: título do processo pai (`wsubwork` com `subworkid = workid`);
+  4. `TituloFirma`: título do sub-fluxo de assinatura;
+  5. `Mapa`: nome do nó do mapa do sub-fluxo (`wsubwork.subwork_mapid = wmap.map_mapid`, `wmap.map_mapobjid = dtree.dataid`);
+  6. `Fecha`: início do sub-fluxo, texto `AAAA-MM-DD HH24:MI` (a página filtra por data com ele);
+  7. `EstadoSubflujo`: `subwork_status` (códigos não conferidos; serve para a página descartar sub-fluxos parados);
+  8. `Atributos`: JSON com todos os atributos do sub-fluxo, `[{id, t, n, s, i, login, nombre}]` (`wf_attrid`, tipo,
+     entrada, `wf_valstr`, `wf_valint`; para tipo 14, usuário, `login` = `kuaf.name` e `nombre` = nome completo).
+- O WebReport escolhe, **por nome de mapa**, quais atributos usar (empregado, documento, DocID). Mapa **Firma** no QA
+  (`wf_attrid`, tipo): 4 Empleado (14), 5 Firmante 2 (14), 6 DocID (-1), 7 Nombre del Documento (-1), 8 AttachID (-1),
+  9 WFID (-1), 10 Email Firmante 1 (-1), 11 Email Firmante 2 (-1), 14 Tipo documental (10). Os demais mapas de assinatura
+  (sub-fluxos de Contratación e Documental) ainda não foram levantados.
+- `subworktask_status` conferido no QA: **2 = ativa**, **1 = ainda não alcançada**, **-1 = concluída**.
+- `wfattrdata.wf_id` = `SubWorkID` (conferido pelo diagnóstico no mapa Firma: 0 fluxos sem atributos).
+- Sem checagem de permissão por linha (não há coluna `DataID`): **restringir o WebReport e o LiveReport a um grupo**.
+- Dialeto: **PostgreSQL** (`JSON_AGG`/`JSON_BUILD_OBJECT`, 9.4+). Comentários mínimos de propósito: o OTCS rejeita termos
+  como `FETCH` mesmo em comentário. Sem limite de linhas no SQL; sem `;` no fim.
+- **Diagnóstico** (`Cancelar Flujo de Firma - diagnostico.sql`, sem parâmetros): `tareas_aguardar_firma_activas`,
+  `por_mapa` (nome e ID dos mapas com a tarefa ativa: é a lista de mapas a configurar no WebReport) e checagens do mapa
+  Firma (`atributos_mapa_firma`, `firma_sin_atributos_en_subworkid`, `firma_docid_no_numerico`,
+  `firma_empleado_sin_usuario`). Rodado na origem em 23/10/2026: 1 tarefa, mapa `Firma` (21538127), atributos como acima.
+- Consultas de ajuda (com o `SubWorkID` de um fluxo em "Aguardar Firma"):
+  `SELECT subworktask_taskid, subworktask_title, subworktask_status FROM wsubworktask WHERE subworktask_subworkid = <SubWorkID>`;
+  `SELECT wf_attrid, wf_attrtype, wf_entrynum, wf_valint, wf_valstr FROM wfattrdata WHERE wf_id = <SubWorkID>`.
+- A página lê estas 8 colunas por posição e filtra sozinha; testada só com dados simulados (navegador local, 23/10/2026).
 - O LiveReport também roda nos ramos `guardar`, `leer` e `reasignar` (o WebReport sempre executa a fonte); as linhas só são
   emitidas na página.
 
@@ -197,15 +239,16 @@ Roteiro do design (acordo de teste `OUT_FOR_SIGNATURE`). Nada disto foi validado
    padrão no `LL_WEBREPORT_IF`; se não houver, validar o formato (dígitos separados por vírgula) antes da tag. O GET com a
    sessão do usuário é alcançável por link: restringir o WebReport a um grupo.
 4. `LL_WEBREPORT_STARTROW`/`ENDROW` e `[LL_REPTAG_1..8]` dentro dos três IF aninhados.
-5. Parâmetros de URL mapeados na aba Parameters (se faltar, pode sair vazio, `?` ou literal; a página trata).
+5. Saída das colunas do LiveReport no WebReport: o JSON de `Atributos` (coluna 8) chega íntegro dentro do textarea e
+   `Fecha` (coluna 6) no formato `AAAA-MM-DD HH24:MI`.
 6. `&WORKID`, `&SUBWORKID` e `&TASKID` disponíveis na tarefa quando o WebReport abre.
 7. Formulário aberto pode sobrescrever o atributo ao enviar a tarefa; e se o formulário permite guardar sem enviar (plano C).
 8. Forma do array que o servidor envia a `IDs Cancelados` (`updateTaskForm`), e a leitura desse atributo multivalor pelo
    servidor: não validadas no OTCS.
-9. Permissões do LiveReport: nome da opção de checagem e se o LiveReport exclui as linhas sem permissão; alternativa é
-   restringir por grupo. Os dois candidatos para a coluna 9 (DocID do contrato, DataID do mapa) estão no `.sql`.
+9. Permissões: o LiveReport lista todos os fluxos em "Aguardar Firma", sem checagem por linha; restringir o WebReport e o
+   LiveReport ao grupo que pode cancelar.
 10. `REPORT_ID_POR_ASIGNAR` bloqueia a gravação e a reatribuição até ser trocado.
-11. SQL inteiro: tabelas e colunas, tabela de atributos, código de tarefa ativa, IDs de atributos e dialeto.
+11. SQL inteiro: tabelas e colunas, tabela de atributos, código de tarefa ativa e IDs de atributos (o dialeto é PostgreSQL).
 12. Gravar o atributo depois que a tarefa foi transferida ao AdminKeralty ("Cambiar selección" pós-revisão): permissão do usuário
     humano sobre a tarefa; ver o risco acima.
 13. Valores de status do processo usados pelo servidor para reconhecer "já parado" (`CANCEL_STOP_ORIGINAL`) e a permissão do
@@ -216,7 +259,7 @@ Roteiro do design (acordo de teste `OUT_FOR_SIGNATURE`). Nada disto foi validado
 - **Nó do WebReport e mapa do workflow de cancelamento não existem no Content.** Faltam os atributos `ID Flujo a Cancelar`,
   `IDs Cancelados` e `ID Subflujo a Cancelar` no formulário, a tarefa com o nome de `CANCEL_TASK_NAMES` e, com
   `CANCEL_STOP_ORIGINAL=false`, o passo que para só os WorkIDs de `IDs Cancelados`. `REPORT_ID` é placeholder até publicar.
-- **LiveReport não executado** e com placeholders `<<...>>`.
+- **LiveReport sem placeholders, mas ainda não executado** no OTCS; atributos conferidos só para o mapa Firma.
 - **Aviso de firma parcial** mostra a quantidade e a data, mas o servidor não bloqueia o cancelamento: a página só exige
   ciência. Decisão pendente (ver o design, "Em aberto", item 4).
 - **Fluxo ambíguo** não se resolve na página: o servidor só aceita subflujo com um fluxo, e a página não grava
