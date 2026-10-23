@@ -3,5 +3,5 @@ cd /d "%~dp0"
 start "Servidor" cmd /k "npm start"
 
 
-start "Ngrok" cmd /k "server\http\ngrok.exe http --domain=legible-chipmunk-only.ngrok-free.app 3000"
+start "Ngrok" cmd /k "ngrok http --domain=legible-chipmunk-only.ngrok-free.app 3000"
 
