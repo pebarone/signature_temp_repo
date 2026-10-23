@@ -2,23 +2,29 @@
 // Caso de uso do cancelamento de fluxos (ticket 2026060410003715, "Cancelación y reenvío de flujos"):
 //   cancelAgreement(id)        -> consulta o Adobe, pede o cancelamento e marca o acordo como encerrado
 //   cancelWorkflow(workflowId) -> acha o acordo aberto do fluxo (nunca o de outro subprocesso) e cancela
-//   cancelFromTask(input)      -> POST /cancel do WebReport: lê no OTCS o fluxo alvo, cancela e faz o SendOn da tarefa
-//                                 do workflow de cancelamento
+//   cancelFromTask(input)      -> POST /cancel do WebReport (LOTE): lê no OTCS os fluxos alvo (atributo multivalor), cancela
+//                                 um a um (cancelWorkflow), grava os cancelados no atributo de resultado e faz o SendOn da
+//                                 tarefa do workflow de cancelamento
+//   previewFromTask(input)     -> POST /cancel/preview: classifica cada alvo SEM cancelar nem gravar nada
 // O orquestrador NÃO encerra o fluxo original no Content: isso é do workflow de cancelamento. Por isso o acordo
 // cancelado fica "concluído" (agreementState.cancelRequestedPatch) e o AGREEMENT_RECALLED posterior não gera Rechazado.
 // Decisões e pontos em aberto: docs/DESIGN_TICKET_2026060410003715.md.
 const { describeError } = require('../infra/util');
-const { locate } = require('../domain/workflowSteps');
-const { CANCEL_STATES, TARGET, classifyCancelState, selectCancelTarget } = require('../domain/cancellation');
+const { locate, normalizeName } = require('../domain/workflowSteps');
+const {
+  CANCEL_STATES, TARGET, classifyCancelState, selectCancelTarget, parseTargets, classifyCancelOutcome, countSignatures, isProcessFinishedStatus
+} = require('../domain/cancellation');
 const { cancelRequestedPatch } = require('../domain/agreementState');
 const { KINDS, classifyAgreementStatus } = require('../domain/eventPolicy');
-const { ServiceError, fieldValue } = require('./signatureService');
+const { ServiceError } = require('./signatureService');
 
 const MAX_COMMENT_LENGTH = 500;
 const DEFAULT_SETTLE_TIMEOUT_MS = 20000;
+const DEFAULT_BATCH_BUDGET_MS = 15000;
+const DEFAULT_MAX_TARGETS = 20;
+const MAX_SENDON_COMMENT_LENGTH = 1000;
 const DEFAULT_COMMENT = 'Flujo cancelado desde Content Server.';
 const CANCEL_ERROR_MESSAGE = 'Error al cancelar el flujo.';
-const sendOnComment = (agreementId) => `Cancelación confirmada en Adobe Sign (acuerdo ${agreementId})`;
 
 const clean = (v) => (v === undefined || v === null ? '' : String(v).trim());
 const httpStatus = (e) => e?.response?.status;
@@ -40,6 +46,22 @@ const notRegistered = (id) => fail(404, `Acuerdo ${id} no registrado en el orque
 // Comentário do cancelamento (o Adobe o mostra a quem for avisado): sem controles, limitado, com texto padrão
 const cleanComment = (c) =>
   clean(String(c ?? '').replace(/[\u0000-\u001f\u007f]+/g, ' ')).slice(0, MAX_COMMENT_LENGTH) || DEFAULT_COMMENT;
+
+// Entrada do formulário da tarefa pelo rótulo (exato; senão ignorando acentos/caixa)
+const fieldEntry = (fields, label) => {
+  if (!label) return undefined;
+  return fields?.[label] ?? Object.entries(fields || {}).find(([k]) => normalizeName(k) === normalizeName(label))?.[1];
+};
+
+// Valores de um atributo, multivalor ou não: o forms API devolve array em `value` para atributo multivalor; escalar
+// (número ou texto, inclusive separado por vírgula) vira lista de um item. Vazios saem; objetos são ignorados.
+const fieldValues = (fields, label) => {
+  const v = fieldEntry(fields, label)?.value;
+  return (Array.isArray(v) ? v : [v])
+    .filter((x) => x !== undefined && x !== null && typeof x !== 'object')
+    .map((x) => String(x).trim())
+    .filter(Boolean);
+};
 
 // Resumo de um acordo para as respostas de erro (ambíguo / encerrado)
 const summary = (r) => ({
@@ -87,9 +109,10 @@ function createCancellationService({
     }
   }
 
-  // Espera a reconciliação em curso do acordo, no máximo cancel.settleTimeoutMs. false = estourou o prazo.
-  async function waitSettled(id) {
-    const limit = Number(config.cancel?.settleTimeoutMs) || DEFAULT_SETTLE_TIMEOUT_MS;
+  // Espera a reconciliação em curso do acordo, no máximo `limitMs` (padrão cancel.settleTimeoutMs; o lote passa o
+  // menor entre ele e o tempo restante do prazo). false = estourou o prazo.
+  async function waitSettled(id, limitMs) {
+    const limit = Number(limitMs) || Number(config.cancel?.settleTimeoutMs) || DEFAULT_SETTLE_TIMEOUT_MS;
     let timer;
     const timeout = new Promise((resolve) => { timer = setTimeout(() => resolve(false), limit); });
     try {
@@ -197,11 +220,12 @@ function createCancellationService({
       - já CANCELLED (recall)/ABORTED: idempotente, não chama o cancelamento (e fecha o registro, se ainda aberto);
       - CANCELLED por recusa do signatário (histórico): 409 ALREADY_REJECTED, registro intacto;
       - SIGNED ou outro estado final: 409.
-    Antes de qualquer chamada ao Adobe, espera a reconciliação que já estava em curso (limite cancel.settleTimeoutMs;
-    estourou => 503 RECONCILE_IN_PROGRESS, nada consultado nem marcado).
+    Antes de qualquer chamada ao Adobe, espera a reconciliação que já estava em curso (limite cancel.settleTimeoutMs, ou
+    `settleTimeoutMs` da opção interna do lote, que o limita ao tempo restante do prazo; estourou => 503
+    RECONCILE_IN_PROGRESS, nada consultado nem marcado).
     Depois do cancelamento confirmado, o acordo vira "concluído" para o pipeline (sem SendOn nem PDF).
   */
-  async function cancelAgreement(agreementId, { comment, source = 'admin' } = {}) {
+  async function cancelAgreement(agreementId, { comment, source = 'admin', settleTimeoutMs } = {}) {
     const id = clean(agreementId);
     const rec = id ? repo.get(id) : null;
     if (!rec) throw notRegistered(id);
@@ -211,7 +235,7 @@ function createCancellationService({
     inflight.add(id);
     const release = hold(id);
     try {
-      if (!(await waitSettled(id))) {
+      if (!(await waitSettled(id, settleTimeoutMs))) {
         logger.warn(`[${id}] cancelación: la reconciliación en curso no terminó a tiempo; no se consulta ni se cancela en Adobe`);
         throw reconcileInProgress();
       }
@@ -226,7 +250,7 @@ function createCancellationService({
     Cancela o acordo aberto de um fluxo (workflowId), opcionalmente de um subprocesso exato. Nunca escolhe o acordo de
     outro subprocesso nem adivinha entre vários: ver domain/cancellation.js (selectCancelTarget).
   */
-  async function cancelWorkflow(workflowId, { subworkflowId, comment, source = 'admin' } = {}) {
+  async function cancelWorkflow(workflowId, { subworkflowId, comment, source = 'admin', settleTimeoutMs } = {}) {
     const wf = clean(workflowId);
     const sub = clean(subworkflowId);
     if (!isNumeric(wf)) throw fail(422, 'workflowId debe ser numérico.', { code: 'INVALID_WORKFLOW_ID' });
@@ -252,18 +276,16 @@ function createCancellationService({
         });
       default:
         // OPEN, o CANCELLED (repetição: o Adobe é reconsultado e o resultado é idempotente)
-        return cancelAgreement(target.record.id, { comment, source });
+        return cancelAgreement(target.record.id, { comment, source, settleTimeoutMs });
     }
   }
 
   /*
-    POST /cancel (WebReport do workflow de cancelamento). `input` é o corpo já autenticado (HMAC v2 + nonce):
-      { workflowId, subworkflowId } = o workflow de cancelamento (a tarefa onde o WebReport roda).
-    O fluxo a cancelar vem SEMPRE do formulário dessa tarefa (atributos CANCEL_FIELD_*), nunca do corpo. Exige a tarefa
-    ativa e atribuída ao usuário de integração. Cancelamento confirmado => SendOn da tarefa do workflow de cancelamento.
-    Repetir depois de uma falha no SendOn é seguro: o acordo já cancelado responde de forma idempotente.
+    Leitura comum de /cancel e /cancel/preview: `input` é o corpo já autenticado (HMAC v2 + nonce) com
+    { workflowId, subworkflowId } = o workflow de cancelamento (a tarefa onde o WebReport roda). Relê a tarefa no OTCS
+    (ativa e atribuída ao usuário de integração) e o formulário dela. Devolve { task, form }; os alvos NUNCA vêm do corpo.
   */
-  async function cancelFromTask(input = {}) {
+  async function readTask(input) {
     const cfg = config.cancel || {};
     const processId = clean(input.workflowId);
     if (!isNumeric(processId)) throw fail(400, 'workflowId is mandatory.');
@@ -325,50 +347,337 @@ function createCancellationService({
       logger.error(`[CANCEL] OTCS getTaskForm(${task.processId}/${task.subprocessId}/${task.taskId}) falló: ${describeError(e)}`);
       throw otcsUnavailable();
     }
+    return { task, form };
+  }
 
-    // O destino sale del atributo del formulario (OTCS = fuente de la verdad); un valor del navegador no cuenta
-    const targetWorkflowId = fieldValue(form.fields, cfg.fields?.targetWorkflow);
-    const targetSubworkflowId = fieldValue(form.fields, cfg.fields?.targetSubworkflow);
-    if (!isNumeric(targetWorkflowId)) {
+  /*
+    Alvos do formulário: atributo multivalor (cfg.fields.targetWorkflow) + subprocesso opcional. O subprocesso só vale
+    com UM alvo (com vários é ignorado: subworkflowIgnored). 422 MISSING_TARGET / INVALID_TARGET / TOO_MANY_TARGETS.
+  */
+  function readTargets(form, task, input) {
+    const cfg = config.cancel || {};
+    const max = Number(cfg.maxTargets) || DEFAULT_MAX_TARGETS;
+    const { ids, invalid, overLimit } = parseTargets(fieldValues(form.fields, cfg.fields?.targetWorkflow), { max });
+    const subs = fieldValues(form.fields, cfg.fields?.targetSubworkflow);
+    const badSubs = subs.length > 1 || (subs.length === 1 && !isNumeric(subs[0])) ? subs : [];
+    if (invalid.length || badSubs.length) {
+      throw fail(422, 'El ID del flujo o del subflujo a cancelar no es válido.', {
+        code: 'INVALID_TARGET', invalid: [...invalid, ...badSubs]
+      });
+    }
+    if (!ids.length) {
       throw fail(422, 'El flujo de cancelación no tiene el ID del flujo a cancelar.', { code: 'MISSING_TARGET' });
     }
-    if (targetSubworkflowId && !isNumeric(targetSubworkflowId)) {
-      throw fail(422, 'El ID del subflujo a cancelar no es válido.', { code: 'INVALID_TARGET' });
+    if (overLimit) {
+      throw fail(422, `Se pueden cancelar como máximo ${max} flujos por solicitud.`, { code: 'TOO_MANY_TARGETS', max });
     }
     const claimed = clean(input.targetWorkflowId);
-    if (claimed && claimed !== targetWorkflowId) {
-      logger.warn(`[CANCEL] Workflow ${processId}: el navegador envió targetWorkflowId=${claimed}; se ignora, vale el atributo del formulario (${targetWorkflowId})`);
+    if (claimed && !ids.includes(claimed)) {
+      logger.warn(`[CANCEL] Workflow ${task.processId}: el navegador envió targetWorkflowId=${claimed}; se ignora, valen los atributos del formulario (${ids.join(', ')})`);
+    }
+    const subworkflowIgnored = ids.length > 1 && subs.length > 0;
+    if (subworkflowIgnored) {
+      logger.warn(`[CANCEL] Workflow ${task.processId}: hay ${ids.length} flujos a cancelar; el subflujo ${subs[0]} se ignora (solo vale con un flujo)`);
+    }
+    return { ids, subworkflowId: ids.length === 1 ? (subs[0] || '') : '', subworkflowIgnored };
+  }
+
+  /*
+    Prazo ÚNICO do lote (e da prévia): deadline = início + cancel.batchBudgetMs. Antes de cada item (o primeiro inclusive,
+    que sempre começa porque o prazo é >= 1 s) calcula-se o tempo restante; <= 0 => BUDGET_EXCEEDED. A espera pela
+    reconciliação em curso de cada item é limitada a min(settleTimeoutMs, restante), então o pior caso normal de um pedido
+    é ~batchBudgetMs + as chamadas ao Adobe do último item (GET + PUT + eventual reconsulta/histórico), abaixo do timeout
+    da rota do OpenShift (~30 s). Exceção: o Adobe travar numa chamada (ADOBE_TIMEOUT_MS, 60 s): a rota corta, o servidor
+    termina o item e repetir é idempotente (IN_PROGRESS / alreadyCancelled).
+  */
+  function makeDeadline() {
+    const limit = Number(config.cancel?.batchBudgetMs) || DEFAULT_BATCH_BUDGET_MS;
+    const deadline = Number(now()) + limit;
+    return { remaining: () => deadline - Number(now()) };
+  }
+
+  const budgetItem = (workflowId) => ({
+    workflowId,
+    outcome: 'pending',
+    code: 'BUDGET_EXCEEDED',
+    message: 'Se agotó el tiempo de la solicitud antes de procesar este flujo; repita la operación.'
+  });
+
+  /*
+    Para (stop) o fluxo ORIGINAL no Content depois de o Adobe confirmar (só com cancel.stopOriginal). Devolve 'stopped',
+    'already_stopped' (o stop falhou, mas o estado relido mostra o processo parado/concluído/arquivado: sucesso idempotente)
+    ou { failed: true, httpStatus } (qualquer erro, inclusive 400/401/403 = sem permissão; sem saber o estado, falha).
+  */
+  async function stopOriginalFlow(workflowId) {
+    try {
+      await otcs.stopProcess(workflowId);
+      return 'stopped';
+    } catch (e) {
+      logger.error(`[CANCEL] Flujo ${workflowId}: no se pudo detener el flujo original en Content Server: ${describeError(e)}`);
+      try {
+        const { status } = await otcs.getProcessStatus(workflowId);
+        if (isProcessFinishedStatus(status)) {
+          logger.warn(`[CANCEL] Flujo ${workflowId}: el flujo original ya estaba detenido/concluido en Content Server (estado "${status}")`);
+          return 'already_stopped';
+        }
+        logger.error(`[CANCEL] Flujo ${workflowId}: el flujo original sigue activo en Content Server (estado "${status}")`);
+      } catch (re) {
+        logger.error(`[CANCEL] Flujo ${workflowId}: tampoco se pudo leer el estado del flujo original: ${describeError(re)}`);
+      }
+      return { failed: true, httpStatus: httpStatus(e) };
+    }
+  }
+
+  // Item do lote para um alvo: cancelWorkflow (lógica e idempotência unitárias) traduzido em cancelled/refused/pending;
+  // com cancel.stopOriginal, o Adobe confirmado é seguido do stop do original (falha => pending STOP_FAILED)
+  async function cancelTarget(workflowId, { subworkflowId, comment, source, settleTimeoutMs }) {
+    try {
+      const out = await cancelWorkflow(workflowId, { subworkflowId, comment, source, settleTimeoutMs });
+      const item = {
+        workflowId,
+        outcome: 'cancelled',
+        agreementId: out.agreementId,
+        alreadyCancelled: out.alreadyCancelled,
+        adobeStatus: out.adobeStatus,
+        contentStop: 'disabled',
+        message: out.alreadyCancelled ? 'El acuerdo ya estaba cancelado.' : 'Acuerdo cancelado.'
+      };
+      if (!config.cancel?.stopOriginal) return item;
+      const stop = await stopOriginalFlow(workflowId);
+      if (typeof stop === 'string') return { ...item, contentStop: stop };
+      const permissions = [400, 401, 403].includes(stop.httpStatus)
+        ? ' Verifique los permisos del usuario de integración para detener procesos.' : '';
+      return {
+        ...item,
+        outcome: 'pending',
+        code: 'STOP_FAILED',
+        cancelledInAdobe: true,
+        contentStop: 'failed',
+        message: `El acuerdo fue cancelado en Adobe Sign, pero no se pudo detener el flujo en Content Server; repita la operación.${permissions}`
+      };
+    } catch (e) {
+      if (e instanceof ServiceError) {
+        const b = e.body || {};
+        return {
+          workflowId,
+          outcome: classifyCancelOutcome(b.code),
+          agreementId: b.agreementId || b.agreement?.id,
+          adobeStatus: b.adobeStatus,
+          code: b.code || 'UNEXPECTED_ERROR',
+          message: b.error || CANCEL_ERROR_MESSAGE,
+          agreements: b.agreements,
+          agreement: b.agreement,
+          hint: b.hint
+        };
+      }
+      logger.error(`[CANCEL] Flujo ${workflowId}: error inesperado al cancelar: ${describeError(e)}`);
+      return { workflowId, outcome: 'pending', code: 'UNEXPECTED_ERROR', message: CANCEL_ERROR_MESSAGE };
+    }
+  }
+
+  // Comentário do SendOn: resumo curto do lote (cancelados / não cancelados)
+  function batchComment(items) {
+    const done = items.filter((i) => i.outcome === 'cancelled').map((i) => i.workflowId);
+    const notDone = items.filter((i) => i.outcome !== 'cancelled').map((i) => `${i.workflowId} (${i.code})`);
+    const parts = [`Cancelados (${done.length}): ${done.join(', ') || '-'}`];
+    if (notDone.length) parts.push(`No cancelados (${notDone.length}): ${notDone.join(', ')}`);
+    const stopped = config.cancel?.stopOriginal ? 'sí' : 'no, los detiene el paso siguiente';
+    return `Cancelación en Adobe Sign (originales detenidos en Content: ${stopped}). ${parts.join('. ')}`
+      .slice(0, MAX_SENDON_COMMENT_LENGTH);
+  }
+
+  /*
+    POST /cancel (WebReport do workflow de cancelamento), em LOTE. Os alvos vêm SEMPRE do formulário da tarefa (nunca do
+    corpo), ver readTask/readTargets. Processa em sequência com cancelWorkflow dentro de cancel.batchBudgetMs; cada item
+    termina em cancelled / refused (definitivo) / pending (transitório, inclusive BUDGET_EXCEEDED).
+      - algum pending: { complete: false, sentOn: false, items, summary }; nada é gravado e não há SendOn (repetir é seguro);
+      - todos finais: grava os WorkIDs cancelados no atributo cancel.fields.result (vazio desliga) e faz o SendOn:
+        sem o atributo => 409 RESULT_FIELD_MISSING; falha ao gravar => 503 RESULT_WRITE_FAILED; falha no SendOn =>
+        503 SENDON_FAILED (cancelled: true). Todos com os items. Repetir é seguro: os cancelados voltam alreadyCancelled.
+  */
+  async function cancelFromTask(input = {}) {
+    const cfg = config.cancel || {};
+    const { task, form } = await readTask(input);
+    const { ids, subworkflowId, subworkflowIgnored } = readTargets(form, task, input);
+
+    // Gravação do resultado ligada e atributo ausente: falha ANTES de cancelar qualquer coisa (nada é consultado no Adobe)
+    const resultLabel = clean(cfg.fields?.result);
+    const resultField = resultLabel ? fieldEntry(form.fields, resultLabel) : null;
+    if (resultLabel && !resultField?.key) {
+      logger.error(`[CANCEL] Workflow ${task.processId}/${task.subprocessId}/${task.taskId}: el formulario no tiene el atributo de resultado "${resultLabel}"; no se cancela nada`);
+      throw fail(409, `El formulario no tiene el atributo "${resultLabel}" para registrar los flujos cancelados.`, {
+        code: 'RESULT_FIELD_MISSING'
+      });
     }
 
-    const result = await cancelWorkflow(targetWorkflowId, {
-      subworkflowId: targetSubworkflowId,
-      comment: `Flujo cancelado desde Content Server (workflow de cancelación ${task.processId}).`,
-      source: `workflow:${task.processId}/${task.subprocessId}`
-    });
+    const stopOriginal = !!cfg.stopOriginal;
+    const deadline = makeDeadline();
+    const settleCap = Number(cfg.settleTimeoutMs) || DEFAULT_SETTLE_TIMEOUT_MS;
+    const source = `workflow:${task.processId}/${task.subprocessId}`;
+    const comment = `Flujo cancelado desde Content Server (workflow de cancelación ${task.processId}).`;
+    const items = [];
+    for (const workflowId of ids) {
+      const remaining = deadline.remaining();
+      items.push(remaining <= 0
+        ? budgetItem(workflowId)
+        : await cancelTarget(workflowId, { subworkflowId, comment, source, settleTimeoutMs: Math.min(settleCap, remaining) }));
+    }
+    const count = (outcome) => items.filter((i) => i.outcome === outcome).length;
+    const summary = { total: items.length, cancelled: count('cancelled'), refused: count('refused'), pending: count('pending') };
+    const where = `${task.processId}/${task.subprocessId}/${task.taskId}`;
+
+    if (summary.pending) {
+      logger.warn(`[CANCEL] Workflow ${where}: lote incompleto (${summary.cancelled} cancelados, ${summary.refused} rechazados, ${summary.pending} pendientes); sin SendOn, se debe repetir`);
+      return { complete: false, sentOn: false, items, summary, stopOriginal, subworkflowIgnored };
+    }
+
+    const cancelledIds = items.filter((i) => i.outcome === 'cancelled').map((i) => i.workflowId);
+    if (resultField) {
+      try {
+        await otcs.updateTaskForm(task.processId, task.subprocessId, task.taskId, { [resultField.key]: cancelledIds });
+      } catch (e) {
+        logger.error(`[CANCEL] Workflow ${where}: no se pudo grabar "${resultLabel}" en el formulario: ${describeError(e)}`);
+        throw fail(503, 'No se pudo registrar los flujos cancelados en el formulario; intente nuevamente.', {
+          code: 'RESULT_WRITE_FAILED', items, summary, stopOriginal
+        });
+      }
+    }
 
     try {
       await otcs.sendOnWorkflow({
         workflowId: task.processId,
         subworkflowId: task.subprocessId,
         taskId: task.taskId,
-        comment: sendOnComment(result.agreementId)
+        comment: batchComment(items)
       });
     } catch (e) {
-      logger.error(`[${result.agreementId}] acuerdo cancelado, pero falló el SendOn de la tarea de cancelación ${task.processId}/${task.subprocessId}/${task.taskId}: ${describeError(e)}`);
-      throw fail(503, 'El acuerdo fue cancelado, pero no se pudo continuar el flujo de cancelación; intente nuevamente.', {
-        code: 'SENDON_FAILED', cancelled: true, id: result.agreementId
+      logger.error(`[CANCEL] Lote procesado, pero falló el SendOn de la tarea de cancelación ${where}: ${describeError(e)}`);
+      throw fail(503, 'Los flujos fueron procesados, pero no se pudo continuar el flujo de cancelación; intente nuevamente.', {
+        code: 'SENDON_FAILED', cancelled: true, items, summary, stopOriginal
       });
     }
-    logger.info(`[${result.agreementId}] SendOn de la tarea de cancelación ${task.taskId} realizado (workflow ${task.processId}/${task.subprocessId})`);
-    return {
-      id: result.agreementId,
-      alreadyCancelled: result.alreadyCancelled,
-      targetWorkflowId,
-      targetSubworkflowId: result.subworkflowId
-    };
+    logger.info(`[CANCEL] SendOn de la tarea de cancelación ${where} realizado (${summary.cancelled} cancelados, ${summary.refused} rechazados)`);
+    return { complete: true, sentOn: true, items, summary, resultField: resultLabel || null, stopOriginal, subworkflowIgnored };
   }
 
-  return { cancelAgreement, cancelWorkflow, cancelFromTask };
+  // ---------- prévia (POST /cancel/preview): consulta, não cancela nem grava nada ----------
+
+  const previewItem = (workflowId, state, cancelable, message, extra = {}) => ({
+    workflowId, state, cancelable, ...extra, message
+  });
+
+  // Histórico do acordo: lista, ou null se não foi possível ler (nunca lança)
+  async function readEvents(id) {
+    try {
+      return await adobe.getAgreementEvents(id);
+    } catch (e) {
+      logger.error(`[${id}] previa de cancelación: no se pudo consultar el historial en Adobe: ${describeError(e)}`);
+      return null;
+    }
+  }
+
+  async function previewTarget(workflowId, subworkflowId) {
+    const target = selectCancelTarget(repo.listByWorkflow(workflowId, subworkflowId));
+    if (target.kind === TARGET.NONE) {
+      return previewItem(workflowId, 'no_encontrado', false,
+        'El orquestador no tiene un acuerdo de firma para este flujo (si es del orquestador anterior, adóptelo; si ya está firmado, regularícelo).');
+    }
+    if (target.kind === TARGET.AMBIGUOUS) {
+      return previewItem(workflowId, 'ambiguo', false,
+        'El flujo tiene más de un acuerdo de firma abierto; indique el subflujo (solo con un flujo).',
+        { agreements: target.records.map(summary) });
+    }
+    if (target.kind === TARGET.CLOSED) {
+      return previewItem(workflowId, 'concluido', false,
+        `El acuerdo más reciente del flujo ya concluyó (estado ${target.record.state}); no hay nada que cancelar.`,
+        { agreementId: target.record.id, agreement: summary(target.record) });
+    }
+
+    const rec = target.record; // OPEN, o CANCELLED (repetición)
+    const agreementId = rec.id;
+    let status;
+    try {
+      status = clean((await adobe.getAgreement(agreementId))?.status).toUpperCase();
+    } catch (e) {
+      if (httpStatus(e) === 404) {
+        return previewItem(workflowId, 'no_existe_en_adobe', false, 'El acuerdo no existe en Adobe Sign.', { agreementId });
+      }
+      logger.error(`[${agreementId}] previa de cancelación: no se pudo consultar el estado en Adobe: ${describeError(e)}`);
+      return previewItem(workflowId, 'no_disponible', null, 'Adobe Sign no disponible; intente nuevamente.', { agreementId });
+    }
+    const base = { agreementId, adobeStatus: status };
+
+    switch (classifyCancelState(status)) {
+      case CANCEL_STATES.SIGNED:
+        return previewItem(workflowId, 'firmado', false, 'Firmado: regularizar el flujo, no cancelar.', base);
+      case CANCEL_STATES.NOT_CANCELABLE:
+        return previewItem(workflowId, 'no_cancelable', false,
+          `El acuerdo está en estado ${status || 'desconocido'} en Adobe Sign; no se puede cancelar.`, base);
+      case CANCEL_STATES.ALREADY_CANCELLED: {
+        // CANCELLED sin pedido nuestro: puede ser rechazo de un firmante (solo el historial lo distingue)
+        if (status === 'CANCELLED' && !rec.cancelRequestedAt) {
+          const events = await readEvents(agreementId);
+          if (!events) {
+            return previewItem(workflowId, 'no_disponible', null, 'No se pudo leer el historial del acuerdo; intente nuevamente.', base);
+          }
+          if (classifyAgreementStatus(status, events) === KINDS.FINAL_REJECTED) {
+            return previewItem(workflowId, 'rechazado', false, 'Un firmante rechazó el acuerdo; no se cancela.', base);
+          }
+        }
+        return previewItem(workflowId, 'ya_cancelado', true, 'El acuerdo ya estaba cancelado; se registrará como cancelado.', base);
+      }
+      default: {
+        const events = await readEvents(agreementId);
+        if (!events) {
+          return previewItem(workflowId, 'abierto', true,
+            'Acuerdo abierto en Adobe Sign (no se pudo leer el historial: puede haber firmas ya realizadas).',
+            { ...base, partialUnknown: true });
+        }
+        const { signedCount, lastSignedAt } = countSignatures(events);
+        if (signedCount > 0) {
+          return previewItem(workflowId, 'firma_parcial', true,
+            `Atención: ${signedCount} firma(s) ya realizada(s); al cancelar se pierden.`, { ...base, signedCount, lastSignedAt });
+        }
+        return previewItem(workflowId, 'abierto', true, 'Acuerdo abierto, sin firmas realizadas.', base);
+      }
+    }
+  }
+
+  /*
+    POST /cancel/preview: mesma leitura e validação do /cancel (tarefa ativa, atribuída, alvos do formulário), mas só
+    CONSULTA: nenhum cancelAgreement, nenhuma escrita no repositório (sem hold/inflight/settle), nenhum updateTaskForm e
+    nenhum SendOn. Mesmo orçamento de tempo: alvos não iniciados ao estourar => state 'pendiente'.
+    => { items, summary: { total, <state>: n }, subworkflowIgnored, resultFieldMissing? (true só se a gravação está ligada e o atributo falta) }. Estados e `cancelable`: ver a spec do lote
+    (cancelable null = não se sabe: no_disponible e pendiente).
+  */
+  async function previewFromTask(input = {}) {
+    const { task, form } = await readTask(input);
+    const { ids, subworkflowId, subworkflowIgnored } = readTargets(form, task, input);
+
+    // A prévia segue normalmente; resultFieldMissing avisa a página antes de confirmar o cancelamento
+    const resultLabel = clean(config.cancel?.fields?.result);
+    const resultFieldMissing = !!resultLabel && !fieldEntry(form.fields, resultLabel)?.key;
+
+    const deadline = makeDeadline();
+    const items = [];
+    for (const workflowId of ids) {
+      if (deadline.remaining() <= 0) {
+        items.push(previewItem(workflowId, 'pendiente', null, 'Se agotó el tiempo de la solicitud antes de consultar este flujo; repita la operación.'));
+        continue;
+      }
+      try {
+        items.push(await previewTarget(workflowId, subworkflowId));
+      } catch (e) {
+        logger.error(`[CANCEL] Previa del flujo ${workflowId}: error inesperado: ${describeError(e)}`);
+        items.push(previewItem(workflowId, 'no_disponible', null, CANCEL_ERROR_MESSAGE));
+      }
+    }
+    const summary = { total: items.length };
+    for (const i of items) summary[i.state] = (summary[i.state] || 0) + 1;
+    return { items, summary, stopOriginal: !!config.cancel?.stopOriginal, subworkflowIgnored, ...(resultFieldMissing ? { resultFieldMissing: true } : {}) };
+  }
+
+  return { cancelAgreement, cancelWorkflow, cancelFromTask, previewFromTask };
 }
 
 module.exports = { createCancellationService, CANCEL_ERROR_MESSAGE };

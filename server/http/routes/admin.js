@@ -124,7 +124,7 @@ function adminRoutes({
     Estas rotas cancelam no Adobe e fecham o acordo SEM disposição: ninguém encerra o workflow original, que continua em
     "Aguardar Firma". A resposta 200 diz isso (contentFlow: 'unchanged' + note) e o log registra um warn. Decisão: não
     mandar `Rechazado`, porque o ramo Rechazado dos mapas pode disparar ações de negócio que não são "cancelar".
-    Alternativa revisável: fechar o original pelo otcsClient.stopProcess (hoje sem uso; ver o design do ticket).
+    Alternativa revisável: fechar o original pelo otcsClient.stopProcess (hoje só o lote do /cancel o usa, com CANCEL_STOP_ORIGINAL; ver o design do ticket).
   */
   if (cancellationService) {
     const CONTENT_FLOW_NOTE =

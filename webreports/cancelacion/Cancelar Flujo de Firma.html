@@ -1,10 +1,27 @@
 [LL_WEBREPORT_EXCLUDEHTML /]
-[// Cancelar Flujo de Firma (WebReport del workflow de cancelacion; QA/PROD: IDs por asignar al publicar). Ver webreports/cancelacion/README.md y webreports/README.md. /]
+[// Cancelar Flujo de Firma (WebReport UNICO del workflow de cancelacion en lote: Inicio, Cancelar Flujo de Firma, Fin). QA/PROD: IDs por asignar al publicar. /]
+[// Ver webreports/cancelacion/README.md y webreports/README.md. Fuente de datos (LiveReport): Cancelar Flujo de Firma.sql, mismo directorio. /]
 [// Modelo: webreports/firma-flujo-puro/Requisicion de Firma.html (misma estructura, mismo ramo reasignar, mismo estilo). /]
-[// Ramo reasignar: la propia pagina lo pide (mismo origen, sesion del usuario) para mover la tarea al usuario de integracion. /]
-[// La URL solo trae los IDs de la tarea (workid, subworkid, taskid). El destino es fijo en este ramo; la URL no lo elige. /]
+[// Ramos por accion: guardar (graba la seleccion), leer (la verifica), reasignar (mueve la tarea al usuario de integracion); sin accion se muestra la pagina. /]
+[// Los ramos se anidan: cada uno solo corre con su accion y la pagina es el ultimo ELSE. /]
+[// TODO VALIDAR EN QA (seguridad): ids y lista llegan por la URL y se sustituyen como texto dentro de la tag SETWFATTR. Si el WebReport tiene un operador /]
+[// de comparacion por patron, validar aqui que ids tenga la forma digitos separados por coma ANTES de la tag; si no, restringir el WebReport por permisos. /]
+[LL_WEBREPORT_IF "[LL_REPTAG_&ACCION /]" == "guardar" /]
+[// VALIDAR EN QA: SETWFATTR. Documentada solo en foros; se dice que funciona en un paso WebReport / destino de workflow. La forma de lista multivalor no esta documentada. /]
+[// La pagina manda dos parametros: ids (1,2,3; lo que se muestra al usuario) y lista (los mismos ids entre comillas simples, '1','2','3', para armar la lista literal). /]
+[// Alternativas si esta forma no graba: prefijo con lista de dos elementos (workid y subworkid), como en WFTASKACTION; o un solo valor con los ids separados por coma (el servidor tambien los acepta asi). /]
+[// VALIDAR EN QA: con la tarea ya asignada al usuario de integracion (despues de la revision), el usuario que abre la pagina quiza no pueda grabar; la pagina lo trata como fallo (plan C). /]
+[LL_REPTAG_&SUBWORKID SETWFATTR:"ID Flujo a Cancelar":{[LL_REPTAG_&LISTA /]} /]
+GUARDADO_OK
+[LL_WEBREPORT_ELSE /]
+[LL_WEBREPORT_IF "[LL_REPTAG_&ACCION /]" == "leer" /]
+[// Verificacion de lo grabado: la pagina compara estos numeros con la seleccion ANTES de llamar al servidor. Solo lectura. /]
+LEIDO_OK
+[LL_REPTAG_&SUBWORKID WFATTR:"ID Flujo a Cancelar":DISPLAY /]
+[LL_WEBREPORT_ELSE /]
 [LL_WEBREPORT_IF "[LL_REPTAG_&ACCION /]" == "reasignar" /]
 [// USUARIO DE INTEGRACION POR AMBIENTE: 11742766 = QA (AdminKeralty). En PROD cambiar este numero (ver webreports/cancelacion/README.md). /]
+[// La URL solo trae los IDs de la tarea (workid, subworkid, taskid). El destino es fijo en este ramo; la URL no lo elige. /]
 [LL_REPTAG_{'[LL_REPTAG_&WORKID /]','[LL_REPTAG_&SUBWORKID /]','[LL_REPTAG_&TASKID /]'} WFTASKACTION:REASSIGN:11742766 /]
 REASIGNADO_OK
 [LL_WEBREPORT_ELSE /]
@@ -14,7 +31,7 @@ REASIGNADO_OK
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="color-scheme" content="light">
-  <title>Cancelar flujo de firma</title>
+  <title>Cancelar flujos de firma</title>
   <style>
     :root {
       --fondo: #f3f5f8;
@@ -40,7 +57,7 @@ REASIGNADO_OK
       margin: 0;
       min-height: 100vh;
       display: flex;
-      align-items: center;
+      align-items: flex-start;
       justify-content: center;
       padding: 16px;
       background: var(--fondo);
@@ -51,7 +68,7 @@ REASIGNADO_OK
     }
     .tarjeta {
       width: 100%;
-      max-width: 520px;
+      max-width: 760px;
       padding: 32px;
       background: var(--tarjeta);
       border: 1px solid var(--borde);
@@ -67,17 +84,6 @@ REASIGNADO_OK
       text-transform: uppercase;
       color: var(--texto-suave);
     }
-    .documento {
-      display: flex;
-      flex-wrap: wrap;
-      align-items: baseline;
-      gap: 4px 12px;
-      padding: 12px 14px;
-      background: #f8fafc;
-      border: 1px solid var(--borde);
-      border-radius: 10px;
-    }
-    .documento-nombre { flex: 1 1 200px; min-width: 0; font-weight: 600; overflow-wrap: anywhere; }
     .firmantes { margin: 0; padding: 0; list-style: none; }
     .firmantes li {
       display: flex;
@@ -90,6 +96,16 @@ REASIGNADO_OK
     .firmantes li:first-child { border-top: 0; }
     .firmante-etiqueta { min-width: 80px; color: var(--texto-suave); }
     .firmante-correo { flex: 1 1 180px; min-width: 0; overflow-wrap: anywhere; }
+    .chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 0; padding: 0; list-style: none; }
+    .chip {
+      padding: 2px 10px;
+      background: #f8fafc;
+      border: 1px solid var(--borde);
+      border-radius: 999px;
+      font-size: 14px;
+      font-variant-numeric: tabular-nums;
+    }
+    .nota { margin: 10px 0 0; font-size: 13px; color: var(--texto-suave); }
     .aviso-caja {
       margin: 20px 0 0;
       padding: 12px 14px;
@@ -100,6 +116,39 @@ REASIGNADO_OK
       font-size: 15px;
     }
     .aviso-caja strong { display: block; margin-bottom: 2px; }
+    .grupo { margin-top: 20px; }
+    .grupo-titulo { margin: 0 0 8px; font-size: 15px; font-weight: 600; }
+    .grupo-ayuda { margin: 0 0 8px; font-size: 13px; color: var(--texto-suave); }
+    .grupo.destacado {
+      padding: 12px;
+      background: #fffaf0;
+      border: 2px solid var(--aviso);
+      border-radius: var(--radio);
+    }
+    .lista-items { margin: 0; padding: 0; list-style: none; background: var(--tarjeta); border: 1px solid var(--borde); border-radius: 10px; overflow: hidden; }
+    .item { display: grid; gap: 2px; padding: 10px 14px; border-top: 1px solid var(--borde); }
+    .item:first-child { border-top: 0; }
+    .item-cab { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; }
+    .item-id { font-weight: 600; font-variant-numeric: tabular-nums; }
+    .item-texto { font-size: 14px; overflow-wrap: anywhere; }
+    .item-extra { font-size: 12px; color: var(--texto-suave); overflow-wrap: anywhere; }
+    .item-aviso {
+      margin-top: 4px;
+      padding: 6px 10px;
+      background: var(--aviso-suave);
+      border: 1px solid #f5d08a;
+      border-radius: 8px;
+      color: #7a2e0e;
+      font-size: 13px;
+      font-weight: 600;
+    }
+    .badge { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; font-weight: 600; }
+    .badge.ok { background: var(--ok-suave); color: var(--ok); }
+    .badge.error { background: var(--error-suave); color: var(--error); }
+    .badge.aviso { background: var(--aviso-suave); color: var(--aviso); }
+    .badge.neutro { background: #eef2f6; color: var(--texto-suave); }
+    .check { display: flex; align-items: flex-start; gap: 10px; margin: 16px 0 0; font-size: 15px; font-weight: 600; color: #7a2e0e; cursor: pointer; }
+    .check input { flex: 0 0 auto; width: 20px; height: 20px; margin: 2px 0 0; accent-color: var(--aviso); }
     .pasos { margin: 24px 0 0; padding: 0; list-style: none; display: grid; gap: 14px; }
     .paso { display: flex; align-items: center; gap: 12px; color: var(--texto-suave); }
     .paso[data-estado="activo"], .paso[data-estado="hecho"] { color: var(--texto); }
@@ -185,8 +234,11 @@ REASIGNADO_OK
     .btn:hover { background: var(--acento-hover); }
     .btn.peligro { background: var(--error); }
     .btn.peligro:hover { background: var(--error-hover); }
-    .btn:focus-visible, a:focus-visible { outline: 3px solid var(--acento); outline-offset: 2px; }
-    .btn:disabled { opacity: 0.6; cursor: progress; }
+    .btn.secundario { background: #fff; color: var(--texto); border: 1px solid #d0d5dd; }
+    .btn.secundario:hover { background: #f8fafc; }
+    .btn:focus-visible, a:focus-visible, .check input:focus-visible { outline: 3px solid var(--acento); outline-offset: 2px; }
+    .btn:disabled { opacity: 0.6; cursor: not-allowed; }
+    .btn[aria-busy="true"]:disabled { cursor: progress; }
     @media (max-width: 400px) {
       .tarjeta { padding: 24px 20px; }
     }
@@ -197,48 +249,296 @@ REASIGNADO_OK
         transition-duration: 0.01ms !important;
       }
     }
+  
+    .intro { margin: 0 0 16px; font-size: 15px; color: var(--texto-suave); }
+    .filtros { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; }
+    .campo { display: grid; gap: 4px; font-size: 13px; font-weight: 600; color: var(--texto-suave); }
+    .campo input {
+      min-height: 40px;
+      padding: 8px 10px;
+      border: 1px solid #d0d5dd;
+      border-radius: 8px;
+      font: inherit;
+      font-size: 15px;
+      font-weight: 400;
+      color: var(--texto);
+    }
+    .barra { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 12px; }
+    .barra .espacio { flex: 1 1 auto; }
+    .barra .btn { min-height: 40px; padding: 8px 16px; font-size: 15px; }
+    .tabla-caja { overflow-x: auto; border: 1px solid var(--borde); border-radius: 10px; }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    th, td { padding: 8px 10px; text-align: left; border-top: 1px solid var(--borde); vertical-align: top; }
+    thead th { border-top: 0; background: #f8fafc; font-size: 12px; letter-spacing: 0.03em; text-transform: uppercase; color: var(--texto-suave); white-space: nowrap; }
+    td.num, th.num { font-variant-numeric: tabular-nums; }
+    td.largo { min-width: 160px; overflow-wrap: anywhere; }
+    tbody tr:hover { background: #f8fafc; }
+    tbody tr.marcada { background: var(--ok-suave); }
+    .col-check { width: 40px; }
+    .col-check input, .chk-fila { width: 18px; height: 18px; accent-color: var(--acento); }
+    .vacio { margin: 12px 0 0; padding: 16px; text-align: center; color: var(--texto-suave); border: 1px dashed #d0d5dd; border-radius: 10px; }
+    .contador { font-size: 15px; font-weight: 600; }
+    .contador.lleno { color: var(--aviso); }
+    .chip { display: inline-flex; align-items: center; gap: 6px; }
+    .chip.con-quitar { padding-right: 4px; }
+    .chip button { width: 22px; height: 22px; padding: 0; border: 0; border-radius: 50%; background: transparent; color: var(--texto-suave); font-size: 16px; line-height: 1; cursor: pointer; }
+    .chip button:hover { background: var(--error-suave); color: var(--error); }
+    .estado-sel { min-height: 1.5em; margin: 12px 0 0; font-size: 14px; font-weight: 600; overflow-wrap: anywhere; }
+    .estado-sel.aviso { color: var(--aviso); }
+    .estado-sel.ok { color: var(--ok); }
+    .pasos-c { margin: 8px 0 0; padding-left: 20px; font-size: 15px; }
+    .ids-copia {
+      display: block;
+      width: 100%;
+      min-height: 64px;
+      margin: 8px 0 0;
+      padding: 8px 10px;
+      border: 1px solid #d0d5dd;
+      border-radius: 8px;
+      font: inherit;
+      font-size: 15px;
+      font-variant-numeric: tabular-nums;
+      color: var(--texto);
+      background: #f8fafc;
+      resize: vertical;
+    }
+    .btn.chico { min-height: 40px; padding: 8px 16px; font-size: 15px; }
+    input:focus-visible, textarea:focus-visible, .chip button:focus-visible { outline: 3px solid var(--acento); outline-offset: 2px; }
+    .modal-fondo {
+      position: fixed;
+      inset: 0;
+      z-index: 10;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 16px;
+      background: rgba(16, 24, 40, 0.5);
+    }
+    .modal {
+      width: 100%;
+      max-width: 520px;
+      max-height: 90vh;
+      overflow-y: auto;
+      padding: 24px;
+      background: var(--tarjeta);
+      border-radius: var(--radio);
+      box-shadow: 0 8px 24px rgba(16, 24, 40, 0.25);
+    }
+    .modal h2 { margin: 0 0 8px; font-size: 18px; }
+    .modal ul { margin: 12px 0; padding: 0; list-style: none; border: 1px solid var(--borde); border-radius: 10px; }
+    .modal li { display: flex; flex-wrap: wrap; gap: 2px 10px; padding: 6px 12px; border-top: 1px solid var(--borde); font-size: 14px; }
+    .modal li:first-child { border-top: 0; }
+    .modal .id { font-weight: 600; font-variant-numeric: tabular-nums; }
+    .modal .acciones-modal { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+    .tarjeta { max-width: 1000px; }
   </style>
 </head>
 <body>
   <main class="tarjeta">
-    <h1 class="titulo">Cancelar flujo de firma</h1>
+    <h1 class="titulo">Cancelar flujos de firma</h1>
 
-    <h2 class="seccion">Flujo a cancelar</h2>
-    <ul class="firmantes" id="destino">
-      <li><span class="firmante-etiqueta">Flujo</span><span class="firmante-correo" id="destino-flujo"></span></li>
-      <li><span class="firmante-etiqueta">Subflujo</span><span class="firmante-correo" id="destino-subflujo"></span></li>
-    </ul>
+    <!-- ===== Etapa A: buscar y marcar ===== -->
+    <section id="vista-seleccion" hidden>
+      <p class="intro">Busque los flujos que están en "Aguardar Firma" y márquelos (máximo <span id="max-flujos"></span>). Al pulsar "Revisar" se guarda la selección en esta tarea y se consulta el estado de cada acuerdo en Adobe Sign; todavía no se cancela nada.</p>
 
-    <div id="vista-confirmar" hidden>
-      <div class="aviso-caja" role="note">
-        <strong>Atención</strong>
-        Al cancelar se pierde cualquier firma parcial: si algún firmante ya firmó, su firma se descarta y el documento no se podrá recuperar con esa firma.
-        Confirme que este es el flujo correcto antes de continuar.
+      <h2 class="seccion">Buscar</h2>
+      <form id="form-busqueda" method="get" action="">
+        <!-- Parametros fijos de la URL del WebReport. Los valores se completan por script desde la configuracion y las tags de OTCS. -->
+        <input type="hidden" name="func" value="ll">
+        <input type="hidden" name="objAction" value="RunReport">
+        <input type="hidden" name="objId" id="f-objid" value="">
+        <input type="hidden" name="workid" id="f-workid" value="">
+        <input type="hidden" name="subworkid" id="f-subworkid" value="">
+        <input type="hidden" name="taskid" id="f-taskid" value="">
+        <div class="filtros">
+          <label class="campo">ID empleado<input type="text" name="idempleado" id="q-idempleado" autocomplete="off" inputmode="numeric"></label>
+          <label class="campo">Nombre<input type="text" name="nombre" id="q-nombre" autocomplete="off"></label>
+          <label class="campo">Cédula<input type="text" name="cedula" id="q-cedula" autocomplete="off" inputmode="numeric"></label>
+          <label class="campo">Documento<input type="text" name="documento" id="q-documento" autocomplete="off"></label>
+          <label class="campo">Desde<input type="date" name="desde" id="q-desde"></label>
+          <label class="campo">Hasta<input type="date" name="hasta" id="q-hasta"></label>
+        </div>
+        <div class="barra">
+          <button class="btn chico" type="submit">Buscar</button>
+          <button class="btn secundario chico" type="button" id="btn-limpiar-filtros">Limpiar filtros</button>
+        </div>
+      </form>
+
+      <h2 class="seccion">Flujos en "Aguardar Firma" <span id="total-resultados"></span></h2>
+      <div class="tabla-caja" id="tabla-caja" hidden>
+        <table>
+          <thead>
+            <tr>
+              <th class="col-check"><input type="checkbox" id="chk-todos" aria-label="Seleccionar todos"></th>
+              <th class="num">Flujo</th>
+              <th class="num">Subflujo</th>
+              <th>Título</th>
+              <th>Fecha</th>
+              <th class="num">ID empleado</th>
+              <th>Nombre</th>
+              <th class="num">Cédula</th>
+              <th>Documento</th>
+            </tr>
+          </thead>
+          <tbody id="tbody"></tbody>
+        </table>
       </div>
-    </div>
+      <p class="vacio" id="vacio" hidden>No hay flujos en "Aguardar Firma" que coincidan con la búsqueda.</p>
+      <div class="barra">
+        <label><input type="checkbox" id="chk-todos-2"> Seleccionar todos</label>
+        <span class="espacio"></span>
+        <span class="contador" id="contador" role="status" aria-live="polite"></span>
+      </div>
 
-    <ol class="pasos" id="pasos" hidden>
-      <li class="paso" id="paso-asignar" data-estado="pendiente" hidden><span class="paso-icono" aria-hidden="true"></span><span>Asignando la tarea</span></li>
-      <li class="paso" id="paso-cancelar" data-estado="pendiente"><span class="paso-icono" aria-hidden="true"></span><span>Cancelando en Adobe Sign</span></li>
-      <li class="paso" id="paso-listo" data-estado="pendiente"><span class="paso-icono" aria-hidden="true"></span><span>Listo</span></li>
-    </ol>
+      <h2 class="seccion">Selección actual</h2>
+      <ul class="chips" id="seleccion"></ul>
+      <p class="estado-sel" id="sel-estado" role="status" aria-live="polite"></p>
+      <div class="aviso-caja" role="note">
+        <strong>La revisión puede transferir la tarea</strong>
+        Si la tarea no está asignada al usuario de integración, "Revisar" la transfiere a él. Después no la verá en su bandeja: no cierre esta página hasta terminar. Cambiar la selección más tarde puede no ser posible (en ese caso se pegan los IDs a mano).
+      </div>
+      <div class="acciones">
+        <button class="btn" type="button" id="btn-revisar-sel" disabled>Revisar flujos</button>
+        <button class="btn secundario" type="button" id="btn-limpiar-seleccion" disabled>Quitar selección</button>
+        <button class="btn secundario" type="button" id="btn-volver-guardados" hidden>Volver a los flujos guardados</button>
+      </div>
+    </section>
 
-    <div class="resultado" id="resultado" hidden><span class="insignia" id="insignia" aria-hidden="true"></span></div>
+    <!-- ===== Plan C: la grabacion fallo o no se pudo verificar ===== -->
+    <section id="vista-plan-c" hidden>
+      <div class="aviso-caja" role="alert">
+        <strong id="pc-titulo"></strong>
+        <span id="pc-texto"></span>
+      </div>
+      <h2 class="seccion">Pegar los IDs manualmente</h2>
+      <ol class="pasos-c">
+        <li>Copie los IDs con el botón.</li>
+        <li>En el formulario de esta tarea, pegue en el campo "ID Flujo a Cancelar" (separados por coma; también sirve un ID por valor) y guarde el formulario.</li>
+        <li>Recargue la tarea (F5) y abra esta página otra vez: mostrará los IDs guardados para revisarlos.</li>
+      </ol>
+      <textarea class="ids-copia" id="ids-copia" readonly aria-label="IDs seleccionados"></textarea>
+      <div class="barra">
+        <button class="btn chico" type="button" id="btn-copiar">Copiar IDs</button>
+        <button class="btn secundario chico" type="button" id="btn-pc-volver">Volver a la selección</button>
+        <span class="estado-sel" id="estado-copia" role="status" aria-live="polite"></span>
+      </div>
+    </section>
 
-    <p class="estado" id="estado" role="status" aria-live="polite"></p>
-    <p class="acuerdo" id="acuerdo" hidden></p>
-    <ul class="lista-acuerdos" id="lista-acuerdos" hidden></ul>
+    <!-- ===== Etapas B, C y D: revisar, confirmar y cancelar ===== -->
+    <section id="vista-revision" hidden>
+      <div id="bloque-destino">
+        <h2 class="seccion">Flujos a cancelar <span id="destino-total"></span></h2>
+        <ul class="chips" id="destino-ids"></ul>
+        <ul class="firmantes" id="destino">
+          <li><span class="firmante-etiqueta">Subflujo</span><span class="firmante-correo" id="destino-subflujo"></span></li>
+        </ul>
+        <p class="nota" id="nota-destino">
+          El servidor vuelve a leer la lista del atributo "ID Flujo a Cancelar" al cancelar y procesa <strong>todos</strong> los flujos de esa lista.
+          La revisión es informativa y no cancela nada.
+        </p>
+      </div>
 
-    <div class="acciones">
-      <button class="btn peligro" type="button" id="btn-cancelar" hidden>Cancelar flujo</button>
-      <button class="btn" type="button" id="btn-reintentar" hidden>Reintentar</button>
-    </div>
+      <div id="vista-inicio" hidden>
+        <div class="aviso-caja" role="note">
+          <strong>Atención</strong>
+          Al cancelar un flujo se pierde cualquier firma parcial: si algún firmante ya firmó, su firma se descarta y el documento no se podrá recuperar con esa firma.
+          <span id="inicio-reabierto">Esta tarea ya tiene flujos guardados: revíselos o cambie la selección.</span>
+          La revisión puede transferir la tarea al usuario de integración; no cierre esta página hasta terminar.
+        </div>
+      </div>
+
+      <ol class="pasos" id="pasos" hidden>
+        <li class="paso" id="paso-guardar" data-estado="pendiente" hidden><span class="paso-icono" aria-hidden="true"></span><span>Guardando y verificando la selección</span></li>
+        <li class="paso" id="paso-asignar" data-estado="pendiente" hidden><span class="paso-icono" aria-hidden="true"></span><span>Asignando la tarea</span></li>
+        <li class="paso" id="paso-trabajo" data-estado="pendiente"><span class="paso-icono" aria-hidden="true"></span><span id="paso-trabajo-texto">Consultando en Adobe Sign</span></li>
+        <li class="paso" id="paso-listo" data-estado="pendiente"><span class="paso-icono" aria-hidden="true"></span><span>Listo</span></li>
+      </ol>
+
+      <!-- Resultado de la revision (/cancel/preview). Todo el contenido llega por createElement/textContent. -->
+      <div id="vista-prevista" hidden>
+        <div class="aviso-caja" id="aviso-reasignado" role="note" hidden>
+          <strong>Tarea asignada al usuario de integración</strong>
+          No cierre esta página hasta terminar: la tarea ya no está en su bandeja.
+        </div>
+        <div class="grupo" id="grupo-cancelar" hidden>
+          <h3 class="grupo-titulo" id="titulo-cancelar">Se cancelarán</h3>
+          <ul class="lista-items" id="lista-cancelar"></ul>
+        </div>
+        <div class="grupo destacado" id="grupo-firmados" hidden>
+          <h3 class="grupo-titulo" id="titulo-firmados">Firmados — regularizar, no cancelar</h3>
+          <p class="grupo-ayuda">Estos acuerdos ya fueron firmados por todos en Adobe Sign. No se cancelan: hay que regularizar el flujo de contratación.</p>
+          <ul class="lista-items" id="lista-firmados"></ul>
+        </div>
+        <div class="grupo" id="grupo-resto" hidden>
+          <h3 class="grupo-titulo" id="titulo-resto">No se cancelarán</h3>
+          <ul class="lista-items" id="lista-resto"></ul>
+        </div>
+        <div class="grupo" id="grupo-transitorios" hidden>
+          <h3 class="grupo-titulo" id="titulo-transitorios">No se pudieron revisar</h3>
+          <p class="grupo-ayuda">Falla temporal o tiempo agotado. Use "Revisar de nuevo" para consultarlos otra vez.</p>
+          <ul class="lista-items" id="lista-transitorios"></ul>
+        </div>
+        <p class="nota" id="nota-subflujo-ignorado" hidden>El atributo "ID Subflujo a Cancelar" se ignora porque la lista tiene varios flujos.</p>
+        <p class="nota" id="nota-confirmar"></p>
+        <label class="check" id="caja-parcial" hidden>
+          <input type="checkbox" id="chk-parcial">
+          <span>Entiendo que se perderán las firmas parciales de los flujos marcados como "Firma parcial".</span>
+        </label>
+      </div>
+
+      <!-- Resultado de la cancelacion (/cancel), item a item. -->
+      <div id="vista-resultado" hidden>
+        <ul class="lista-items" id="lista-resultado"></ul>
+      </div>
+
+      <div class="resultado" id="resultado" hidden><span class="insignia" id="insignia" aria-hidden="true"></span></div>
+
+      <p class="estado" id="estado" role="status" aria-live="polite"></p>
+      <p class="acuerdo" id="acuerdo" hidden></p>
+      <ul class="lista-acuerdos" id="lista-acuerdos" hidden></ul>
+
+      <div class="acciones">
+        <button class="btn" type="button" id="btn-revisar" hidden>Revisar flujos</button>
+        <button class="btn peligro" type="button" id="btn-confirmar" hidden>Cancelar estos flujos</button>
+        <button class="btn" type="button" id="btn-reintentar" hidden>Reintentar</button>
+        <button class="btn secundario" type="button" id="btn-cambiar" hidden>Cambiar selección</button>
+      </div>
+    </section>
   </main>
 
-  <!-- Datos del flujo en OTCS. Van en textarea (contenido RCDATA: el HTML no interpreta etiquetas) y el script lee el valor como texto literal. -->
+  <!-- Confirmacion antes de guardar y revisar -->
+  <div class="modal-fondo" id="modal" hidden>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-titulo">
+      <h2 id="modal-titulo">Revisar los flujos seleccionados</h2>
+      <p id="modal-texto"></p>
+      <ul id="modal-lista"></ul>
+      <p class="intro" style="margin:0">Aún no se cancela nada: la cancelación se confirma después de ver el estado de cada acuerdo. Si la tarea no está con el usuario de integración, se transferirá a él.</p>
+      <div class="acciones-modal">
+        <button class="btn secundario chico" type="button" id="modal-volver">Volver</button>
+        <button class="btn chico" type="button" id="modal-aceptar">Guardar y revisar</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Datos del flujo en OTCS. Van en textarea (contenido RCDATA: el HTML no interpreta etiquetas) y el script lee el valor como texto literal.
+       ID Flujo a Cancelar es multivalor: el formato de DISPLAY no esta documentado (VALIDAR EN QA); el script solo extrae los numeros. -->
   <div hidden>
     <textarea id="dato-flujo" hidden readonly>[LL_REPTAG_&SUBWORKID WFATTR:"ID Flujo a Cancelar":DISPLAY /]</textarea>
     <textarea id="dato-subflujo" hidden readonly>[LL_REPTAG_&SUBWORKID WFATTR:"ID Subflujo a Cancelar":DISPLAY /]</textarea>
+    <!-- Filas devueltas por el LiveReport (columnas en este orden: WorkID, SubWorkID, Titulo, Fecha, IDEmpleado, Nombre, Cedula, Documento, DataID).
+         Cada valor va en un textarea y el script lo lee como texto literal. VALIDAR EN QA: marcadores de fila y tags de columna por numero. -->
+    <table id="origen"><tbody>
+[LL_WEBREPORT_STARTROW /]
+      <tr><td><textarea>[LL_REPTAG_1 /]</textarea></td><td><textarea>[LL_REPTAG_2 /]</textarea></td><td><textarea>[LL_REPTAG_3 /]</textarea></td><td><textarea>[LL_REPTAG_4 /]</textarea></td><td><textarea>[LL_REPTAG_5 /]</textarea></td><td><textarea>[LL_REPTAG_6 /]</textarea></td><td><textarea>[LL_REPTAG_7 /]</textarea></td><td><textarea>[LL_REPTAG_8 /]</textarea></td></tr>
+[LL_WEBREPORT_ENDROW /]
+    </tbody></table>
+    <!-- Valores actuales de los filtros (parametros de la URL) para volver a mostrarlos tras buscar. -->
+    <textarea id="p-idempleado">[LL_REPTAG_&IDEMPLEADO /]</textarea>
+    <textarea id="p-nombre">[LL_REPTAG_&NOMBRE /]</textarea>
+    <textarea id="p-cedula">[LL_REPTAG_&CEDULA /]</textarea>
+    <textarea id="p-documento">[LL_REPTAG_&DOCUMENTO /]</textarea>
+    <textarea id="p-desde">[LL_REPTAG_&DESDE /]</textarea>
+    <textarea id="p-hasta">[LL_REPTAG_&HASTA /]</textarea>
   </div>
 
 <script>
@@ -248,8 +548,11 @@ REASIGNADO_OK
      CONFIGURACION POR AMBIENTE (unico bloque a cambiar al publicar)
      Valores que cambian por ambiente:
        - SERVER_URL, BASIC_USER, BASIC_PASS y REPORT_ID (aqui abajo);
-       - REPORT_ID: ID de ESTE WebReport en el ambiente (QA: por asignar al publicarlo). WebReports no tiene una tag
-         para el ID del propio reporte (la tag REPORTID no existe);
+       - REPORT_ID: ID de ESTE WebReport en el ambiente (QA/PROD: por asignar al publicarlo). WebReports no tiene una tag
+         para el ID del propio reporte (la tag REPORTID no existe). Lo usan los ramos guardar, leer y reasignar;
+       - MAX_FLUJOS: tope de flujos por cancelacion. Debe ser IGUAL a CANCEL_MAX_TARGETS del orquestador (por defecto 20);
+       - ATRIBUTO: nombre del atributo de destino. Es solo texto para el usuario: el nombre que manda esta en las tags
+         SETWFATTR / WFATTR del WebReport (arriba) y debe ser igual a CANCEL_FIELD_TARGET_WORKFLOW del servidor;
        - usuario de integracion (11742766 en QA, AdminKeralty): NO va en este script.
          Esta fijado en la linea WFTASKACTION:REASSIGN del ramo reasignar del WebReport,
          con su comentario. Cambiarlo ahi al publicar en PROD.
@@ -261,65 +564,131 @@ REASIGNADO_OK
   const BASIC_USER = 'ADOBE-LOGS';
   const BASIC_PASS = 'ADOBE-LOGS-PASS';
   const REPORT_ID = 'REPORT_ID_POR_ASIGNAR';
+  const MAX_FLUJOS = 20;
+  const ATRIBUTO = 'ID Flujo a Cancelar';
   /* ============================ fin de la configuracion ============================ */
 
   /* Valores de OTCS. WORKFLOW_ID / SUBWORKFLOW_ID son los del workflow de CANCELACION (la tarea donde corre este WebReport).
-     El flujo a cancelar (ID Flujo a Cancelar / ID Subflujo a Cancelar) se lee de textarea ocultos y solo se MUESTRA para
-     confirmarlo: el servidor lo vuelve a leer del formulario de la tarea y no recibe este valor del navegador. */
+     Los flujos a cancelar se leen del atributo (textarea oculto) para MOSTRARLOS: el servidor los vuelve a leer del formulario
+     de la tarea y no recibe esta lista del navegador. */
   const WORKFLOW_ID = '[LL_REPTAG_&WORKID /]';
   const SUBWORKFLOW_ID = '[LL_REPTAG_&SUBWORKID /]';
+  const TASK_ID = '[LL_REPTAG_&TASKID /]';
+  const OTCS_URL = '[LL_REPTAG_URLPREFIXFULL /]'.replace(/\/+$/, '');
   const DESTINO_FLUJO_RAW = valorDe('dato-flujo');
   const DESTINO_SUBFLUJO_RAW = valorDe('dato-subflujo');
 
-  /* Marca que devuelve el ramo reasignar. Se arma en JS para no aparecer en la pagina normal. */
+  /* Marcas de los ramos. Se arman en JS para no aparecer en la pagina normal. */
   const MARCA_REASIGNADO = 'REASIGNADO' + '_OK';
+  const MARCA_GUARDADO = 'GUARDADO' + '_OK';
+  const MARCA_LEIDO = 'LEIDO' + '_OK';
+  const CLAVE_SEL = 'cancelar-sel-' + WORKFLOW_ID;
+  const COLUMNAS = ['workId', 'subWorkId', 'titulo', 'fecha', 'idEmpleado', 'nombre', 'cedula', 'documento'];
   const MSG_ASIGNAR = 'No fue posible asignar la tarea. Intente de nuevo.';
   const CABECERAS = { 'Content-Type': 'application/json', 'ngrok-skip-browser-warning': 'true' };
-  const OTCS_URL = '[LL_REPTAG_URLPREFIXFULL /]'.replace(/\/+$/, '');
-  const ORDEN_PASOS = ['asignar', 'cancelar', 'listo'];
-  const TEXTO_PASO = { asignar: 'Asignando la tarea...', cancelar: 'Cancelando en Adobe Sign...' };
+  const ORDEN_PASOS = ['guardar', 'asignar', 'trabajo', 'listo'];
+  const TEXTO_PASO = { guardar: 'Guardando y verificando la selección...', asignar: 'Asignando la tarea...' };
+  const TRANSITORIOS = ['no_disponible', 'pendiente'];
+  const ERRORES_DE_LISTA = ['MISSING_TARGET', 'INVALID_TARGET', 'TOO_MANY_TARGETS'];
+
+  /* Estado de cada flujo en la revision (/cancel/preview). texto puede ser una funcion del item. */
+  const ESTADOS = {
+    abierto: { etq: 'Abierto', tipo: 'ok', texto: 'Acuerdo en curso en Adobe Sign, sin firmas concluidas.' },
+    firma_parcial: {
+      etq: 'Firma parcial',
+      tipo: 'aviso',
+      texto: (it) => 'Acuerdo en curso con ' + (Number.isFinite(it.signedCount) ? it.signedCount + ' firma(s) ya concluida(s)' : 'firmas ya concluidas') + '.'
+    },
+    ya_cancelado: { etq: 'Ya cancelado', tipo: 'neutro', texto: 'El acuerdo ya está cancelado en Adobe Sign; no se vuelve a cancelar.' },
+    firmado: { etq: 'Firmado', tipo: 'aviso', texto: 'Firmado por todos en Adobe Sign. Regularice el flujo de contratación; no se cancela.' },
+    rechazado: { etq: 'Rechazado', tipo: 'error', texto: 'Un firmante rechazó el acuerdo en Adobe Sign. No se cancela.' },
+    no_cancelable: { etq: 'No cancelable', tipo: 'error', texto: 'El estado del acuerdo en Adobe Sign no permite cancelarlo.' },
+    concluido: { etq: 'Concluido', tipo: 'neutro', texto: 'El acuerdo de este flujo ya concluyó; no hay nada que cancelar.' },
+    ambiguo: { etq: 'Ambiguo', tipo: 'error', texto: 'El flujo tiene más de un acuerdo de firma abierto. No se cancela ninguno.' },
+    no_encontrado: {
+      etq: 'Sin acuerdo',
+      tipo: 'error',
+      texto: 'No se encontró un acuerdo de firma para este flujo en el orquestador. Si el flujo se envió con el orquestador anterior, pida a soporte que adopte el acuerdo; si ya estaba firmado, regularícelo.'
+    },
+    no_existe_en_adobe: { etq: 'No existe en Adobe', tipo: 'error', texto: 'El acuerdo ya no existe en Adobe Sign; no hay nada que cancelar.' },
+    no_disponible: { etq: 'No disponible', tipo: 'aviso', texto: 'Adobe Sign no respondió; no se pudo revisar este flujo.' },
+    pendiente: { etq: 'Pendiente', tipo: 'aviso', texto: 'No se alcanzó a revisar este flujo (tiempo agotado).' }
+  };
 
   /* Respuestas del servidor: texto para el usuario, ayuda y si Reintentar tiene sentido.
-     Los codigos transitorios (503, IN_PROGRESS) se pueden repetir sin riesgo: el servidor es idempotente. */
+     Los codigos transitorios (503, IN_PROGRESS) se pueden repetir sin riesgo: el servidor es idempotente.
+     Los codigos de item (ALREADY_SIGNED...) tambien salen item a item en la respuesta de /cancel. */
   const CODIGOS = {
     AGREEMENT_NOT_FOUND: {
       mensaje: 'No se encontró un acuerdo de firma para este flujo.',
-      detalle: 'Revise el ID del flujo. Si el flujo se envió con el orquestador anterior, pida a soporte que adopte el acuerdo (POST /admin/adopt/{ID del acuerdo}) y presione "Reintentar".',
+      detalle: 'Si el flujo se envió con el orquestador anterior, pida a soporte que adopte el acuerdo (POST /admin/adopt/{ID del acuerdo}) y vuelva a intentar.',
       reintento: true
     },
     AGREEMENT_NOT_FOUND_IN_ADOBE: { mensaje: 'El acuerdo ya no existe en Adobe Sign; no hay nada que cancelar.', reintento: false },
     AMBIGUOUS: {
       mensaje: 'El flujo tiene más de un acuerdo de firma abierto. No se canceló ninguno.',
-      detalle: 'Indique el subflujo en el atributo "ID Subflujo a Cancelar" del flujo de cancelación y vuelva a abrir esta página.',
+      detalle: 'Cancélelo por separado: deje un solo flujo en "ID Flujo a Cancelar" e indique el subflujo en "ID Subflujo a Cancelar".',
       reintento: false
     },
     AGREEMENT_CLOSED: { mensaje: 'El acuerdo más reciente de este flujo ya concluyó; no hay nada que cancelar.', reintento: false },
-    ALREADY_SIGNED: { mensaje: 'El acuerdo ya fue firmado por todos en Adobe Sign; no se puede cancelar.', reintento: false },
+    ALREADY_SIGNED: { mensaje: 'El acuerdo ya fue firmado por todos en Adobe Sign; no se puede cancelar. Regularice el flujo.', reintento: false },
     ALREADY_REJECTED: { mensaje: 'Un firmante ya rechazó el acuerdo en Adobe Sign; no se puede cancelar. El flujo original recibirá el rechazo.', reintento: false },
     NOT_CANCELABLE: { mensaje: 'El acuerdo está en un estado en el que Adobe Sign no permite cancelarlo.', reintento: false },
     IN_PROGRESS: { mensaje: 'Ya hay una cancelación en curso para este acuerdo. Espere unos segundos y reintente.', reintento: true },
+    BUDGET_EXCEEDED: { mensaje: 'No alcanzó el tiempo para procesar este flujo. Reintente: los ya cancelados no se vuelven a cancelar.', reintento: true },
+    UNEXPECTED_ERROR: { mensaje: 'Error inesperado al procesar este flujo. Reintente; si persiste, avise a soporte.', reintento: true },
     NOT_AT_CANCEL_STEP: { mensaje: 'El flujo de cancelación no está en el paso "Cancelar Flujo de Firma" (quizá ya se completó).', reintento: false },
     FLOW_NOT_FOUND: { mensaje: 'No se encontró el flujo de cancelación en Content Server.', reintento: false },
-    MISSING_TARGET: { mensaje: 'El flujo de cancelación no tiene el ID del flujo a cancelar. Complete el atributo "ID Flujo a Cancelar".', reintento: false },
-    INVALID_TARGET: { mensaje: 'El ID del subflujo a cancelar no es válido. Corrija el atributo "ID Subflujo a Cancelar".', reintento: false },
+    MISSING_TARGET: { mensaje: 'El flujo de cancelación no tiene el ID de los flujos a cancelar. Seleccione los flujos o complete el atributo "ID Flujo a Cancelar".', reintento: false },
+    INVALID_TARGET: {
+      mensaje: 'La lista de flujos a cancelar tiene valores no válidos. Cambie la selección o corrija "ID Flujo a Cancelar" (y "ID Subflujo a Cancelar"): solo números.',
+      reintento: false
+    },
+    TOO_MANY_TARGETS: { mensaje: 'La lista tiene más flujos de los permitidos. Cambie la selección para reducirla.', reintento: false },
     ADOBE_UNAVAILABLE: { mensaje: 'Adobe Sign no está disponible por ahora. No se modificó nada; intente nuevamente.', reintento: true },
     OTCS_UNAVAILABLE: { mensaje: 'Content Server no está disponible por ahora. No se modificó nada; intente nuevamente.', reintento: true },
     RECONCILE_IN_PROGRESS: { mensaje: 'El acuerdo se está sincronizando con Adobe Sign. No se modificó nada; intente nuevamente en unos segundos.', reintento: true },
+    STOP_FAILED: {
+      mensaje: 'Cancelado en Adobe Sign; falta detener el flujo en Content Server.',
+      detalle: 'Si el error son permisos, verifique que el usuario de integración pueda detener procesos. Presione "Reintentar pendientes": Adobe no se cancela de nuevo, solo se repite la detención.',
+      reintento: true
+    },
+    RESULT_FIELD_MISSING: {
+      mensaje: 'Error de configuración: el formulario de la tarea no tiene el campo "IDs Cancelados". No se canceló nada ni se avanzó la tarea.',
+      detalle: 'Avise a soporte: falta el campo en el formulario del mapa (o hay que desactivar el registro en el servidor, CANCEL_FIELD_RESULT vacío). Corregido eso, presione "Reintentar".',
+      reintento: true
+    },
+    RESULT_WRITE_FAILED: {
+      mensaje: 'Los flujos se procesaron, pero no se pudo registrar la lista de cancelados en el formulario. No se avanzó la tarea.',
+      detalle: 'Repetir es seguro: presione "Reintentar" (los ya cancelados no se vuelven a cancelar).',
+      reintento: true
+    },
     SENDON_FAILED: {
-      mensaje: 'El acuerdo ya fue cancelado en Adobe Sign, pero no se pudo continuar el flujo de cancelación.',
+      mensaje: 'Los acuerdos ya fueron cancelados en Adobe Sign, pero no se pudo continuar el flujo de cancelación.',
       detalle: 'Repetir es seguro: presione "Reintentar" para continuar sin volver a cancelar.',
       reintento: true
     },
     REASSIGN_REQUIRED: { mensaje: MSG_ASIGNAR, reintento: true }
   };
 
-  /* Unico estado de la pagina. */
+  /* Estado del flujo original en Content (item.contentStop del /cancel; 'disabled' = el servidor no lo detiene: no se muestra). */
+  const CONTENT_STOP = {
+    stopped: { etq: 'Detenido en Content', tipo: 'ok' },
+    already_stopped: { etq: 'Ya estaba detenido', tipo: 'neutro' },
+    failed: { etq: 'No se pudo detener', tipo: 'error' }
+  };
+
+  /* Unico estado de la pagina. modo: seleccion | revision | planc. ultima: accion que repite Reintentar ('revisar' | 'cancelar').
+     destinoIds: lo que hay grabado en el atributo (lo que el servidor va a leer). seleccion: Map workId -> etiqueta. */
   const state = {
-    ocupado: false, intentado: false, paso: 'cancelar', acuerdoId: null, yaCancelado: false, handoff: null,
-    destinoFlujo: '', destinoSubflujo: ''
+    modo: 'seleccion', ocupado: false, intentado: false, paso: 'trabajo', handoff: null, reasignado: false, ultima: 'revisar',
+    destinoIds: [], destinoSubflujo: '', cancelables: 0, hayParcial: false, stopOriginal: false, yaEjecutado: false,
+    filas: [], seleccion: new Map()
   };
 
   /* ---------- Utilidades ---------- */
+
+  const $ = (id) => document.getElementById(id);
 
   /* Texto literal de un textarea oculto. */
   function valorDe(id) {
@@ -329,6 +698,55 @@ REASIGNADO_OK
 
   function esDigitos(v) {
     return /^\d+$/.test(String(v));
+  }
+
+  function esObjeto(v) {
+    return v !== null && typeof v === 'object' && !Array.isArray(v);
+  }
+
+  /* Numeros (sin repetir, en orden) de un texto cuyo formato de lista no se conoce. Solo para MOSTRAR y comparar. */
+  function extraerIds(texto) {
+    const vistos = new Set();
+    const salida = [];
+    (String(texto || '').match(/\d+/g) || []).forEach((n) => {
+      if (!vistos.has(n)) { vistos.add(n); salida.push(n); }
+    });
+    return salida;
+  }
+
+  function mismosIds(a, b) {
+    return a.length === b.length && a.every((id) => b.indexOf(id) >= 0);
+  }
+
+  /* Crea un elemento. Los hijos de texto van como nodos de texto: nada de lo que llega del servidor se interpreta como HTML. */
+  function h(etiqueta, props, ...hijos) {
+    const el = document.createElement(etiqueta);
+    if (props) {
+      Object.keys(props).forEach((k) => {
+        const v = props[k];
+        if (v === false || v === null || v === undefined) return;
+        if (k === 'class') el.className = v;
+        else el.setAttribute(k, v === true ? '' : String(v));
+      });
+    }
+    hijos.flat().forEach((c) => {
+      if (c === null || c === undefined || c === false) return;
+      el.appendChild(typeof c === 'string' ? document.createTextNode(c) : c);
+    });
+    return el;
+  }
+
+  /* Valor de un parametro de la URL leido por la tag. Si OTCS no lo resuelve puede dejar vacio, "?" o la propia tag. */
+  function parametro(id) {
+    const v = valorDe(id);
+    if (!v || v === '?' || v.charAt(0) === '&' || v.indexOf('LL_REPTAG') >= 0) return '';
+    return v;
+  }
+
+  /* Valor de una celda del LiveReport: "?" es como OTCS muestra vacio. */
+  function celda(v) {
+    const t = String(v || '').trim();
+    return t === '?' ? '' : t;
   }
 
   function mensajeDeError(data) {
@@ -350,7 +768,8 @@ REASIGNADO_OK
   }
 
   /* Error de una respuesta del servidor, con el texto de CODIGOS cuando el codigo se conoce.
-     err.sinReintento: Reintentar no cambiaria nada. err.detalle: linea de ayuda. err.acuerdos: lista a mostrar. */
+     err.sinReintento: Reintentar no cambiaria nada. err.detalle: linea de ayuda. err.acuerdos: lista a mostrar.
+     err.items: items de /cancel que vienen junto con el error (RESULT_WRITE_FAILED, SENDON_FAILED). */
   function errorServidor(r, porDefecto) {
     const data = r.data;
     const codigo = typeof data.code === 'string' ? data.code : '';
@@ -364,28 +783,46 @@ REASIGNADO_OK
       err.message = 'La cancelación de flujos no está habilitada en el servidor.';
       err.sinReintento = true;
     }
-    if (codigo === 'NOT_CANCELABLE' && data.adobeStatus) {
+    if (codigo === 'TOO_MANY_TARGETS' && Number.isFinite(data.max)) {
+      err.message = 'La lista tiene más flujos de los permitidos (máximo ' + data.max + '). Cambie la selección para reducirla.';
+    } else if (codigo === 'INVALID_TARGET' && Array.isArray(data.invalid) && data.invalid.length) {
+      err.detalle = 'Valores no válidos: ' + data.invalid.slice(0, 10).map(String).join(', ') + (data.invalid.length > 10 ? '...' : '');
+    } else if (codigo === 'NOT_CANCELABLE' && data.adobeStatus) {
       err.detalle = 'Estado en Adobe Sign: ' + String(data.adobeStatus);
-    } else if (codigo === 'SENDON_FAILED' && data.id) {
-      err.detalle = 'ID del acuerdo: ' + String(data.id) + '. ' + def.detalle;
-    } else if (codigo === 'AGREEMENT_CLOSED' && data.agreement && typeof data.agreement === 'object') {
+    } else if (codigo === 'AGREEMENT_CLOSED' && esObjeto(data.agreement)) {
       err.acuerdos = [data.agreement];
     } else if (codigo === 'AMBIGUOUS' && Array.isArray(data.agreements)) {
-      err.acuerdos = data.agreements.filter((a) => a && typeof a === 'object');
+      err.acuerdos = data.agreements.filter(esObjeto);
     }
+    if (Array.isArray(data.items)) err.items = data.items.filter(esObjeto);
     return err;
   }
 
-  /* ---------- Interfaz ---------- */
+  /* ---------- Modos de la pagina ---------- */
+
+  function mostrarModo(modo) {
+    state.modo = modo;
+    $('vista-seleccion').hidden = modo !== 'seleccion';
+    $('vista-plan-c').hidden = modo !== 'planc';
+    $('vista-revision').hidden = modo !== 'revision';
+  }
+
+  /* ---------- Interfaz de la revision ---------- */
 
   function setEstado(texto, tipo) {
-    const el = document.getElementById('estado');
+    const el = $('estado');
     el.textContent = texto;
     el.className = tipo ? 'estado ' + tipo : 'estado';
   }
 
+  function setEstadoSel(texto, tipo) {
+    const el = $('sel-estado');
+    el.textContent = texto;
+    el.className = tipo ? 'estado-sel ' + tipo : 'estado-sel';
+  }
+
   function pintarPaso(nombre, estado) {
-    document.getElementById('paso-' + nombre).setAttribute('data-estado', estado);
+    $('paso-' + nombre).setAttribute('data-estado', estado);
   }
 
   /* Marca el paso activo; los anteriores quedan hechos y los siguientes pendientes. */
@@ -397,38 +834,52 @@ REASIGNADO_OK
       else if (i === idx) pintarPaso(p, 'activo');
       else pintarPaso(p, 'pendiente');
     });
-    setEstado(TEXTO_PASO[nombre], '');
+    setEstado(TEXTO_PASO[nombre] || $('paso-trabajo-texto').textContent + '...', '');
   }
 
   function mostrarInsignia(tipo) {
-    document.getElementById('resultado').hidden = !tipo;
-    document.getElementById('insignia').className = tipo ? 'insignia ' + tipo : 'insignia';
+    $('resultado').hidden = !tipo;
+    $('insignia').className = tipo ? 'insignia ' + tipo : 'insignia';
+  }
+
+  function ocultar(ids) {
+    ids.forEach((id) => { $(id).hidden = true; });
   }
 
   function reiniciarVista() {
     mostrarInsignia(null);
-    document.getElementById('acuerdo').hidden = true;
-    document.getElementById('lista-acuerdos').hidden = true;
-    document.getElementById('btn-reintentar').hidden = true;
-    document.getElementById('btn-cancelar').hidden = true;
-    document.getElementById('vista-confirmar').hidden = true;
+    ocultar(['acuerdo', 'lista-acuerdos', 'btn-reintentar', 'btn-revisar', 'btn-confirmar', 'btn-cambiar', 'vista-inicio', 'vista-prevista',
+      'vista-resultado', 'pasos', 'paso-guardar', 'paso-asignar']);
+    $('lista-acuerdos').textContent = '';
     setEstado('', '');
   }
 
   function pintarDatos() {
-    document.getElementById('destino-flujo').textContent = state.destinoFlujo || 'Sin dato';
-    document.getElementById('destino-subflujo').textContent = state.destinoSubflujo || 'No indicado (se usa el flujo completo)';
+    const ids = state.destinoIds;
+    $('destino-total').textContent = ids.length ? '(' + ids.length + ')' : '';
+    const ul = $('destino-ids');
+    ul.textContent = '';
+    if (!ids.length) ul.appendChild(h('li', { class: 'chip' }, 'Sin dato'));
+    ids.forEach((id) => ul.appendChild(h('li', { class: 'chip' }, id)));
+    const sub = $('destino-subflujo');
+    if (ids.length > 1) {
+      sub.textContent = state.destinoSubflujo
+        ? state.destinoSubflujo + ' (se ignora: hay varios flujos)'
+        : 'No aplica (hay varios flujos)';
+    } else {
+      sub.textContent = state.destinoSubflujo || 'No indicado (se usa el flujo completo)';
+    }
   }
 
   /* Linea secundaria bajo el estado (ID del acuerdo, ayuda del error). */
   function mostrarDetalle(texto) {
-    const el = document.getElementById('acuerdo');
+    const el = $('acuerdo');
     el.textContent = texto;
     el.hidden = false;
   }
 
   function mostrarAcuerdos(lista) {
-    const ul = document.getElementById('lista-acuerdos');
+    const ul = $('lista-acuerdos');
     ul.textContent = '';
     lista.forEach((a) => {
       const li = document.createElement('li');
@@ -438,29 +889,219 @@ REASIGNADO_OK
     ul.hidden = lista.length === 0;
   }
 
-  function mostrarExito() {
-    ORDEN_PASOS.forEach((p) => pintarPaso(p, 'hecho'));
-    mostrarInsignia('ok');
-    setEstado(
-      state.yaCancelado
-        ? 'El acuerdo ya estaba cancelado en Adobe Sign. El flujo de cancelación continúa.'
-        : 'Flujo cancelado en Adobe Sign. El flujo de cancelación continúa.',
-      'ok'
-    );
-    mostrarDetalle((state.acuerdoId ? 'ID del acuerdo: ' + state.acuerdoId + '. ' : '') + 'Puede cerrar esta ventana.');
+  /* Texto del paso de trabajo (consultando / cancelando) y pasos visibles. conGuardar: muestra el paso de guardado. */
+  function mostrarPasos(textoTrabajo, conGuardar) {
+    $('paso-trabajo-texto').textContent = textoTrabajo;
+    ORDEN_PASOS.forEach((p) => pintarPaso(p, 'pendiente'));
+    $('paso-guardar').hidden = !conGuardar;
+    $('pasos').hidden = false;
+  }
+
+  /* ---------- Revision: lista por estado ---------- */
+
+  function lineasAcuerdos(it) {
+    const lista = [];
+    if (Array.isArray(it.agreements)) it.agreements.filter(esObjeto).forEach((a) => lista.push(lineaAcuerdo(a)));
+    if (esObjeto(it.agreement)) lista.push(lineaAcuerdo(it.agreement));
+    return lista;
+  }
+
+  function filaPrevista(it) {
+    const info = ESTADOS[it.state] || {
+      etq: String(it.state || 'Desconocido'),
+      tipo: 'neutro',
+      texto: typeof it.message === 'string' && it.message ? it.message : 'Estado no reconocido por esta página.'
+    };
+    const texto = typeof info.texto === 'function' ? info.texto(it) : info.texto;
+    const extra = [];
+    if (it.adobeStatus) extra.push('Estado en Adobe Sign: ' + String(it.adobeStatus));
+    if (it.agreementId) extra.push('Acuerdo: ' + String(it.agreementId));
+    if (it.state === 'firma_parcial' && it.lastSignedAt) extra.push('Última firma: ' + String(it.lastSignedAt));
+    const li = h('li', { class: 'item' },
+      h('div', { class: 'item-cab' },
+        h('span', { class: 'item-id' }, 'Flujo ' + String(it.workflowId === undefined || it.workflowId === null ? '?' : it.workflowId)),
+        h('span', { class: 'badge ' + info.tipo }, info.etq)),
+      h('div', { class: 'item-texto' }, texto),
+      extra.length ? h('div', { class: 'item-extra' }, extra.join(' · ')) : null);
+    if (it.state === 'firma_parcial') {
+      li.appendChild(h('div', { class: 'item-aviso', role: 'alert' }, 'Firma parcial: al cancelar se pierde(n) la(s) firma(s) ya concluida(s).'));
+    }
+    if (it.state === 'abierto' && it.partialUnknown === true) {
+      li.appendChild(h('div', { class: 'item-aviso' }, 'No se pudo consultar el historial de firmas: podría haber firmas parciales que se perderán.'));
+    }
+    lineasAcuerdos(it).forEach((t) => li.appendChild(h('div', { class: 'item-extra' }, t)));
+    return li;
+  }
+
+  function llenarGrupo(sufijo, titulo, items) {
+    const ul = $('lista-' + sufijo);
+    ul.textContent = '';
+    items.forEach((it) => ul.appendChild(filaPrevista(it)));
+    $('titulo-' + sufijo).textContent = titulo + ' (' + items.length + ')';
+    $('grupo-' + sufijo).hidden = items.length === 0;
+  }
+
+  /* Boton de confirmar: el texto depende de N (cancelables) y se bloquea hasta marcar la ciencia de firma parcial. */
+  function actualizarConfirmar() {
+    const btn = $('btn-confirmar');
+    const n = state.cancelables;
+    btn.textContent = n > 0 ? 'Cancelar estos ' + n + (n === 1 ? ' flujo' : ' flujos') : 'Continuar sin cancelar ninguno';
+    btn.className = n > 0 ? 'btn peligro' : 'btn';
+    const falta = state.hayParcial && !$('chk-parcial').checked;
+    btn.disabled = state.ocupado || falta;
+    btn.setAttribute('aria-busy', state.ocupado ? 'true' : 'false');
+  }
+
+  /* Oculta pasos y mensajes de la fase anterior sin tocar la vista de revision. */
+  function reiniciarSoloAcciones() {
+    ocultar(['pasos', 'paso-guardar', 'paso-asignar', 'acuerdo', 'lista-acuerdos', 'btn-reintentar', 'vista-resultado']);
+    mostrarInsignia(null);
+    setEstado('', '');
+  }
+
+  function renderPrevista(data) {
+    const items = Array.isArray(data.items) ? data.items.filter(esObjeto) : [];
+    const grupos = { cancelar: [], firmados: [], resto: [], transitorios: [] };
+    items.forEach((it) => {
+      if (TRANSITORIOS.includes(it.state)) grupos.transitorios.push(it);
+      else if (it.state === 'firmado') grupos.firmados.push(it);
+      else if (it.cancelable === true) grupos.cancelar.push(it);
+      else grupos.resto.push(it);
+    });
+    state.cancelables = grupos.cancelar.length;
+    state.hayParcial = grupos.cancelar.some((it) => it.state === 'firma_parcial');
+
+    llenarGrupo('cancelar', 'Se cancelarán', grupos.cancelar);
+    llenarGrupo('firmados', 'Firmados — regularizar, no cancelar', grupos.firmados);
+    llenarGrupo('resto', 'No se cancelarán', grupos.resto);
+    llenarGrupo('transitorios', 'No se pudieron revisar', grupos.transitorios);
+
+    $('aviso-reasignado').hidden = !state.reasignado;
+    $('nota-subflujo-ignorado').hidden = data.subworkflowIgnored !== true;
+    const hayNoCancelables = grupos.firmados.length + grupos.resto.length + grupos.transitorios.length > 0;
+    state.stopOriginal = data.stopOriginal === true;
+    $('nota-confirmar').textContent =
+      (state.stopOriginal
+        ? 'Al confirmar, los flujos se cancelan en Adobe Sign y se detienen en Content Server. '
+        : 'Los flujos se cancelan solo en Adobe Sign; el flujo original se detiene en el paso siguiente. ') +
+      'El servidor procesa toda la lista del atributo' +
+      (hayNoCancelables ? ': los flujos que no se pueden cancelar quedan sin cambios y se informa el motivo' : '') +
+      '. Luego la tarea de cancelación continúa.';
+
+    $('caja-parcial').hidden = !state.hayParcial;
+    $('chk-parcial').checked = false;
+
+    reiniciarSoloAcciones();
+    $('vista-prevista').hidden = false;
+    const rev = $('btn-revisar');
+    rev.textContent = 'Revisar de nuevo';
+    rev.className = 'btn secundario';
+    rev.hidden = false;
+    $('btn-confirmar').hidden = false;
+    $('btn-cambiar').hidden = false;
+    actualizarConfirmar();
+    setEstado(items.length ? '' : 'El servidor no devolvió ningún flujo para revisar.', items.length ? '' : 'aviso');
+    /* El formulario no tiene el campo donde se registran los cancelados: error de configuracion, no se ofrece confirmar
+       (el /cancel responderia RESULT_FIELD_MISSING antes de cancelar nada). La lista queda como informacion. */
+    if (data.resultFieldMissing === true) {
+      $('btn-confirmar').hidden = true;
+      $('caja-parcial').hidden = true;
+      mostrarInsignia('error');
+      setEstado(CODIGOS.RESULT_FIELD_MISSING.mensaje, 'error');
+      mostrarDetalle(CODIGOS.RESULT_FIELD_MISSING.detalle);
+    }
+  }
+
+  /* ---------- Resultado de la cancelacion, item a item ---------- */
+
+  function filaResultado(it) {
+    const outcome = it.outcome;
+    const codigo = typeof it.code === 'string' ? it.code : '';
+    const def = CODIGOS[codigo];
+    let etq = 'Desconocido';
+    let tipo = 'neutro';
+    if (outcome === 'cancelled') { etq = it.alreadyCancelled === true ? 'Ya estaba cancelado' : 'Cancelado'; tipo = 'ok'; }
+    else if (outcome === 'refused') { etq = 'No cancelado'; tipo = 'error'; }
+    else if (outcome === 'pending') { etq = 'Pendiente'; tipo = 'aviso'; }
+    let texto = def ? def.mensaje : (typeof it.message === 'string' ? it.message : '');
+    if (outcome === 'cancelled') texto = it.alreadyCancelled === true ? 'El acuerdo ya estaba cancelado en Adobe Sign.' : 'Acuerdo cancelado en Adobe Sign.';
+    const extra = [];
+    if (it.agreementId) extra.push('Acuerdo: ' + String(it.agreementId));
+    if (it.adobeStatus) extra.push('Estado en Adobe Sign: ' + String(it.adobeStatus));
+    const cs = CONTENT_STOP[it.contentStop] || (it.code === 'STOP_FAILED' ? CONTENT_STOP.failed : null);
+    const li = h('li', { class: 'item' },
+      h('div', { class: 'item-cab' },
+        h('span', { class: 'item-id' }, 'Flujo ' + String(it.workflowId === undefined || it.workflowId === null ? '?' : it.workflowId)),
+        h('span', { class: 'badge ' + tipo }, etq),
+        cs ? h('span', { class: 'badge ' + cs.tipo }, cs.etq) : null),
+      texto ? h('div', { class: 'item-texto' }, texto) : null,
+      def && def.detalle && outcome !== 'cancelled' ? h('div', { class: 'item-extra' }, def.detalle) : null,
+      extra.length ? h('div', { class: 'item-extra' }, extra.join(' · ')) : null);
+    lineasAcuerdos(it).forEach((t) => li.appendChild(h('div', { class: 'item-extra' }, t)));
+    return li;
+  }
+
+  function pintarResultado(items) {
+    const ul = $('lista-resultado');
+    ul.textContent = '';
+    items.forEach((it) => ul.appendChild(filaResultado(it)));
+    $('vista-resultado').hidden = items.length === 0;
+  }
+
+  function resumenItems(items) {
+    const c = items.filter((i) => i.outcome === 'cancelled').length;
+    const r = items.filter((i) => i.outcome === 'refused').length;
+    const p = items.filter((i) => i.outcome === 'pending').length;
+    return 'Cancelados: ' + c + ' · No cancelados: ' + r + ' · Pendientes: ' + p;
+  }
+
+  function mostrarFinCancelacion(data) {
+    const items = Array.isArray(data.items) ? data.items.filter(esObjeto) : [];
+    const notaSub = data.subworkflowIgnored === true ? ' "ID Subflujo a Cancelar" se ignoró (hay varios flujos).' : '';
+    $('vista-prevista').hidden = true;
+    ocultar(['btn-confirmar', 'btn-revisar', 'btn-cambiar']);
+    pintarResultado(items);
+    mostrarDetalle(resumenItems(items));
+    if (data.complete === true) {
+      state.yaEjecutado = true;
+      ORDEN_PASOS.forEach((p) => pintarPaso(p, 'hecho'));
+      mostrarInsignia('ok');
+      setEstado('Proceso terminado. El flujo de cancelación continúa.', 'ok');
+      if (typeof data.resultField === 'string' && data.resultField) {
+        mostrarDetalle(resumenItems(items) + '. Lista de cancelados registrada en "' + data.resultField + '".' + notaSub + ' Puede cerrar esta ventana.');
+      } else {
+        mostrarDetalle(resumenItems(items) + '.' + notaSub + ' Puede cerrar esta ventana.');
+      }
+    } else {
+      pintarPaso(state.paso, 'aviso');
+      mostrarInsignia('aviso');
+      const pend = items.filter((i) => i.outcome === 'pending').length;
+      setEstado('Quedan ' + (pend || 'algunos') + ' flujo(s) pendiente(s). No se registró nada ni se avanzó la tarea: repetir es seguro.', 'aviso');
+      const b = $('btn-reintentar');
+      b.textContent = 'Reintentar pendientes';
+      b.hidden = false;
+    }
   }
 
   /* Los errores de datos no se reintentan: repetir la misma validacion no cambia nada.
-     Los transitorios (503, IN_PROGRESS, SENDON_FAILED, red) dejan Reintentar. */
+     Los transitorios (503, IN_PROGRESS, SENDON_FAILED, red) dejan Reintentar.
+     Los errores de la lista de flujos ofrecen "Cambiar selección". */
   function mostrarError(err) {
     console.error('[cancelar]', err);
-    document.getElementById('pasos').hidden = !state.intentado;
-    if (!err.sinReintento) pintarPaso(state.paso, 'error');
+    $('pasos').hidden = !state.intentado;
+    if (!err.sinReintento && state.intentado) pintarPaso(state.paso, 'error');
     mostrarInsignia('error');
-    setEstado(err.message || 'No se pudo cancelar el flujo.', 'error');
+    setEstado(err.message || 'No se pudo completar la operación.', 'error');
     if (err.detalle) mostrarDetalle(err.detalle);
     if (err.acuerdos) mostrarAcuerdos(err.acuerdos);
-    document.getElementById('btn-reintentar').hidden = Boolean(err.sinReintento);
+    if (err.items && err.items.length) {
+      pintarResultado(err.items);
+      $('vista-prevista').hidden = true;
+    }
+    const b = $('btn-reintentar');
+    b.textContent = 'Reintentar';
+    b.hidden = Boolean(err.sinReintento);
+    $('btn-cambiar').hidden = ERRORES_DE_LISTA.indexOf(err.codigo) < 0;
   }
 
   /* ---------- Red ---------- */
@@ -478,8 +1119,8 @@ REASIGNADO_OK
     return { ok: resp.ok, status: resp.status, data: data && typeof data === 'object' ? data : {} };
   }
 
-  /* Campos del pedido. Son los mismos en /auth y en /cancel (la firma los cubre): solo el workflow de cancelacion.
-     El flujo a cancelar NO viaja: el servidor lo lee del formulario de la tarea. */
+  /* Campos del pedido. Son los mismos en /auth, /cancel/preview y /cancel (la firma los cubre): solo el workflow de cancelacion.
+     Los flujos a cancelar NO viajan: el servidor los lee del formulario de la tarea. */
   function camposCancelacion() {
     return { workflowId: WORKFLOW_ID, subworkflowId: SUBWORKFLOW_ID };
   }
@@ -493,27 +1134,49 @@ REASIGNADO_OK
     return { timestamp: r.data.timestamp, nonce: r.data.nonce, signature: r.data.signature };
   }
 
-  /* /auth + /cancel. Devuelve la respuesta de /cancel tal cual (ok, status, data). Cada pedido usa un /auth nuevo (nonce de un solo uso). */
-  async function iniciar() {
+  /* /auth + la ruta (/cancel/preview o /cancel). Devuelve la respuesta tal cual (ok, status, data).
+     Cada pedido usa un /auth nuevo (el nonce es de un solo uso). */
+  async function pedir(ruta) {
     const campos = camposCancelacion();
     const firma = await obtenerFirma(campos);
-    return postJson(SERVER_URL + '/cancel', { ...campos, ...firma }, CABECERAS);
+    return postJson(SERVER_URL + ruta, { ...campos, ...firma }, CABECERAS);
+  }
+
+  /* Pedido GET al propio WebReport (ramos guardar / leer / reasignar): mismo origen, sesion del usuario. */
+  function paramsRamo(accion, extra) {
+    const p = new URLSearchParams({
+      func: 'll',
+      objAction: 'RunReport',
+      objId: REPORT_ID,
+      workid: WORKFLOW_ID,
+      subworkid: SUBWORKFLOW_ID,
+      taskid: TASK_ID,
+      accion
+    });
+    Object.keys(extra || {}).forEach((k) => p.set(k, extra[k]));
+    return p;
+  }
+
+  async function pedirRamo(accion, extra) {
+    const resp = await fetch(OTCS_URL + '?' + paramsRamo(accion, extra).toString(), { credentials: 'same-origin', cache: 'no-store' });
+    const texto = await resp.text().catch(() => '');
+    return { ok: resp.ok, texto };
   }
 
   /* Reasigna la tarea al usuario de integracion fijado en el ramo reasignar del WebReport.
      La URL solo lleva los IDs de la tarea: el destino no lo elige la URL. */
   async function reasignar() {
-    const h = state.handoff || {};
-    if (![h.workflowId, h.subworkflowId, h.taskId, REPORT_ID].every(esDigitos)) {
+    const hd = state.handoff || {};
+    if (![hd.workflowId, hd.subworkflowId, hd.taskId, REPORT_ID].every(esDigitos)) {
       throw new Error('Datos de reasignación inválidos.');
     }
     const params = new URLSearchParams({
       func: 'll',
       objAction: 'RunReport',
       objId: REPORT_ID,
-      workid: h.workflowId,
-      subworkid: h.subworkflowId,
-      taskid: h.taskId,
+      workid: hd.workflowId,
+      subworkid: hd.subworkflowId,
+      taskid: hd.taskId,
       accion: 'reasignar'
     });
     let resp;
@@ -528,48 +1191,369 @@ REASIGNADO_OK
     }
   }
 
-  /* Cancelacion. Si el servidor exige reasignar antes (REASSIGN_REQUIRED: la tarea sigue con el usuario),
-     reasigna y repite /auth + /cancel una sola vez. Como en el /start, el servidor valida antes lo que puede.
-     /cancel hace el SendOn de la tarea al terminar: no hay una segunda confirmacion de asignacion. */
-  async function cancelar() {
-    let r = await iniciar();
+  /* Pedido con reasignacion. Si el servidor exige reasignar antes (REASSIGN_REQUIRED: la tarea sigue con el usuario),
+     reasigna y repite /auth + la ruta una sola vez (nuevo /auth: el nonce ya se uso). */
+  async function conReasignacion(ruta, textoTrabajo) {
+    let r = await pedir(ruta);
     if (reasignaRequerido(r) && r.data.handoff) {
       state.handoff = r.data.handoff;
-      document.getElementById('paso-asignar').hidden = false;
+      $('paso-asignar').hidden = false;
       pasoActivo('asignar');
       await reasignar();
-      pasoActivo('cancelar');
-      r = await iniciar();
+      state.reasignado = true;
+      $('paso-trabajo-texto').textContent = textoTrabajo;
+      pasoActivo('trabajo');
+      r = await pedir(ruta);
       if (reasignaRequerido(r)) throw new Error(MSG_ASIGNAR);
     }
-    if (!r.ok) throw errorServidor(r, 'No se pudo cancelar el flujo.');
-    state.acuerdoId = r.data.id || null;
-    state.yaCancelado = r.data.alreadyCancelled === true;
+    return r;
   }
 
-  /* Valida lo que la pagina leyo del formulario. El servidor valida de nuevo con los atributos de OTCS. */
-  function validarDestino() {
-    const fallo = (msg) => Object.assign(new Error(msg), { sinReintento: true });
-    const flujo = DESTINO_FLUJO_RAW;
-    const sub = DESTINO_SUBFLUJO_RAW;
-    /* El WebReport muestra "?" cuando un atributo esta vacio. */
-    if (!esDigitos(flujo)) throw fallo(CODIGOS.MISSING_TARGET.mensaje);
-    if (sub && sub !== '?' && !esDigitos(sub)) throw fallo(CODIGOS.INVALID_TARGET.mensaje);
-    state.destinoFlujo = flujo;
-    state.destinoSubflujo = esDigitos(sub) ? sub : '';
+  /* ---------- Guardado de la seleccion (ramos guardar y leer) ---------- */
+
+  /* Validacion en el cliente: solo digitos separados por coma, entre 1 y MAX_FLUJOS. */
+  function validarIds(ids) {
+    if (!ids.length) return 'Seleccione al menos un flujo.';
+    if (ids.length > MAX_FLUJOS) return 'Solo se pueden seleccionar ' + MAX_FLUJOS + ' flujos por cancelación.';
+    if (!ids.every((id) => /^\d{1,12}$/.test(id))) return 'Hay IDs que no son numéricos.';
+    if (new Set(ids).size !== ids.length) return 'Hay IDs repetidos.';
+    if (!/^\d+(,\d+)*$/.test(ids.join(','))) return 'Lista de IDs inválida.';
+    return '';
   }
 
-  /* Cancelacion completa. Reintentar la vuelve a ejecutar desde /auth. */
-  async function ejecutar() {
+  /* Numeros que el WebReport devuelve tras LEIDO_OK (formato de DISPLAY del multivalor desconocido: solo se extraen los numeros). */
+  function numerosLeidos(texto) {
+    const i = texto.indexOf(MARCA_LEIDO);
+    return extraerIds(i < 0 ? '' : texto.slice(i + MARCA_LEIDO.length));
+  }
+
+  /* Devuelve { estado: 'verificado' | 'no_verificado' | 'fallo', motivo }.
+     1) ramo guardar (SETWFATTR) y marca GUARDADO_OK; 2) ramo leer: el atributo debe tener exactamente los IDs enviados.
+     Solo 'verificado' deja seguir al servidor. */
+  async function guardar(ids) {
+    const error = validarIds(ids);
+    if (error) return { estado: 'fallo', motivo: error };
+    if (![WORKFLOW_ID, SUBWORKFLOW_ID, TASK_ID, REPORT_ID].every(esDigitos)) {
+      return { estado: 'fallo', motivo: 'Datos de la tarea inválidos: abra esta página desde la tarea "Cancelar Flujo de Firma".' };
+    }
+    let r;
+    try {
+      r = await pedirRamo('guardar', { ids: ids.join(','), lista: ids.map((id) => "'" + id + "'").join(',') });
+    } catch (_) {
+      return { estado: 'fallo', motivo: 'Sin conexión con OpenText.' };
+    }
+    if (!r.ok || !r.texto.includes(MARCA_GUARDADO)) {
+      return { estado: 'fallo', motivo: 'OpenText no confirmó el guardado. Verifique su sesión y sus permisos sobre la tarea.' };
+    }
+    let lectura;
+    try {
+      lectura = await pedirRamo('leer', {});
+    } catch (_) {
+      return { estado: 'no_verificado', motivo: 'No fue posible verificar el atributo (sin conexión).' };
+    }
+    if (!lectura.ok || !lectura.texto.includes(MARCA_LEIDO)) {
+      return { estado: 'no_verificado', motivo: 'No fue posible verificar el atributo.' };
+    }
+    return mismosIds(numerosLeidos(lectura.texto), ids)
+      ? { estado: 'verificado', motivo: '' }
+      : { estado: 'fallo', motivo: 'El atributo "' + ATRIBUTO + '" no refleja la selección (OpenText respondió, pero el valor no cambió).' };
+  }
+
+  /* ---------- Plan C ---------- */
+
+  function mostrarPlanC(res, ids) {
+    mostrarModo('planc');
+    $('pc-titulo').textContent = res.estado === 'fallo' ? 'No se pudo guardar la selección' : 'No se pudo verificar la selección guardada';
+    $('pc-texto').textContent = res.motivo +
+      ' Si la tarea ya fue transferida al usuario de integración, quizá no admita cambios desde esta página.' +
+      ' No se consultó nada al servidor de firmas.';
+    $('ids-copia').value = ids.join(', ');
+    $('estado-copia').textContent = '';
+    $('estado-copia').className = 'estado-sel';
+  }
+
+  /* Copia con el portapapeles; si el navegador no lo permite, selecciona el texto para Ctrl+C. */
+  async function copiar() {
+    const area = $('ids-copia');
+    const aviso = $('estado-copia');
+    try {
+      await navigator.clipboard.writeText(area.value);
+      aviso.textContent = 'IDs copiados.';
+      aviso.className = 'estado-sel ok';
+    } catch (_) {
+      area.focus();
+      area.select();
+      let ok = false;
+      try { ok = document.execCommand('copy'); } catch (__) { ok = false; }
+      aviso.textContent = ok ? 'IDs copiados.' : 'Seleccionados: presione Ctrl+C para copiarlos.';
+      aviso.className = ok ? 'estado-sel ok' : 'estado-sel aviso';
+    }
+  }
+
+  /* ---------- Etapa A: seleccion (se conserva entre busquedas con sessionStorage; sin almacenamiento, queda en memoria) ---------- */
+
+  function cargarSeleccionLocal() {
+    try {
+      const crudo = window.sessionStorage.getItem(CLAVE_SEL);
+      const obj = crudo ? JSON.parse(crudo) : {};
+      Object.keys(obj).forEach((id) => { if (esDigitos(id) && state.seleccion.size < MAX_FLUJOS) state.seleccion.set(id, String(obj[id] || '')); });
+    } catch (_) { /* sin almacenamiento: la seleccion vive solo en esta carga */ }
+  }
+
+  function guardarSeleccionLocal() {
+    try {
+      const obj = {};
+      state.seleccion.forEach((etq, id) => { obj[id] = etq; });
+      window.sessionStorage.setItem(CLAVE_SEL, JSON.stringify(obj));
+    } catch (_) { /* idem */ }
+  }
+
+  function limpiarSeleccionLocal() {
+    try { window.sessionStorage.removeItem(CLAVE_SEL); } catch (_) { /* idem */ }
+  }
+
+  /* Une filas con el mismo WorkID (un flujo con varios subflujos): la seleccion es por WorkID. */
+  function leerFilas() {
+    const porId = new Map();
+    document.querySelectorAll('#origen tbody tr').forEach((tr) => {
+      const celdas = Array.from(tr.querySelectorAll('textarea')).map((t) => celda(t.value));
+      if (celdas.length < COLUMNAS.length) return;
+      const f = {};
+      COLUMNAS.forEach((c, i) => { f[c] = celdas[i]; });
+      if (!esDigitos(f.workId)) return;
+      const previa = porId.get(f.workId);
+      if (previa) {
+        if (f.subWorkId && previa.subs.indexOf(f.subWorkId) < 0) previa.subs.push(f.subWorkId);
+        return;
+      }
+      f.subs = f.subWorkId ? [f.subWorkId] : [];
+      porId.set(f.workId, f);
+    });
+    return Array.from(porId.values());
+  }
+
+  function etiquetaDe(f) {
+    return [f.nombre, f.documento].filter(Boolean).join(' - ');
+  }
+
+  function pintarTabla() {
+    const tbody = $('tbody');
+    tbody.textContent = '';
+    state.filas.forEach((f) => {
+      const marcada = state.seleccion.has(f.workId);
+      const chk = h('input', { type: 'checkbox', class: 'chk-fila', 'data-id': f.workId, 'aria-label': 'Seleccionar el flujo ' + f.workId });
+      chk.checked = marcada;
+      chk.addEventListener('change', () => alternar(f, chk));
+      tbody.appendChild(h('tr', { class: marcada ? 'marcada' : '' },
+        h('td', { class: 'col-check' }, chk),
+        h('td', { class: 'num' }, f.workId),
+        h('td', { class: 'num' }, f.subs.join(', ')),
+        h('td', { class: 'largo' }, f.titulo),
+        h('td', null, f.fecha),
+        h('td', { class: 'num' }, f.idEmpleado),
+        h('td', { class: 'largo' }, f.nombre),
+        h('td', { class: 'num' }, f.cedula),
+        h('td', { class: 'largo' }, f.documento)));
+    });
+    $('tabla-caja').hidden = state.filas.length === 0;
+    $('vacio').hidden = state.filas.length !== 0;
+    $('total-resultados').textContent = state.filas.length ? '(' + state.filas.length + ')' : '';
+  }
+
+  function pintarSeleccion() {
+    const ul = $('seleccion');
+    ul.textContent = '';
+    state.seleccion.forEach((etq, id) => {
+      const quitar = h('button', { type: 'button', 'aria-label': 'Quitar el flujo ' + id }, '×');
+      quitar.addEventListener('click', () => { state.seleccion.delete(id); refrescar(); });
+      ul.appendChild(h('li', { class: 'chip con-quitar', title: etq || null }, id, quitar));
+    });
+    if (!state.seleccion.size) ul.appendChild(h('li', { class: 'nota' }, 'Ningún flujo seleccionado.'));
+    const n = state.seleccion.size;
+    const c = $('contador');
+    c.textContent = 'Seleccionados: ' + n + ' de ' + MAX_FLUJOS;
+    c.className = n >= MAX_FLUJOS ? 'contador lleno' : 'contador';
+    $('btn-revisar-sel').disabled = n === 0 || state.ocupado;
+    $('btn-revisar-sel').textContent = n > 0 ? 'Revisar ' + n + (n === 1 ? ' flujo' : ' flujos') : 'Revisar flujos';
+    $('btn-limpiar-seleccion').disabled = n === 0 || state.ocupado;
+  }
+
+  /* Casilla "seleccionar todos" de las filas visibles: marcada si todas lo estan, intermedia si algunas. */
+  function pintarTodos() {
+    const total = state.filas.length;
+    const marcadas = state.filas.filter((f) => state.seleccion.has(f.workId)).length;
+    [$('chk-todos'), $('chk-todos-2')].forEach((el) => {
+      el.checked = total > 0 && marcadas === total;
+      el.indeterminate = marcadas > 0 && marcadas < total;
+      el.disabled = total === 0;
+    });
+  }
+
+  function refrescar() {
+    guardarSeleccionLocal();
+    state.filas.forEach((f) => {
+      const chk = document.querySelector('.chk-fila[data-id="' + f.workId + '"]');
+      if (chk) {
+        chk.checked = state.seleccion.has(f.workId);
+        chk.closest('tr').className = chk.checked ? 'marcada' : '';
+      }
+    });
+    pintarSeleccion();
+    pintarTodos();
+  }
+
+  function alternar(f, chk) {
+    if (chk.checked) {
+      if (state.seleccion.size >= MAX_FLUJOS) {
+        chk.checked = false;
+        setEstadoSel('Solo se pueden seleccionar ' + MAX_FLUJOS + ' flujos por cancelación.', 'aviso');
+        return;
+      }
+      state.seleccion.set(f.workId, etiquetaDe(f));
+    } else {
+      state.seleccion.delete(f.workId);
+    }
+    setEstadoSel('', '');
+    refrescar();
+  }
+
+  function alternarTodos(marcar) {
+    let recortado = false;
+    state.filas.forEach((f) => {
+      if (marcar) {
+        if (state.seleccion.has(f.workId)) return;
+        if (state.seleccion.size >= MAX_FLUJOS) { recortado = true; return; }
+        state.seleccion.set(f.workId, etiquetaDe(f));
+      } else {
+        state.seleccion.delete(f.workId);
+      }
+    });
+    setEstadoSel(recortado ? 'Solo se pueden seleccionar ' + MAX_FLUJOS + ' flujos: se marcaron los primeros.' : '', recortado ? 'aviso' : '');
+    refrescar();
+  }
+
+  /* Vuelve a la etapa A con la seleccion igual a lo grabado (se puede agregar y quitar). */
+  function irASeleccion() {
+    if (state.ocupado) return;
+    const previa = new Map(state.seleccion);
+    state.seleccion = new Map();
+    state.destinoIds.slice(0, MAX_FLUJOS).forEach((id) => {
+      const fila = state.filas.find((f) => f.workId === id);
+      state.seleccion.set(id, fila ? etiquetaDe(fila) : (previa.get(id) || ''));
+    });
+    setEstadoSel('', '');
+    $('btn-volver-guardados').hidden = state.destinoIds.length === 0;
+    mostrarModo('seleccion');
+    refrescar();
+  }
+
+  /* Desde el plan C: vuelve a la seleccion tal como estaba (no la reemplaza por lo grabado). */
+  function volverASeleccionActual() {
+    setEstadoSel('', '');
+    $('btn-volver-guardados').hidden = state.destinoIds.length === 0;
+    mostrarModo('seleccion');
+    refrescar();
+  }
+
+  /* Vuelve a la vista de los flujos grabados (antes de revisar). */
+  function irARevision() {
+    reiniciarVista();
+    $('inicio-reabierto').hidden = false;
+    pintarDatos();
+    mostrarModo('revision');
+    $('bloque-destino').hidden = false;
+    $('vista-inicio').hidden = false;
+    const rev = $('btn-revisar');
+    rev.textContent = 'Revisar flujos';
+    rev.className = 'btn';
+    rev.hidden = false;
+    $('btn-cambiar').hidden = false;
+  }
+
+  /* ---------- Confirmacion antes de guardar y revisar ---------- */
+
+  let focoPrevio = null;
+
+  function abrirModal() {
+    const ids = Array.from(state.seleccion.keys());
+    if (!ids.length) return;
+    $('modal-texto').textContent = 'Se guardarán ' + ids.length + (ids.length === 1 ? ' flujo' : ' flujos') + ' en el atributo "' + ATRIBUTO + '" de esta tarea y se revisará su estado en Adobe Sign:';
+    const ul = $('modal-lista');
+    ul.textContent = '';
+    state.seleccion.forEach((etq, id) => ul.appendChild(h('li', null, h('span', { class: 'id' }, id), etq ? h('span', null, etq) : null)));
+    focoPrevio = document.activeElement;
+    $('modal').hidden = false;
+    $('modal-aceptar').focus();
+  }
+
+  function cerrarModal() {
+    $('modal').hidden = true;
+    if (focoPrevio && typeof focoPrevio.focus === 'function') focoPrevio.focus();
+  }
+
+  function aceptarModal() {
+    const ids = Array.from(state.seleccion.keys());
+    cerrarModal();
+    revisar(ids);
+  }
+
+  /* ---------- Acciones del servidor ---------- */
+
+  /* Etapas B y C. Con ids (viene de la seleccion): primero guarda y verifica en el Content; solo si el atributo coincide
+     consulta al servidor. Sin ids (los flujos ya estaban grabados, o "Revisar de nuevo"): va directo a la prevista.
+     Si los ids son los mismos que ya hay grabados, no vuelve a grabar. */
+  async function revisar(ids) {
     if (state.ocupado) return;
     state.ocupado = true;
     state.intentado = true;
+    state.ultima = 'revisar';
+    const guardarAntes = Array.isArray(ids) && !mismosIds(ids, state.destinoIds);
+    mostrarModo('revision');
     reiniciarVista();
-    document.getElementById('pasos').hidden = false;
+    $('bloque-destino').hidden = guardarAntes;
+    mostrarPasos('Consultando en Adobe Sign', guardarAntes);
     try {
-      pasoActivo('cancelar');
-      await cancelar();
-      mostrarExito();
+      if (guardarAntes) {
+        pasoActivo('guardar');
+        const res = await guardar(ids);
+        if (res.estado !== 'verificado') {
+          mostrarPlanC(res, ids);
+          return;
+        }
+        state.destinoIds = ids;
+        limpiarSeleccionLocal();
+        pintarDatos();
+        $('bloque-destino').hidden = false;
+      }
+      pasoActivo('trabajo');
+      const r = await conReasignacion('/cancel/preview', 'Consultando en Adobe Sign');
+      if (!r.ok) throw errorServidor(r, 'No se pudo revisar los flujos.');
+      renderPrevista(r.data);
+    } catch (err) {
+      $('bloque-destino').hidden = false;
+      mostrarError(err);
+    } finally {
+      state.ocupado = false;
+      actualizarConfirmar();
+      pintarSeleccion();
+    }
+  }
+
+  /* Etapa D: /auth + POST /cancel. Reintentar la repite desde /auth (idempotente en el servidor). */
+  async function cancelarLote() {
+    if (state.ocupado) return;
+    state.ocupado = true;
+    state.intentado = true;
+    state.ultima = 'cancelar';
+    $('vista-prevista').hidden = true;
+    ocultar(['btn-confirmar', 'btn-revisar', 'btn-cambiar']);
+    reiniciarSoloAcciones();
+    mostrarPasos('Cancelando en Adobe Sign', false);
+    try {
+      pasoActivo('trabajo');
+      const r = await conReasignacion('/cancel', 'Cancelando en Adobe Sign');
+      if (!r.ok) throw errorServidor(r, 'No se pudo cancelar los flujos.');
+      mostrarFinCancelacion(r.data);
     } catch (err) {
       mostrarError(err);
     } finally {
@@ -577,25 +1561,68 @@ REASIGNADO_OK
     }
   }
 
-  /* Al abrir: solo muestra el flujo a cancelar y pide confirmacion. No llama al servidor. */
-  function iniciarVista() {
-    try {
-      validarDestino();
-    } catch (err) {
-      pintarDatos();
-      mostrarError(err);
-      return;
-    }
-    pintarDatos();
-    document.getElementById('vista-confirmar').hidden = false;
-    document.getElementById('btn-cancelar').hidden = false;
+  function reintentar() {
+    return state.ultima === 'cancelar' ? cancelarLote() : revisar();
   }
 
-  document.getElementById('btn-cancelar').addEventListener('click', ejecutar);
-  document.getElementById('btn-reintentar').addEventListener('click', ejecutar);
-  window.addEventListener('load', iniciarVista);
+  /* ---------- Arranque ---------- */
+
+  function iniciar() {
+    $('max-flujos').textContent = String(MAX_FLUJOS);
+    $('f-objid').value = REPORT_ID;
+    $('f-workid').value = WORKFLOW_ID;
+    $('f-subworkid').value = SUBWORKFLOW_ID;
+    $('f-taskid').value = TASK_ID;
+    $('form-busqueda').setAttribute('action', OTCS_URL);
+    ['idempleado', 'nombre', 'cedula', 'documento', 'desde', 'hasta'].forEach((n) => { $('q-' + n).value = parametro('p-' + n); });
+
+    state.filas = leerFilas();
+    pintarTabla();
+
+    /* Lo que ya hay en el atributo (reapertura: pendientes de un lote anterior, o IDs pegados a mano). */
+    const guardados = extraerIds(DESTINO_FLUJO_RAW);
+    state.destinoIds = guardados;
+    state.destinoSubflujo = esDigitos(DESTINO_SUBFLUJO_RAW) ? DESTINO_SUBFLUJO_RAW : '';
+
+    $('chk-todos').addEventListener('change', (e) => alternarTodos(e.target.checked));
+    $('chk-todos-2').addEventListener('change', (e) => alternarTodos(e.target.checked));
+    $('btn-revisar-sel').addEventListener('click', abrirModal);
+    $('btn-limpiar-seleccion').addEventListener('click', () => { state.seleccion.clear(); setEstadoSel('', ''); refrescar(); });
+    $('btn-limpiar-filtros').addEventListener('click', () => {
+      ['idempleado', 'nombre', 'cedula', 'documento', 'desde', 'hasta'].forEach((n) => { $('q-' + n).value = ''; });
+    });
+    $('btn-volver-guardados').addEventListener('click', irARevision);
+    $('modal-volver').addEventListener('click', cerrarModal);
+    $('modal-aceptar').addEventListener('click', aceptarModal);
+    $('modal').addEventListener('click', (e) => { if (e.target === $('modal')) cerrarModal(); });
+    document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !$('modal').hidden) cerrarModal(); });
+    $('btn-copiar').addEventListener('click', copiar);
+    $('btn-pc-volver').addEventListener('click', volverASeleccionActual);
+    $('btn-revisar').addEventListener('click', () => revisar());
+    $('btn-confirmar').addEventListener('click', cancelarLote);
+    $('btn-reintentar').addEventListener('click', reintentar);
+    $('btn-cambiar').addEventListener('click', irASeleccion);
+    $('chk-parcial').addEventListener('change', actualizarConfirmar);
+
+    if (guardados.length) {
+      /* Reapertura con IDs: se muestran y se ofrece ir directo a la revision. */
+      $('inicio-reabierto').hidden = false;
+      irARevision();
+    } else {
+      cargarSeleccionLocal();
+      $('inicio-reabierto').hidden = true;
+      const crudo = DESTINO_FLUJO_RAW;
+      mostrarModo('seleccion');
+      if (crudo && crudo !== '?') setEstadoSel('El atributo "' + ATRIBUTO + '" tiene un valor que no se reconoce: ' + crudo.slice(0, 120), 'aviso');
+      refrescar();
+    }
+  }
+
+  window.addEventListener('load', iniciar);
 })();
 </script>
 </body>
 </html>
+[LL_WEBREPORT_ENDIF /]
+[LL_WEBREPORT_ENDIF /]
 [LL_WEBREPORT_ENDIF /]

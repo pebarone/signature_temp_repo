@@ -10,7 +10,9 @@ const { createAgreementRepository } = require('../server/infra/agreementReposito
 const { createAdobeClient } = require('../server/infra/adobeClient');
 const { createOtcsClient } = require('../server/infra/otcsClient');
 const { parseWebhookPayload } = require('../server/domain/eventPolicy');
-const { CANCEL_STATES, TARGET, classifyCancelState, selectCancelTarget } = require('../server/domain/cancellation');
+const {
+  CANCEL_STATES, TARGET, classifyCancelState, selectCancelTarget, parseTargets, classifyCancelOutcome, countSignatures, isProcessFinishedStatus
+} = require('../server/domain/cancellation');
 const { cancelRequestedPatch } = require('../server/domain/agreementState');
 const { ServiceError } = require('../server/services/signatureService');
 const {
@@ -48,12 +50,12 @@ const recalled = (world, id = 'AG-1', opts = {}) =>
 
 const cancelWorld = (env = {}, opts = {}) => buildWorld({ listen: true, env: { CANCEL_ENABLED: 'true', ...env }, ...opts });
 
-// Protocolo do WebReport: POST /auth (Basic) e POST /cancel com o que voltou. `extra` entra no corpo sem passar pelo /auth.
-async function authThenCancel(world, fields = { workflowId: '9001', subworkflowId: '9001' }, { tamper = {}, extra = {} } = {}) {
+// Protocolo do WebReport: POST /auth (Basic) e POST /cancel (ou /cancel/preview, via `path`) com o que voltou. `extra` entra no corpo sem passar pelo /auth.
+async function authThenCancel(world, fields = { workflowId: '9001', subworkflowId: '9001' }, { tamper = {}, extra = {}, path = '/cancel' } = {}) {
   const auth = await post(world, '/auth', fields, ADMIN);
   assert.equal(auth.status, 200);
   const creds = await auth.json();
-  return post(world, '/cancel', { ...fields, ...tamper, ...extra, ...creds });
+  return post(world, path, { ...fields, ...tamper, ...extra, ...creds });
 }
 
 /* ---------- domínio ---------- */
@@ -121,19 +123,99 @@ test('config: cancelamento desligado por padrão, nomes provisórios e variávei
   assert.deepEqual(computeConfig({}).cancel, {
     enabled: false,
     taskNames: ['Cancelar Flujo de Firma'],
-    fields: { targetWorkflow: 'ID Flujo a Cancelar', targetSubworkflow: 'ID Subflujo a Cancelar' },
+    fields: { targetWorkflow: 'ID Flujo a Cancelar', targetSubworkflow: 'ID Subflujo a Cancelar', result: 'IDs Cancelados' },
     notifySigners: false,
-    settleTimeoutMs: 20000
+    stopOriginal: false,
+    settleTimeoutMs: 20000,
+    maxTargets: 20,
+    batchBudgetMs: 15000
   });
   const c = computeConfig({
     CANCEL_ENABLED: 'true', CANCEL_TASK_NAMES: 'Cancelar A, Cancelar B', CANCEL_FIELD_TARGET_WORKFLOW: 'Fluxo',
-    CANCEL_FIELD_TARGET_SUBWORKFLOW: 'Subfluxo', CANCEL_NOTIFY_SIGNERS: '1', CANCEL_SETTLE_TIMEOUT_MS: '45000'
+    CANCEL_FIELD_TARGET_SUBWORKFLOW: 'Subfluxo', CANCEL_NOTIFY_SIGNERS: '1', CANCEL_SETTLE_TIMEOUT_MS: '45000',
+    CANCEL_FIELD_RESULT: 'Cancelados', CANCEL_STOP_ORIGINAL: 'true', CANCEL_MAX_TARGETS: '50', CANCEL_BATCH_BUDGET_MS: '25000'
   }).cancel;
   assert.deepEqual(c, {
     enabled: true, taskNames: ['Cancelar A', 'Cancelar B'],
-    fields: { targetWorkflow: 'Fluxo', targetSubworkflow: 'Subfluxo' }, notifySigners: true, settleTimeoutMs: 45000
+    fields: { targetWorkflow: 'Fluxo', targetSubworkflow: 'Subfluxo', result: 'Cancelados' }, notifySigners: true, stopOriginal: true,
+    settleTimeoutMs: 45000, maxTargets: 50, batchBudgetMs: 25000
   });
   assert.equal(computeConfig({ CANCEL_SETTLE_TIMEOUT_MS: '10' }).cancel.settleTimeoutMs, 1000, 'mínimo de 1 s');
+  // lote: limite de alvos 1..100 (padrão 20), orçamento mínimo de 1 s e gravação do resultado desligável (vazio)
+  const max = (v) => computeConfig({ CANCEL_MAX_TARGETS: v }).cancel.maxTargets;
+  assert.deepEqual([max('0'), max('1'), max('100'), max('500'), max('x'), max('')], [1, 1, 100, 100, 20, 20]);
+  assert.equal(computeConfig({ CANCEL_BATCH_BUDGET_MS: '10' }).cancel.batchBudgetMs, 1000, 'mínimo de 1 s');
+  assert.equal(computeConfig({ CANCEL_BATCH_BUDGET_MS: 'x' }).cancel.batchBudgetMs, 15000);
+  assert.equal(computeConfig({ CANCEL_FIELD_RESULT: '' }).cancel.fields.result, '', 'vazio desliga a gravação');
+});
+
+test('parseTargets: lista, escalar, texto separado, duplicados, inválidos e limite', () => {
+  assert.deepEqual(parseTargets(['3101', '3102']), { ids: ['3101', '3102'], invalid: [], overLimit: false });
+  assert.deepEqual(parseTargets(3101), { ids: ['3101'], invalid: [], overLimit: false });
+  assert.deepEqual(parseTargets('3101, 3102;3103\n3104\t3105'), { ids: ['3101', '3102', '3103', '3104', '3105'], invalid: [], overLimit: false });
+  // texto separado também dentro de cada item da lista; duplicados saem e a ordem é a da primeira aparição
+  assert.deepEqual(parseTargets(['3102, 3101', '3101', ' 3103 ']).ids, ['3102', '3101', '3103']);
+  // inválidos: não numéricos (sem repetir); nunca viram id
+  assert.deepEqual(parseTargets(['3101', 'abc', '12x', 'abc', '-5', '1.5']), {
+    ids: ['3101'], invalid: ['abc', '12x', '-5', '1.5'], overLimit: false
+  });
+  // vazios
+  for (const empty of [undefined, null, '', '  ', [], [null, '', ' '], ' ,; ']) {
+    assert.deepEqual(parseTargets(empty), { ids: [], invalid: [], overLimit: false }, JSON.stringify(empty));
+  }
+  // limite: conta ids distintos (duplicados não contam); com ou sem inválidos
+  assert.equal(parseTargets('1 2 3', { max: 3 }).overLimit, false);
+  assert.equal(parseTargets('1 2 3 4', { max: 3 }).overLimit, true);
+  assert.equal(parseTargets('1 2 2 1 2', { max: 2 }).overLimit, false);
+  assert.deepEqual(parseTargets('1 2 3 x', { max: 2 }), { ids: ['1', '2', '3'], invalid: ['x'], overLimit: true });
+});
+
+test('classifyCancelOutcome: recusa definitiva (refused) x transitório/desconhecido (pending)', () => {
+  for (const code of [
+    'ALREADY_SIGNED', 'ALREADY_REJECTED', 'AGREEMENT_CLOSED', 'NOT_CANCELABLE', 'AMBIGUOUS',
+    'AGREEMENT_NOT_FOUND', 'AGREEMENT_NOT_FOUND_IN_ADOBE'
+  ]) assert.equal(classifyCancelOutcome(code), 'refused', code);
+  for (const code of [
+    'ADOBE_UNAVAILABLE', 'RECONCILE_IN_PROGRESS', 'IN_PROGRESS', 'BUDGET_EXCEEDED', 'UNEXPECTED_ERROR', 'OTCS_UNAVAILABLE',
+    'ALGO_NOVO', '', undefined, null
+  ]) assert.equal(classifyCancelOutcome(code), 'pending', String(code));
+});
+
+test('countSignatures: só participantes que concluíram assinatura; o remetente e o acordo inteiro (SIGNED) não contam', () => {
+  assert.deepEqual(countSignatures(undefined), { signedCount: 0, lastSignedAt: null });
+  assert.deepEqual(countSignatures([]), { signedCount: 0, lastSignedAt: null });
+  // criação, envio, visualização, lembrete, conclusão do acordo inteiro e eventos do remetente: nada conta
+  assert.equal(countSignatures([
+    { type: 'CREATED', participantRole: 'SENDER' },
+    { type: 'UPLOADED_BY_SENDER', participantRole: 'SENDER' },
+    { type: 'EMAIL_VIEWED', participantEmail: 'a@example.com' },
+    { type: 'REMINDER_SENT' },
+    { type: 'ESIGNED', participantRole: 'SENDER', participantEmail: 'rh@example.com' },
+    { type: 'WORKFLOW_COMPLETED' },
+    { type: 'SIGNED' },
+    { type: 'RECALLED' }
+  ]).signedCount, 0);
+
+  // ESIGNED + ACTION_COMPLETED da mesma pessoa = 1; pessoa diferente = +1; DIGSIGNED conta; data mais recente
+  const signed = countSignatures([
+    { type: 'ESIGNED', participantEmail: 'A@example.com', date: '2026-06-21T10:00:00Z' },
+    { type: 'ACTION_COMPLETED', participantEmail: 'a@example.com', date: '2026-06-21T10:00:01Z' },
+    { type: 'DIGSIGNED', participantEmail: 'b@example.com', date: '2026-06-22T08:30:00Z' },
+    { type: 'EMAIL_VIEWED', participantEmail: 'c@example.com', date: '2026-06-23T08:30:00Z' }
+  ]);
+  assert.deepEqual(signed, { signedCount: 2, lastSignedAt: '2026-06-22T08:30:00Z' });
+
+  // variantes de nome tratadas como conclusão de participante pelo eventPolicy (prefixo AGREEMENT_, PARTICIPANT_*, DOCUMENT_SIGNED)
+  assert.equal(countSignatures([
+    { type: 'AGREEMENT_ACTION_COMPLETED', participantEmail: 'a@example.com' },
+    { type: 'PARTICIPANT_COMPLETED', participantEmail: 'b@example.com' },
+    { type: 'DOCUMENT_SIGNED', participantEmail: 'c@example.com' },
+    { eventType: 'ESIGNED', actingUserEmail: 'd@example.com' }
+  ]).signedCount, 4);
+
+  // sem identificação do participante: o maior número de eventos de um mesmo tipo (não soma ESIGNED com ACTION_COMPLETED)
+  assert.equal(countSignatures([{ type: 'ESIGNED' }, { type: 'ACTION_COMPLETED' }]).signedCount, 1);
+  assert.equal(countSignatures([{ type: 'ESIGNED' }, { type: 'ESIGNED' }, { type: 'ACTION_COMPLETED' }]).signedCount, 2);
 });
 
 /* ---------- clientes ---------- */
@@ -173,6 +255,27 @@ test('otcs: stopProcess faz PUT /v2/processes/{id}/status com status=stop (dispo
   assert.equal(seen.body, 'status=stop');
   assert.equal(seen.opts.headers.OTCSTicket, 't1');
   assert.equal(seen.opts.headers['Content-Type'], 'application/x-www-form-urlencoded');
+});
+
+test('otcs: getTaskForm entrega o valor multivalor (array) do atributo intacto, junto com escalares', async () => {
+  const http = {
+    post: async () => ({ data: { ticket: 't1', validFor: 1800 } }),
+    get: async () => ({
+      data: {
+        forms: [{
+          data: { WorkflowForm_1: ['3101', '3102'], WorkflowForm_2: '3103', WorkflowForm_3: [] },
+          schema: { properties: {
+            WorkflowForm_1: { title: 'ID Flujo a Cancelar' }, WorkflowForm_2: { title: 'Outro' }, WorkflowForm_3: { title: 'IDs Cancelados' }
+          } }
+        }]
+      }
+    })
+  };
+  const client = createOtcsClient({ base: 'https://otcs.invalid/api', user: 'u', pass: 'p', http, now: () => 1000 });
+  const form = await client.getTaskForm(9001, 9001, 2);
+  assert.deepEqual(form.fields['ID Flujo a Cancelar'], { key: 'WorkflowForm_1', value: ['3101', '3102'] });
+  assert.deepEqual(form.fields.Outro, { key: 'WorkflowForm_2', value: '3103' });
+  assert.deepEqual(form.fields['IDs Cancelados'], { key: 'WorkflowForm_3', value: [] });
 });
 
 /* ---------- banco e repositório ---------- */
@@ -805,6 +908,36 @@ test('reconciliação presa além de CANCEL_SETTLE_TIMEOUT_MS: 503 RECONCILE_IN_
   await world.close();
 });
 
+test('lote: a espera pela reconciliação é limitada ao tempo restante do prazo (RECONCILE_IN_PROGRESS pending, antes do settleTimeoutMs); admin usa o settleTimeoutMs inteiro', async () => {
+  const world = await buildWorld();
+  open(world, 'AG-1', { startSendonDone: true });
+  seedCancelFlow(world); // alvo 3003 = AG-1
+  world.config.cancel.settleTimeoutMs = 5000;
+  world.config.cancel.batchBudgetMs = 60; // restante do prazo << settleTimeoutMs
+  const gate = gateFirstRead(world);
+  const running = world.reconciliation.reconcile('AG-1', { refresh: true, force: true, manual: true });
+  await waitFor(() => reads(world) === 1);
+
+  const t0 = Date.now();
+  const out = await world.cancellation.cancelFromTask({ workflowId: '9001', subworkflowId: '9001' });
+  assert.ok(Date.now() - t0 < 2000, 'não esperou o settleTimeoutMs (5 s) inteiro');
+  assert.deepEqual([out.complete, out.sentOn], [false, false]);
+  assert.deepEqual([out.items[0].outcome, out.items[0].code], ['pending', 'RECONCILE_IN_PROGRESS']);
+  assert.equal(reads(world), 1, 'nada foi consultado no Adobe pelo cancelamento');
+  assert.ok(!world.calls.some((c) => c[0] === 'adobe.cancelAgreement'));
+  assert.equal(world.otcs.sendons.length, 0);
+  assert.equal(world.otcs.updateFormCalls.length, 0);
+  assertUntouched(world);
+
+  // rota admin (sem a opção interna): espera o settleTimeoutMs inteiro, então uma reconciliação que termina depois do
+  // prazo do lote (60 ms) ainda é aguardada e o cancelamento acontece
+  setTimeout(() => gate.open(), 200);
+  const admin = await world.cancellation.cancelWorkflow('3003');
+  assert.deepEqual([admin.cancelled, admin.marked], [true, true]);
+  await running;
+  await world.close();
+});
+
 /* ---------- AGREEMENT_RECALLED depois do cancelamento: sem disposição ---------- */
 
 test('RECALLED por webhook depois do cancelamento: vai ao histórico, sem SendOn, PDF nem reconciliação', async () => {
@@ -895,48 +1028,77 @@ test('RECALLED que chega ANTES de o acordo ser marcado (durante o PUT): a reconc
   await world.close();
 });
 
-/* ---------- POST /cancel (WebReport) ---------- */
+/* ---------- POST /cancel (WebReport, lote) e POST /cancel/preview ---------- */
 
-test('POST /cancel desligado (padrão): 404 mesmo com assinatura válida, sem CORS e sem tocar Adobe/OTCS', async () => {
+// Mundo com o workflow de cancelamento apontando para `target` (lista, escalar ou texto) e um acordo aberto por fluxo de `wfIds`
+async function batchWorld(wfIds, { target = wfIds, env = {}, fields = {} } = {}) {
+  const world = await cancelWorld(env);
+  seedCancelFlow(world, { fields: { 'ID Flujo a Cancelar': target, ...fields } });
+  for (const id of wfIds) open(world, `AG-${id}`, { workflowId: String(id), subworkflowId: String(id) });
+  return world;
+}
+
+const preflight = (world, p) => fetch(`${world.baseUrl}${p}`, {
+  method: 'OPTIONS', headers: { origin: OTCS_ORIGIN, 'access-control-request-method': 'POST' }
+});
+
+test('POST /cancel e /cancel/preview desligados (padrão): 404 mesmo com assinatura válida, sem CORS e sem tocar Adobe/OTCS', async () => {
   const world = await buildWorld({ listen: true, env: { OTCS_BASE: `${OTCS_ORIGIN}/cs/cs/api` } });
   assert.equal(world.config.cancel.enabled, false);
   seedCancelFlow(world);
   open(world, 'AG-1');
 
-  const r = await authThenCancel(world);
-  assert.equal(r.status, 404);
-  assert.deepEqual(await r.json(), { error: 'Endpoint not found' });
-  const pre = await fetch(`${world.baseUrl}/cancel`, {
-    method: 'OPTIONS', headers: { origin: OTCS_ORIGIN, 'access-control-request-method': 'POST' }
-  });
-  assert.equal(pre.status, 404);
-  assert.equal(pre.headers.get('access-control-allow-origin'), null);
+  for (const p of ['/cancel', '/cancel/preview']) {
+    const r = await authThenCancel(world, undefined, { path: p });
+    assert.equal(r.status, 404, p);
+    assert.deepEqual(await r.json(), { error: 'Endpoint not found' });
+    const pre = await preflight(world, p);
+    assert.equal(pre.status, 404, `preflight ${p}`);
+    assert.equal(pre.headers.get('access-control-allow-origin'), null);
+  }
 
   assert.equal(world.adobe.cancelled.length, 0);
   assert.equal(world.otcs.sendons.length, 0);
+  assert.equal(world.otcs.updateFormCalls.length, 0);
   assert.equal(world.repo.get('AG-1').state, 'pending');
+  assert.equal(world.otcs.modelCalls.length, 0, 'nem o OTCS foi consultado');
   await world.close();
 });
 
-test('POST /cancel ligado: cancela o fluxo do atributo e depois faz o SendOn da tarefa do workflow de cancelamento', async () => {
+test('POST /cancel ligado: cancela o fluxo do atributo, grava os cancelados no formulário e faz o SendOn', async () => {
   const world = await cancelWorld({ OTCS_BASE: `${OTCS_ORIGIN}/cs/cs/api` });
   seedCancelFlow(world); // atributo "ID Flujo a Cancelar" = 3003
   open(world, 'AG-1');
 
   const r = await authThenCancel(world);
   assert.equal(r.status, 200, await r.clone().text());
-  assert.deepEqual(await r.json(), { message: 'Agreement cancelled. ID: AG-1', id: 'AG-1', alreadyCancelled: false });
+  assert.deepEqual(await r.json(), {
+    complete: true,
+    sentOn: true,
+    items: [{
+      workflowId: '3003', outcome: 'cancelled', agreementId: 'AG-1', alreadyCancelled: false, adobeStatus: 'CANCELLED',
+      contentStop: 'disabled', message: 'Acuerdo cancelado.'
+    }],
+    summary: { total: 1, cancelled: 1, refused: 0, pending: 0 },
+    resultField: 'IDs Cancelados',
+    stopOriginal: false,
+    subworkflowIgnored: false
+  });
 
   assert.equal(world.adobe.cancelled.length, 1);
   assert.match(world.adobe.cancelled[0].comment, /workflow de cancelación 9001/);
   const rec = world.repo.get('AG-1');
   assert.deepEqual([rec.state, rec.sendonDone, rec.cancelSource], ['cancelled', true, 'workflow:9001/9001']);
 
-  // SendOn (sem disposição) da tarefa do workflow de cancelamento, DEPOIS do cancelamento confirmado
+  // Resultado no formulário da tarefa de cancelamento (lista de WorkIDs, chave do campo lida do formulário)
+  assert.deepEqual(world.otcs.updateFormCalls, [{ processId: 9001, subprocessId: 9001, taskId: 2, values: { k_IDsCancelados: ['3003'] } }]);
+
+  // SendOn (sem disposição) da tarefa do workflow de cancelamento, DEPOIS do cancelamento e da gravação
   assert.equal(world.otcs.sendons.length, 1);
   const sendon = world.otcs.sendons[0];
   assert.deepEqual([sendon.workflowId, sendon.subworkflowId, sendon.taskId, sendon.disposition], [9001, 9001, 2, undefined]);
-  assert.equal(sendon.comment, 'Cancelación confirmada en Adobe Sign (acuerdo AG-1)');
+  assert.match(sendon.comment, /Cancelados \(1\): 3003/);
+  assert.doesNotMatch(sendon.comment, /No cancelados/);
   const names = world.calls.map((c) => c[0]);
   assert.ok(names.indexOf('adobe.cancelAgreement') < names.indexOf('otcs.sendon'));
   assert.equal(world.otcs.task('9001', 2).status, 'completed');
@@ -945,19 +1107,33 @@ test('POST /cancel ligado: cancela o fluxo do atributo e depois faz o SendOn da 
   assert.equal(world.otcs.task('3003', 3).status, 'current');
   assert.ok(world.otcs.sendons.every((s) => s.workflowId === 9001));
 
-  // CORS como no /start: origem do OTCS
-  const pre = await fetch(`${world.baseUrl}/cancel`, {
-    method: 'OPTIONS', headers: { origin: OTCS_ORIGIN, 'access-control-request-method': 'POST' }
-  });
-  assert.equal(pre.headers.get('access-control-allow-origin'), OTCS_ORIGIN);
+  // CORS como no /start: origem do OTCS (as duas rotas)
+  for (const p of ['/cancel', '/cancel/preview']) {
+    const pre = await preflight(world, p);
+    assert.equal(pre.headers.get('access-control-allow-origin'), OTCS_ORIGIN, p);
+  }
   await world.close();
 });
 
-test('POST /cancel: HMAC v2 e nonce — sem assinatura, adulterado, repetido, expirado e v1 são recusados sem cancelar', async () => {
+test('POST /cancel e /cancel/preview: HMAC v2 e nonce — sem assinatura, adulterado, repetido, expirado e v1 são recusados sem cancelar', async () => {
   const world = await cancelWorld({ START_LEGACY_SIGNATURE: 'true' });
   seedCancelFlow(world);
   open(world, 'AG-1');
   const fields = { workflowId: '9001', subworkflowId: '9001' };
+
+  // a prévia exige a mesma assinatura (nenhuma consulta ao Adobe/OTCS sem ela)
+  assert.equal((await post(world, '/cancel/preview', fields)).status, 401, 'prévia sem assinatura');
+  assert.equal((await post(world, '/cancel/preview', { ...fields, timestamp: '1', signature: 'zz' })).status, 400);
+  assert.equal((await authThenCancel(world, fields, { path: '/cancel/preview', tamper: { workflowId: '8888' } })).status, 403);
+  const v1p = await post(world, '/cancel/preview', startBodyV1(world, fields));
+  assert.equal(v1p.status, 403);
+  assert.deepEqual(await v1p.json(), { error: 'Unsupported signature version.' });
+  const credsP = await (await post(world, '/auth', fields, ADMIN)).json();
+  assert.equal((await post(world, '/cancel/preview', { ...fields, ...credsP })).status, 200);
+  const replayP = await post(world, '/cancel/preview', { ...fields, ...credsP });
+  assert.equal(replayP.status, 403);
+  assert.deepEqual(await replayP.json(), { error: 'Solicitud ya utilizada.' });
+  assert.equal(world.adobe.cancelled.length, 0);
 
   assert.equal((await post(world, '/cancel', fields)).status, 401, 'sem assinatura');
   assert.equal((await post(world, '/cancel', { ...fields, timestamp: '1', signature: 'zz' })).status, 400, 'malformada');
@@ -994,18 +1170,20 @@ test('POST /cancel: HMAC v2 e nonce — sem assinatura, adulterado, repetido, ex
   await world.close();
 });
 
-test('POST /cancel: tarefa não atribuída ao usuário de integração => 409 REASSIGN_REQUIRED com handoff; nada é cancelado', async () => {
+test('POST /cancel e /cancel/preview: tarefa não atribuída ao usuário de integração => 409 REASSIGN_REQUIRED com handoff; nada é cancelado', async () => {
   const world = await cancelWorld();
   seedCancelFlow(world, { assignee: HUMAN_USER_ID });
   open(world, 'AG-1');
 
-  const r = await authThenCancel(world);
-  assert.equal(r.status, 409);
-  const body = await r.json();
-  assert.equal(body.code, 'REASSIGN_REQUIRED');
-  assert.deepEqual(body.handoff, {
-    workflowId: 9001, subworkflowId: 9001, taskId: 2, integrationUserId: INTEGRATION_USER_ID, assigned: false
-  });
+  for (const path of ['/cancel/preview', '/cancel']) {
+    const r = await authThenCancel(world, undefined, { path });
+    assert.equal(r.status, 409, path);
+    const body = await r.json();
+    assert.equal(body.code, 'REASSIGN_REQUIRED');
+    assert.deepEqual(body.handoff, {
+      workflowId: 9001, subworkflowId: 9001, taskId: 2, integrationUserId: INTEGRATION_USER_ID, assigned: false
+    });
+  }
   assert.equal(world.adobe.cancelled.length, 0);
   assert.equal(world.otcs.sendons.length, 0);
   assert.equal(world.repo.get('AG-1').state, 'pending');
@@ -1021,44 +1199,49 @@ test('POST /cancel: tarefa não atribuída ao usuário de integração => 409 RE
   w2.otcs.unknownAssignees('9001');
   w2.otcs.formFailure = httpError(403, 'forbidden');
   open(w2, 'AG-1');
-  const forbidden = await authThenCancel(w2);
-  assert.equal(forbidden.status, 409);
-  assert.equal((await forbidden.json()).code, 'REASSIGN_REQUIRED');
+  for (const path of ['/cancel/preview', '/cancel']) {
+    const forbidden = await authThenCancel(w2, undefined, { path });
+    assert.equal(forbidden.status, 409);
+    assert.equal((await forbidden.json()).code, 'REASSIGN_REQUIRED');
+  }
   assert.equal(w2.adobe.cancelled.length, 0);
   await world.close();
   await w2.close();
 });
 
-test('POST /cancel: tarefa fora do passo de cancelamento, workflow inexistente e OTCS fora do ar', async () => {
+test('POST /cancel e /cancel/preview: tarefa fora do passo de cancelamento, workflow inexistente e OTCS fora do ar', async () => {
   const world = await cancelWorld();
   open(world, 'AG-1');
 
-  seedCancelFlow(world, { stage: 'done' }); // a tarefa de cancelamento já foi concluída
-  let r = await authThenCancel(world);
-  assert.equal(r.status, 409);
-  assert.equal((await r.json()).code, 'NOT_AT_CANCEL_STEP');
+  for (const path of ['/cancel/preview', '/cancel']) {
+    seedCancelFlow(world, { stage: 'done' }); // a tarefa de cancelamento já foi concluída
+    let r = await authThenCancel(world, undefined, { path });
+    assert.equal(r.status, 409);
+    assert.equal((await r.json()).code, 'NOT_AT_CANCEL_STEP');
 
-  seedCancelFlow(world);
-  world.otcs.workflows['9001'].tasks[1].name = 'Outra tarefa'; // sem tarefa de cancelamento no processo
-  r = await authThenCancel(world);
-  assert.equal(r.status, 409);
+    seedCancelFlow(world);
+    world.otcs.workflows['9001'].tasks[1].name = 'Outra tarefa'; // sem tarefa de cancelamento no processo
+    r = await authThenCancel(world, undefined, { path });
+    assert.equal(r.status, 409);
 
-  r = await authThenCancel(world, { workflowId: '7777', subworkflowId: '7777' }); // processo desconhecido (404 do OTCS)
-  assert.equal(r.status, 409);
-  assert.deepEqual(await r.json(), { error: 'Flujo no encontrado.', code: 'FLOW_NOT_FOUND' });
+    r = await authThenCancel(world, { workflowId: '7777', subworkflowId: '7777' }, { path }); // processo desconhecido (404 do OTCS)
+    assert.equal(r.status, 409);
+    assert.deepEqual(await r.json(), { error: 'Flujo no encontrado.', code: 'FLOW_NOT_FOUND' });
 
-  seedCancelFlow(world);
-  world.otcs.stepsFailures = 1;
-  r = await authThenCancel(world);
-  assert.equal(r.status, 503);
-  assert.equal((await authThenCancel(world, { workflowId: 'abc' })).status, 400);
+    seedCancelFlow(world);
+    world.otcs.stepsFailures = 1;
+    r = await authThenCancel(world, undefined, { path });
+    assert.equal(r.status, 503);
+    assert.equal((await r.json()).code, 'OTCS_UNAVAILABLE');
+    assert.equal((await authThenCancel(world, { workflowId: 'abc' }, { path })).status, 400);
+  }
 
   assert.equal(world.adobe.cancelled.length, 0);
   assert.equal(world.otcs.sendons.length, 0);
   await world.close();
 });
 
-test('POST /cancel: o fluxo alvo vem do atributo do formulário, nunca do corpo', async () => {
+test('POST /cancel: os fluxos alvo vêm do atributo do formulário, nunca do corpo', async () => {
   const world = await cancelWorld();
   seedCancelFlow(world, { fields: { 'ID Flujo a Cancelar': '3003' } });
   open(world, 'AG-1');                                                     // alvo real (atributo)
@@ -1066,25 +1249,75 @@ test('POST /cancel: o fluxo alvo vem do atributo do formulário, nunca do corpo'
 
   const r = await authThenCancel(world, undefined, { extra: { targetWorkflowId: '4444', targetSubworkflowId: '4444' } });
   assert.equal(r.status, 200, await r.clone().text());
-  assert.equal((await r.json()).id, 'AG-1');
+  assert.equal((await r.json()).items[0].agreementId, 'AG-1');
   assert.deepEqual(world.adobe.cancelled.map((c) => c.id), ['AG-1']);
   assert.equal(world.repo.get('AG-D').state, 'pending');
   assert.ok(world.logger.has('warn', /targetWorkflowId=4444; se ignora/));
 
-  // sem o atributo preenchido, o valor do corpo não substitui nada
+  // sem o atributo preenchido, o valor do corpo não substitui nada (nas duas rotas)
   const w2 = await cancelWorld();
   seedCancelFlow(w2, { fields: { 'ID Flujo a Cancelar': '' } });
   open(w2, 'AG-D', { workflowId: '4444', subworkflowId: '4444' });
-  const missing = await authThenCancel(w2, undefined, { extra: { targetWorkflowId: '4444' } });
-  assert.equal(missing.status, 422);
-  assert.equal((await missing.json()).code, 'MISSING_TARGET');
+  for (const path of ['/cancel', '/cancel/preview']) {
+    const missing = await authThenCancel(w2, undefined, { path, extra: { targetWorkflowId: '4444' } });
+    assert.equal(missing.status, 422);
+    assert.equal((await missing.json()).code, 'MISSING_TARGET');
+  }
   assert.equal(w2.adobe.cancelled.length, 0);
   assert.equal(w2.otcs.sendons.length, 0);
   await world.close();
   await w2.close();
 });
 
-test('POST /cancel: atributo ausente ou inválido => 422; o subprocesso do atributo desempata acordos abertos', async () => {
+test('lote: atributo multivalor (lista), escalar e texto separado; duplicados saem e a ordem é preservada', async () => {
+  const ids = ['3101', '3102', '3103'];
+  for (const target of [['3101', '3102', '3103'], '3101, 3102;3103', '3101\n3102 3103 3101', ['3101, 3102', '3103', '3102']]) {
+    const world = await batchWorld(ids, { target });
+    const r = await authThenCancel(world);
+    assert.equal(r.status, 200, await r.clone().text());
+    const body = await r.json();
+    assert.deepEqual(body.items.map((i) => i.workflowId), ids, JSON.stringify(target));
+    assert.deepEqual(body.summary, { total: 3, cancelled: 3, refused: 0, pending: 0 });
+    assert.deepEqual(world.otcs.updateFormCalls[0].values, { k_IDsCancelados: ids });
+    assert.deepEqual(world.adobe.cancelled.map((c) => c.id), ['AG-3101', 'AG-3102', 'AG-3103'], 'em sequência, na ordem');
+    await world.close();
+  }
+
+  // número no escalar (o forms API pode devolver number)
+  const w = await batchWorld(['3101'], { target: 3101 });
+  assert.equal((await authThenCancel(w)).status, 200);
+  assert.deepEqual(w.adobe.cancelled.map((c) => c.id), ['AG-3101']);
+  await w.close();
+});
+
+test('lote: valor inválido => 422 INVALID_TARGET com a lista; acima do limite => 422 TOO_MANY_TARGETS; nada é tocado', async () => {
+  const world = await batchWorld(['3101', '3102', '3103'], { env: { CANCEL_MAX_TARGETS: '2' } });
+  const check = async (target, status, code, extra = {}) => {
+    seedCancelFlow(world, { fields: { 'ID Flujo a Cancelar': target } });
+    for (const path of ['/cancel/preview', '/cancel']) {
+      const r = await authThenCancel(world, undefined, { path });
+      assert.equal(r.status, status, `${path} ${JSON.stringify(target)}`);
+      const body = await r.json();
+      assert.equal(body.code, code);
+      for (const [k, v] of Object.entries(extra)) assert.deepEqual(body[k], v);
+    }
+  };
+  await check(['3101', 'abc', '3102', '12x', 'abc'], 422, 'INVALID_TARGET', { invalid: ['abc', '12x'] });
+  await check('3101, 3102, 3103', 422, 'TOO_MANY_TARGETS', { max: 2 });
+  await check('3101 3102 3101', 200, undefined); // duplicados não contam para o limite
+  assert.equal(world.config.cancel.maxTargets, 2);
+
+  // um alvo inválido não deixa cancelar os válidos
+  const w2 = await batchWorld(['3101']);
+  seedCancelFlow(w2, { fields: { 'ID Flujo a Cancelar': '3101 abc' } });
+  assert.equal((await authThenCancel(w2)).status, 422);
+  assert.equal(w2.adobe.cancelled.length, 0);
+  assert.equal(w2.otcs.sendons.length, 0);
+  await world.close();
+  await w2.close();
+});
+
+test('POST /cancel: subflujo inválido => 422; um alvo usa o subflujo (desempata); vários alvos o ignoram (subworkflowIgnored)', async () => {
   const world = await cancelWorld();
   open(world, 'AG-1', { subworkflowId: '3004' });
   open(world, 'AG-2', { subworkflowId: '3005' });
@@ -1096,77 +1329,300 @@ test('POST /cancel: atributo ausente ou inválido => 422; o subprocesso do atrib
   seedCancelFlow(world, { fields: { 'ID Subflujo a Cancelar': '30x5' } });
   const badSub = await authThenCancel(world);
   assert.equal(badSub.status, 422);
-  assert.equal((await badSub.json()).code, 'INVALID_TARGET');
+  const badBody = await badSub.json();
+  assert.deepEqual([badBody.code, badBody.invalid], ['INVALID_TARGET', ['30x5']]);
 
-  // sem subprocesso: dois acordos abertos => ambíguo, nada cancelado e sem SendOn
+  // sem subprocesso: dois acordos abertos => ambíguo (recusa definitiva do item), nada cancelado
   seedCancelFlow(world);
   const ambiguous = await authThenCancel(world);
-  assert.equal(ambiguous.status, 409);
+  assert.equal(ambiguous.status, 200);
   const body = await ambiguous.json();
-  assert.equal(body.code, 'AMBIGUOUS');
-  assert.deepEqual(body.agreements.map((a) => a.id).sort(), ['AG-1', 'AG-2']);
+  assert.equal(body.complete, true);
+  assert.deepEqual([body.items[0].outcome, body.items[0].code], ['refused', 'AMBIGUOUS']);
+  assert.deepEqual(body.items[0].agreements.map((a) => a.id).sort(), ['AG-1', 'AG-2']);
   assert.equal(world.adobe.cancelled.length, 0);
-  assert.equal(world.otcs.sendons.length, 0);
+  assert.deepEqual(world.otcs.updateFormCalls[0].values, { k_IDsCancelados: [] }, 'resultado vazio também é gravado');
 
-  // com o atributo do subprocesso: só o AG-2
+  // com um alvo e o atributo do subprocesso: só o AG-2
   seedCancelFlow(world, { fields: { 'ID Subflujo a Cancelar': '3005' } });
-  assert.equal((await authThenCancel(world)).status, 200);
+  const one = await authThenCancel(world);
+  assert.equal(one.status, 200);
+  assert.equal((await one.json()).subworkflowIgnored, false);
   assert.deepEqual(world.adobe.cancelled.map((c) => c.id), ['AG-2']);
   assert.equal(world.repo.get('AG-1').state, 'pending');
+
+  // com vários alvos o subflujo é ignorado (e avisado no log): 3003 ainda tem o AG-1 aberto, o subprocesso 3005 não filtra
+  open(world, 'AG-9', { workflowId: '4444', subworkflowId: '4444' });
+  seedCancelFlow(world, { fields: { 'ID Flujo a Cancelar': ['4444', '3003'], 'ID Subflujo a Cancelar': '3005' } });
+  const many = await authThenCancel(world);
+  assert.equal(many.status, 200);
+  const manyBody = await many.json();
+  assert.equal(manyBody.subworkflowIgnored, true);
+  // o AG-1 (subprocesso 3004) é o único aberto do 3003; se o subflujo 3005 valesse, o alvo seria o AG-2 (já cancelado)
+  assert.deepEqual(manyBody.items.map((i) => [i.workflowId, i.outcome, i.agreementId, i.alreadyCancelled]), [
+    ['4444', 'cancelled', 'AG-9', false],
+    ['3003', 'cancelled', 'AG-1', false]
+  ]);
+  assert.ok(world.logger.has('warn', /el subflujo 3005 se ignora/));
   await world.close();
 });
 
-test('POST /cancel: fluxo sem acordo => 404 com dica; Adobe indisponível => 503; já assinado => 409; sem SendOn em todos', async () => {
-  const world = await cancelWorld();
-  seedCancelFlow(world);
+test('lote misto: cancelado, assinado, não encontrado e ambíguo => grava só os cancelados no formulário e faz o SendOn', async () => {
+  const world = await batchWorld(['3101', '3102', '3104'], { target: ['3101', '3102', '3103', '3104'] });
+  world.adobe.agreements['AG-3102'].status = 'SIGNED';
+  // 3104 passa a ter dois acordos abertos (ambíguo); 3103 não tem acordo nenhum
+  open(world, 'AG-3104B', { workflowId: '3104', subworkflowId: '3105' });
 
-  const none = await authThenCancel(world);
-  assert.equal(none.status, 404);
-  const noneBody = await none.json();
-  assert.equal(noneBody.code, 'AGREEMENT_NOT_FOUND');
-  assert.match(noneBody.hint, /adopt/);
+  const r = await authThenCancel(world);
+  assert.equal(r.status, 200, await r.clone().text());
+  const body = await r.json();
+  assert.deepEqual(body.items.map((i) => [i.workflowId, i.outcome, i.code]), [
+    ['3101', 'cancelled', undefined],
+    ['3102', 'refused', 'ALREADY_SIGNED'],
+    ['3103', 'refused', 'AGREEMENT_NOT_FOUND'],
+    ['3104', 'refused', 'AMBIGUOUS']
+  ]);
+  assert.deepEqual(body.summary, { total: 4, cancelled: 1, refused: 3, pending: 0 });
+  assert.deepEqual([body.complete, body.sentOn], [true, true]);
+  assert.equal(body.items[1].agreementId, 'AG-3102');
+  assert.equal(body.items[3].agreements.length, 2);
+  assert.match(body.items[2].hint, /adopt/);
 
-  open(world, 'AG-1');
-  world.adobe.cancelFailures = 1;
-  const down = await authThenCancel(world);
-  assert.equal(down.status, 503);
-  assert.equal((await down.json()).code, 'ADOBE_UNAVAILABLE');
-  assert.equal(world.repo.get('AG-1').state, 'pending', 'nada marcado');
+  assert.deepEqual(world.adobe.cancelled.map((c) => c.id), ['AG-3101']);
+  assert.deepEqual(world.otcs.updateFormCalls.map((c) => c.values), [{ k_IDsCancelados: ['3101'] }]);
+  assert.equal(world.otcs.sendons.length, 1);
+  assert.match(world.otcs.sendons[0].comment, /Cancelados \(1\): 3101\. No cancelados \(3\): 3102 \(ALREADY_SIGNED\), 3103 \(AGREEMENT_NOT_FOUND\), 3104 \(AMBIGUOUS\)/);
+  assert.ok(world.otcs.sendons[0].comment.length <= 1000);
+  assert.equal(world.repo.get('AG-3102').state, 'pending', 'o assinado fica intacto');
+  await world.close();
+});
 
-  world.adobe.agreements['AG-1'].status = 'SIGNED';
-  const signed = await authThenCancel(world);
-  assert.equal(signed.status, 409);
-  assert.equal((await signed.json()).code, 'ALREADY_SIGNED');
+test('lote com item transitório (503 do Adobe): complete:false, nada gravado e sem SendOn; repetir termina e é idempotente', async () => {
+  const world = await batchWorld(['3101', '3102']);
+  world.adobe.cancelFailures = 1; // o 1º cancelamento falha (e a reconsulta mostra o acordo ainda em andamento)
 
+  const r = await authThenCancel(world);
+  assert.equal(r.status, 200, await r.clone().text());
+  const body = await r.json();
+  assert.deepEqual([body.complete, body.sentOn], [false, false]);
+  assert.deepEqual(body.items.map((i) => [i.workflowId, i.outcome, i.code]), [
+    ['3101', 'pending', 'ADOBE_UNAVAILABLE'],
+    ['3102', 'cancelled', undefined]
+  ]);
+  assert.deepEqual(body.summary, { total: 2, cancelled: 1, refused: 0, pending: 1 });
+  assert.equal(world.otcs.updateFormCalls.length, 0, 'nada gravado');
+  assert.equal(world.otcs.sendons.length, 0);
+  assert.equal(world.otcs.task('9001', 2).status, 'current');
+  assert.equal(world.repo.get('AG-3101').state, 'pending');
+
+  // repetir: o que já foi cancelado volta como alreadyCancelled e o lote fecha
+  const again = await authThenCancel(world);
+  const done = await again.json();
+  assert.equal(again.status, 200);
+  assert.deepEqual([done.complete, done.sentOn], [true, true]);
+  assert.deepEqual(done.items.map((i) => [i.workflowId, i.outcome, i.alreadyCancelled]), [
+    ['3101', 'cancelled', false], ['3102', 'cancelled', true]
+  ]);
+  assert.deepEqual(world.otcs.updateFormCalls.map((c) => c.values), [{ k_IDsCancelados: ['3101', '3102'] }]);
+  assert.equal(world.otcs.sendons.length, 1);
+  assert.equal(world.adobe.cancelled.length, 2, 'cada acordo foi cancelado uma única vez no Adobe');
+
+  // erro inesperado de um item vira pendente com mensagem genérica (o detalhe só no log)
+  const w2 = await batchWorld(['3101']);
+  w2.repo.listByWorkflow = () => { throw new Error('segredo interno'); };
+  const unexpected = await (await authThenCancel(w2)).json();
+  assert.deepEqual([unexpected.complete, unexpected.items[0].outcome, unexpected.items[0].code], [false, 'pending', 'UNEXPECTED_ERROR']);
+  assert.equal(unexpected.items[0].message, 'Error al cancelar el flujo.');
+  assert.doesNotMatch(JSON.stringify(unexpected), /segredo interno/);
+  assert.ok(w2.logger.has('error', /segredo interno/));
+  assert.equal(w2.otcs.sendons.length, 0);
+  await world.close();
+  await w2.close();
+});
+
+test('orçamento de tempo estourado: alvos não iniciados ficam pendentes (BUDGET_EXCEEDED), sem gravar nem SendOn; repetir fecha', async () => {
+  const world = await batchWorld(['3101', '3102', '3103'], { env: { CANCEL_BATCH_BUDGET_MS: '5000' } });
+  assert.equal(world.config.cancel.batchBudgetMs, 5000);
+  world.adobe.onCancel = async () => world.clock.advance(6000); // o 1º cancelamento consome o orçamento
+
+  const body = await (await authThenCancel(world)).json();
+  assert.deepEqual([body.complete, body.sentOn], [false, false]);
+  assert.deepEqual(body.items.map((i) => [i.workflowId, i.outcome, i.code]), [
+    ['3101', 'cancelled', undefined],
+    ['3102', 'pending', 'BUDGET_EXCEEDED'],
+    ['3103', 'pending', 'BUDGET_EXCEEDED']
+  ]);
+  assert.deepEqual(body.summary, { total: 3, cancelled: 1, refused: 0, pending: 2 });
+  assert.equal(world.otcs.updateFormCalls.length, 0);
+  assert.equal(world.otcs.sendons.length, 0);
+  assert.deepEqual(world.adobe.cancelled.map((c) => c.id), ['AG-3101'], 'os não iniciados nem foram consultados');
+  assert.equal(world.calls.filter((c) => c[0] === 'adobe.getAgreement' && c[1] !== 'AG-3101').length, 0);
+
+  world.adobe.onCancel = null;
+  const again = await (await authThenCancel(world)).json();
+  assert.deepEqual([again.complete, again.sentOn], [true, true]);
+  assert.deepEqual(world.otcs.updateFormCalls[0].values, { k_IDsCancelados: ['3101', '3102', '3103'] });
+  assert.equal(world.otcs.sendons.length, 1);
+
+  // o primeiro alvo sempre começa, mesmo com o orçamento no mínimo
+  assert.equal(computeConfig({ CANCEL_BATCH_BUDGET_MS: '1' }).cancel.batchBudgetMs, 1000);
+  await world.close();
+});
+
+test('POST /cancel: atributo de resultado ausente no formulário => 409 RESULT_FIELD_MISSING ANTES de cancelar nada', async () => {
+  const world = await batchWorld(['3101'], { fields: { 'IDs Cancelados': null } });
+
+  const r = await authThenCancel(world);
+  assert.equal(r.status, 409);
+  const body = await r.json();
+  assert.equal(body.code, 'RESULT_FIELD_MISSING');
+  assert.equal(body.items, undefined);
+  // nada foi consultado nem cancelado no Adobe, nada gravado, sem SendOn, registro intacto
+  assert.equal(world.calls.filter((c) => c[0].startsWith('adobe.')).length, 0);
+  assert.equal(world.calls.filter((c) => c[0] === 'adobe.cancelAgreement').length, 0);
+  assert.equal(world.adobe.cancelled.length, 0);
+  assert.equal(world.repo.get('AG-3101').state, 'pending');
+  assert.equal(world.otcs.updateFormCalls.length, 0);
   assert.equal(world.otcs.sendons.length, 0);
   assert.equal(world.otcs.task('9001', 2).status, 'current');
   await world.close();
 });
 
-test('POST /cancel: falha no SendOn depois do cancelamento => 503 e repetir é idempotente (Adobe não é cancelado de novo)', async () => {
-  const world = await cancelWorld();
-  seedCancelFlow(world);
-  open(world, 'AG-1');
+test('prévia: resultFieldMissing só quando a gravação está ligada e o atributo falta; a prévia responde normalmente', async () => {
+  const world = await batchWorld(['3101'], { fields: { 'IDs Cancelados': null } });
+  let body = await (await authThenCancel(world, undefined, { path: '/cancel/preview' })).json();
+  assert.equal(body.resultFieldMissing, true);
+  assert.deepEqual(body.items.map((i) => [i.state, i.cancelable]), [['abierto', true]]);
+  assert.equal(world.adobe.cancelled.length, 0);
+
+  // atributo presente: sem a flag
+  seedCancelFlow(world, { fields: { 'ID Flujo a Cancelar': '3101' } });
+  body = await (await authThenCancel(world, undefined, { path: '/cancel/preview' })).json();
+  assert.equal(body.resultFieldMissing, undefined);
+
+  // gravação desligada: o atributo pode faltar sem aviso
+  const off = await batchWorld(['3101'], { env: { CANCEL_FIELD_RESULT: '' }, fields: { 'IDs Cancelados': null } });
+  body = await (await authThenCancel(off, undefined, { path: '/cancel/preview' })).json();
+  assert.equal(body.resultFieldMissing, undefined);
+  await world.close();
+  await off.close();
+});
+
+test('POST /cancel: falha ao gravar o resultado => 503 RESULT_WRITE_FAILED (com items), sem SendOn; repetir fecha', async () => {
+  const world = await batchWorld(['3101']);
+  world.otcs.updateFormFailures = 1;
+
+  const r = await authThenCancel(world);
+  assert.equal(r.status, 503);
+  const body = await r.json();
+  assert.equal(body.code, 'RESULT_WRITE_FAILED');
+  assert.equal(body.items[0].outcome, 'cancelled');
+  assert.equal(world.otcs.sendons.length, 0);
+  assert.equal(world.otcs.task('9001', 2).status, 'current');
+
+  const retry = await authThenCancel(world);
+  assert.equal(retry.status, 200);
+  const done = await retry.json();
+  assert.equal(done.items[0].alreadyCancelled, true);
+  assert.deepEqual(world.otcs.updateFormCalls.map((c) => c.values), [{ k_IDsCancelados: ['3101'] }]);
+  assert.equal(world.otcs.sendons.length, 1);
+  assert.equal(world.adobe.cancelled.length, 1);
+  await world.close();
+});
+
+test('POST /cancel: falha no SendOn depois do lote => 503 SENDON_FAILED (cancelled, items) e repetir é idempotente', async () => {
+  const world = await batchWorld(['3101', '3102']);
   world.otcs.sendOnFailures = 1;
 
   const failed = await authThenCancel(world);
   assert.equal(failed.status, 503);
   const body = await failed.json();
-  assert.deepEqual([body.code, body.cancelled, body.id], ['SENDON_FAILED', true, 'AG-1']);
-  assert.equal(world.adobe.cancelled.length, 1);
-  assert.equal(world.repo.get('AG-1').state, 'cancelled');
+  assert.deepEqual([body.code, body.cancelled], ['SENDON_FAILED', true]);
+  assert.deepEqual(body.items.map((i) => i.outcome), ['cancelled', 'cancelled']);
+  assert.deepEqual(body.summary, { total: 2, cancelled: 2, refused: 0, pending: 0 });
+  assert.equal(world.adobe.cancelled.length, 2);
+  assert.equal(world.repo.get('AG-3101').state, 'cancelled');
   assert.equal(world.otcs.task('9001', 2).status, 'current', 'a tarefa de cancelamento continua ativa');
 
   const retry = await authThenCancel(world);
   assert.equal(retry.status, 200, await retry.clone().text());
-  assert.deepEqual(await retry.json(), { message: 'Agreement already cancelled. ID: AG-1', id: 'AG-1', alreadyCancelled: true });
-  assert.equal(world.adobe.cancelled.length, 1, 'o cancelamento não é repetido no Adobe');
+  const done = await retry.json();
+  assert.deepEqual([done.complete, done.sentOn], [true, true]);
+  assert.deepEqual(done.items.map((i) => i.alreadyCancelled), [true, true]);
+  assert.equal(world.adobe.cancelled.length, 2, 'o cancelamento não é repetido no Adobe');
   assert.equal(world.otcs.task('9001', 2).status, 'completed');
   assert.equal(world.otcs.sendons.length, 1);
+  assert.equal(world.otcs.updateFormCalls.length, 2, 'o resultado é regravado na repetição, com a mesma lista');
+  assert.deepEqual(world.otcs.updateFormCalls[0].values, world.otcs.updateFormCalls[1].values);
 
   // depois de concluída, uma terceira chamada já não está no passo de cancelamento
   assert.equal((await authThenCancel(world)).status, 409);
   await world.close();
+});
+
+test('POST /cancel com CANCEL_FIELD_RESULT vazio: não grava o formulário (updateTaskForm) e segue para o SendOn', async () => {
+  const world = await batchWorld(['3101'], { env: { CANCEL_FIELD_RESULT: '' }, fields: { 'IDs Cancelados': null } });
+  assert.equal(world.config.cancel.fields.result, '');
+
+  const r = await authThenCancel(world);
+  assert.equal(r.status, 200, await r.clone().text());
+  const body = await r.json();
+  assert.deepEqual([body.complete, body.sentOn, body.resultField], [true, true, null]);
+  assert.equal(world.otcs.modelCalls.filter((c) => c[0] === 'updateTaskForm').length, 0);
+  assert.equal(world.otcs.updateFormCalls.length, 0);
+  assert.equal(world.otcs.sendons.length, 1);
+  await world.close();
+});
+
+test('POST /cancel: fluxo sem acordo, já assinado, Adobe indisponível — recusa definitiva fecha o lote; transitório não', async () => {
+  const world = await cancelWorld();
+  seedCancelFlow(world);
+
+  const none = await authThenCancel(world);
+  assert.equal(none.status, 200);
+  const noneBody = await none.json();
+  assert.deepEqual([noneBody.complete, noneBody.items[0].outcome, noneBody.items[0].code], [true, 'refused', 'AGREEMENT_NOT_FOUND']);
+  assert.match(noneBody.items[0].hint, /adopt/);
+  assert.deepEqual(world.otcs.updateFormCalls.map((c) => c.values), [{ k_IDsCancelados: [] }]);
+  assert.equal(world.otcs.sendons.length, 1, 'tudo recusado de forma definitiva: o lote termina e o workflow segue');
+
+  const w2 = await cancelWorld();
+  seedCancelFlow(w2);
+  open(w2, 'AG-1');
+  w2.adobe.cancelFailures = 1;
+  const down = await (await authThenCancel(w2)).json();
+  assert.deepEqual([down.complete, down.items[0].outcome, down.items[0].code], [false, 'pending', 'ADOBE_UNAVAILABLE']);
+  assert.equal(w2.repo.get('AG-1').state, 'pending', 'nada marcado');
+
+  w2.adobe.agreements['AG-1'].status = 'SIGNED';
+  const signed = await (await authThenCancel(w2)).json();
+  assert.deepEqual([signed.complete, signed.items[0].outcome, signed.items[0].code], [true, 'refused', 'ALREADY_SIGNED']);
+  assert.equal(w2.otcs.sendons.length, 1);
+  assert.equal(w2.adobe.cancelled.length, 0);
+
+  // demais recusas definitivas do serviço unitário
+  for (const [setup, code] of [
+    [(w) => { w.adobe.agreements['AG-1'].status = 'EXPIRED'; }, 'NOT_CANCELABLE'],
+    [(w) => { w.adobe.agreements['AG-1'].status = 'CANCELLED'; w.adobe.events['AG-1'] = [{ type: 'REJECTED' }]; }, 'ALREADY_REJECTED'],
+    [(w) => { delete w.adobe.agreements['AG-1']; }, 'AGREEMENT_NOT_FOUND_IN_ADOBE'],
+    [(w) => { w.repo.upsert('AG-1', { sendonDone: true, state: 'completed' }); }, 'AGREEMENT_CLOSED']
+  ]) {
+    const w = await cancelWorld();
+    seedCancelFlow(w);
+    open(w, 'AG-1');
+    setup(w);
+    const item = (await (await authThenCancel(w)).json()).items[0];
+    assert.deepEqual([item.outcome, item.code], ['refused', code]);
+    await w.close();
+  }
+
+  // 503 de reconciliação em curso, IN_PROGRESS: transitórios
+  assert.deepEqual(
+    ['RECONCILE_IN_PROGRESS', 'IN_PROGRESS', 'ADOBE_UNAVAILABLE', 'OTCS_UNAVAILABLE', 'BUDGET_EXCEEDED', 'UNEXPECTED_ERROR', 'QUALQUER'].map(classifyCancelOutcome),
+    Array(7).fill('pending')
+  );
+  await world.close();
+  await w2.close();
 });
 
 test('POST /cancel: erro inesperado devolve 500 genérico sem vazar detalhes', async () => {
@@ -1179,6 +1635,333 @@ test('POST /cancel: erro inesperado devolve 500 genérico sem vazar detalhes', a
   assert.equal(r.status, 500);
   assert.deepEqual(await r.json(), { error: 'Error al cancelar el flujo.' });
   assert.ok(world.logger.has('error', /segredo interno/));
+
+  world.cancellation.previewFromTask = async () => { throw new Error('segredo da previa'); };
+  const p = await authThenCancel(world, undefined, { path: '/cancel/preview' });
+  assert.equal(p.status, 500);
+  assert.deepEqual(await p.json(), { error: 'Error al cancelar el flujo.' });
+  assert.ok(world.logger.has('error', /segredo da previa/));
+  await world.close();
+});
+
+/* ---------- CANCEL_STOP_ORIGINAL: parar o fluxo original no Content depois do Adobe ---------- */
+
+// Mundo com a parada do original ligada; `otcs.stopProcess` também registra a ordem em world.calls
+async function stopWorld(wfIds, opts = {}) {
+  const world = await batchWorld(wfIds, { ...opts, env: { CANCEL_STOP_ORIGINAL: 'true', ...(opts.env || {}) } });
+  const realStop = world.otcs.stopProcess;
+  world.otcs.stopProcess = async (id) => {
+    world.calls.push(['otcs.stop', String(id)]);
+    return realStop(id);
+  };
+  return world;
+}
+
+test('stop do original desligado (padrão): nenhuma chamada a stopProcess, contentStop disabled e stopOriginal false', async () => {
+  const world = await batchWorld(['3101', '3102']);
+  assert.equal(world.config.cancel.stopOriginal, false);
+
+  const body = await (await authThenCancel(world)).json();
+  assert.deepEqual([body.complete, body.sentOn, body.stopOriginal], [true, true, false]);
+  assert.deepEqual(body.items.map((i) => [i.outcome, i.contentStop]), [['cancelled', 'disabled'], ['cancelled', 'disabled']]);
+  assert.equal(world.otcs.modelCalls.filter((c) => c[0] === 'stopProcess' || c[0] === 'getProcessStatus').length, 0);
+  assert.deepEqual(world.otcs.stopped, []);
+  assert.match(world.otcs.sendons[0].comment, /originales detenidos en Content: no/);
+  await world.close();
+});
+
+test('stop do original ligado: depois do Adobe confirmar, item a item; o resultado inclui os parados e o SendOn avisa', async () => {
+  const world = await stopWorld(['3101', '3102']);
+  assert.equal(world.config.cancel.stopOriginal, true);
+
+  const body = await (await authThenCancel(world)).json();
+  assert.deepEqual([body.complete, body.sentOn, body.stopOriginal], [true, true, true]);
+  assert.deepEqual(body.items.map((i) => [i.workflowId, i.outcome, i.contentStop]), [
+    ['3101', 'cancelled', 'stopped'], ['3102', 'cancelled', 'stopped']
+  ]);
+  assert.deepEqual(world.otcs.stopped, [3101, 3102]);
+  // ordem por item: Adobe confirmado -> stop -> próximo item
+  const seq = world.calls.map((c) => c.join(':')).filter((c) => /cancelAgreement|otcs\.stop|otcs\.sendon/.test(c));
+  assert.deepEqual(seq, [
+    'adobe.cancelAgreement:AG-3101', 'otcs.stop:3101', 'adobe.cancelAgreement:AG-3102', 'otcs.stop:3102', 'otcs.sendon:sendon:2'
+  ]);
+  assert.deepEqual(world.otcs.updateFormCalls[0].values, { k_IDsCancelados: ['3101', '3102'] });
+  assert.match(world.otcs.sendons[0].comment, /originales detenidos en Content: sí/);
+  // o eco RECALLED continua sem disposição: o original só foi parado, não recebeu Rechazado
+  assert.equal(world.otcs.dispositionCalls().length, 0);
+  await world.close();
+});
+
+test('stop do original ligado: recusados (assinado, não encontrado...) nunca são parados', async () => {
+  const world = await stopWorld(['3101', '3102'], { target: ['3101', '3102', '3103'] });
+  world.adobe.agreements['AG-3102'].status = 'SIGNED';
+
+  const body = await (await authThenCancel(world)).json();
+  assert.deepEqual(body.items.map((i) => [i.workflowId, i.outcome, i.contentStop]), [
+    ['3101', 'cancelled', 'stopped'], ['3102', 'refused', undefined], ['3103', 'refused', undefined]
+  ]);
+  assert.deepEqual(world.otcs.stopped, [3101]);
+  assert.equal(world.otcs.workflows['3102'].status, undefined, 'o assinado segue ativo');
+  await world.close();
+});
+
+test('stop do original falha (sem permissão): pending STOP_FAILED, sem gravação nem SendOn; repetir não cancela de novo no Adobe e refaz o stop', async () => {
+  const world = await stopWorld(['3101', '3102']);
+  world.otcs.stopFailures = 1; // o 1º stop (3101) falha com 403
+
+  const r = await authThenCancel(world);
+  assert.equal(r.status, 200);
+  const body = await r.json();
+  assert.deepEqual([body.complete, body.sentOn], [false, false]);
+  const [first, second] = body.items;
+  assert.deepEqual([first.outcome, first.code, first.cancelledInAdobe, first.contentStop, first.agreementId],
+    ['pending', 'STOP_FAILED', true, 'failed', 'AG-3101']);
+  assert.match(first.message, /cancelado en Adobe Sign, pero no se pudo detener el flujo en Content Server/);
+  assert.match(first.message, /permisos del usuario de integración/);
+  assert.deepEqual([second.outcome, second.contentStop], ['cancelled', 'stopped']);
+  assert.deepEqual(body.summary, { total: 2, cancelled: 1, refused: 0, pending: 1 });
+  assert.equal(world.otcs.updateFormCalls.length, 0);
+  assert.equal(world.otcs.sendons.length, 0);
+  assert.equal(world.repo.get('AG-3101').state, 'cancelled', 'o Adobe/registro já estão cancelados');
+  assert.ok(world.logger.has('error', /no se pudo detener el flujo original/));
+  assert.equal(world.adobe.cancelled.length, 2);
+
+  // repetir: o Adobe não é cancelado de novo (alreadyCancelled) e só o stop é refeito
+  const again = await (await authThenCancel(world)).json();
+  assert.deepEqual([again.complete, again.sentOn], [true, true]);
+  assert.deepEqual(again.items.map((i) => [i.workflowId, i.alreadyCancelled, i.contentStop]), [
+    ['3101', true, 'stopped'], ['3102', true, 'stopped']
+  ]);
+  assert.equal(world.adobe.cancelled.length, 2, 'nenhum novo cancelamento no Adobe');
+  assert.ok(world.otcs.stopped.includes(3101));
+  assert.deepEqual(world.otcs.updateFormCalls.map((c) => c.values), [{ k_IDsCancelados: ['3101', '3102'] }]);
+  assert.equal(world.otcs.sendons.length, 1);
+
+  // erro que não é de permissão: STOP_FAILED sem a dica de permissões
+  const w2 = await stopWorld(['3101']);
+  w2.otcs.stopFailures = 1;
+  w2.otcs.stopFailStatus = 500;
+  const item = (await (await authThenCancel(w2)).json()).items[0];
+  assert.equal(item.code, 'STOP_FAILED');
+  assert.doesNotMatch(item.message, /permisos/);
+  await world.close();
+  await w2.close();
+});
+
+test('stop do original: já cancelado (repetição) também para; stop falha mas o processo já está parado => already_stopped; sem saber o estado => falha', async () => {
+  // fluxo já cancelado antes (flag desligado), agora o lote com o flag ligado também para o original
+  const world = await stopWorld(['3101']);
+  world.config.cancel.stopOriginal = false;
+  assert.equal((await authThenCancel(world)).status, 200);
+  seedCancelFlow(world, { fields: { 'ID Flujo a Cancelar': '3101' } });
+  world.config.cancel.stopOriginal = true;
+  const rep = (await (await authThenCancel(world)).json()).items[0];
+  assert.deepEqual([rep.alreadyCancelled, rep.contentStop], [true, 'stopped']);
+  assert.deepEqual(world.otcs.stopped, [3101]);
+
+  // o stop devolve erro (resposta perdida), mas o OTCS já parou o processo: sucesso idempotente
+  const w2 = await stopWorld(['3101']);
+  w2.otcs.stopFailsButStops = 1;
+  const body = await (await authThenCancel(w2)).json();
+  assert.deepEqual([body.complete, body.items[0].outcome, body.items[0].contentStop], [true, 'cancelled', 'already_stopped']);
+  assert.ok(w2.otcs.modelCalls.some((c) => c[0] === 'getProcessStatus'));
+  assert.equal(w2.otcs.sendons.length, 1);
+
+  // processo concluído/arquivado também vale (status relido); sem conseguir reler o estado => falha
+  const w3 = await stopWorld(['3101']);
+  w3.otcs.stopFailures = 1;
+  w3.otcs.workflows['3101'].status = 'Completed';
+  assert.equal((await (await authThenCancel(w3)).json()).items[0].contentStop, 'already_stopped');
+  const w4 = await stopWorld(['3101']);
+  w4.otcs.stopFailures = 1;
+  w4.otcs.processStatusFailure = httpError(500, 'status down');
+  const failed = (await (await authThenCancel(w4)).json()).items[0];
+  assert.deepEqual([failed.outcome, failed.code, failed.contentStop], ['pending', 'STOP_FAILED', 'failed']);
+  assert.equal(w4.otcs.sendons.length, 0);
+  for (const w of [world, w2, w3, w4]) await w.close();
+});
+
+test('stop do original conta no prazo do lote: com o tempo esgotado depois do stop, o próximo item é BUDGET_EXCEEDED', async () => {
+  const world = await stopWorld(['3101', '3102'], { env: { CANCEL_BATCH_BUDGET_MS: '5000' } });
+  const stop = world.otcs.stopProcess;
+  world.otcs.stopProcess = async (id) => { const out = await stop(id); world.clock.advance(6000); return out; };
+
+  const body = await (await authThenCancel(world)).json();
+  assert.deepEqual(body.items.map((i) => [i.workflowId, i.outcome, i.code, i.contentStop]), [
+    ['3101', 'cancelled', undefined, 'stopped'], ['3102', 'pending', 'BUDGET_EXCEEDED', undefined]
+  ]);
+  assert.equal(body.complete, false);
+  assert.deepEqual(world.otcs.stopped, [3101]);
+  assert.deepEqual(world.adobe.cancelled.map((c) => c.id), ['AG-3101']);
+  await world.close();
+});
+
+test('prévia e rotas admin nunca param o original, com o flag ligado; a prévia informa stopOriginal', async () => {
+  const world = await stopWorld(['3101', '3102']);
+  world.adobe.agreements['AG-3102'].status = 'SIGNED';
+  const body = await (await authThenCancel(world, undefined, { path: '/cancel/preview' })).json();
+  assert.equal(body.stopOriginal, true);
+  assert.deepEqual(body.items.map((i) => i.state), ['abierto', 'firmado']);
+  assert.equal(world.otcs.modelCalls.filter((c) => c[0] === 'stopProcess' || c[0] === 'getProcessStatus').length, 0);
+  assert.deepEqual(world.otcs.stopped, []);
+
+  // rotas admin / serviço unitário: só o Adobe (contentFlow 'unchanged'), mesmo com o flag
+  const out = await world.cancellation.cancelWorkflow('3101');
+  assert.equal(out.cancelled, true);
+  assert.deepEqual(world.otcs.stopped, []);
+  assert.equal(world.otcs.modelCalls.filter((c) => c[0] === 'stopProcess').length, 0);
+
+  const off = await batchWorld(['3101']);
+  assert.equal((await (await authThenCancel(off, undefined, { path: '/cancel/preview' })).json()).stopOriginal, false);
+  await world.close();
+  await off.close();
+});
+
+test('otcs: getProcessStatus lê wf_details.status e os passos ativos de /v2/workflows/status/processes/{id}', async () => {
+  const bodies = [
+    { results: { wf_details: { status: 'stopped' }, step_list: { current: [], completed: [{}], next: [] } } },
+    { results: { step_list: { current: [{}, {}] } } },
+    {}
+  ];
+  const seen = [];
+  const http = {
+    post: async () => ({ data: { ticket: 't1', validFor: 1800 } }),
+    get: async (url) => { seen.push(url); return { data: bodies.shift() }; }
+  };
+  const client = createOtcsClient({ base: 'https://otcs.invalid/api', user: 'u', pass: 'p', http, now: () => 1000 });
+  assert.deepEqual(await client.getProcessStatus(3003), { status: 'stopped', currentTasks: 0 });
+  assert.deepEqual(await client.getProcessStatus(3003), { status: '', currentTasks: 2 });
+  assert.deepEqual(await client.getProcessStatus(3003), { status: '', currentTasks: null });
+  assert.equal(seen[0], 'https://otcs.invalid/api/v2/workflows/status/processes/3003');
+});
+
+test('isProcessFinishedStatus: parado/concluído/arquivado sim; ativo, vazio e desconhecido não', () => {
+  for (const s of ['stopped', 'Stopped', 'completed', 'Complete', 'archived', 'Archived']) assert.equal(isProcessFinishedStatus(s), true, s);
+  for (const s of ['ontime', 'workflowlate', 'Active', '', undefined, null, 'suspended']) assert.equal(isProcessFinishedStatus(s), false, String(s));
+});
+
+/* ---------- POST /cancel/preview ---------- */
+
+// Foto do que a prévia nunca pode mudar: registros, histórico de eventos e as chamadas de escrita
+function snapshot(world, ids) {
+  return JSON.stringify(ids.map((id) => [world.repo.get(id), world.repo.listEvents(id)]));
+}
+
+test('prévia: cada estado da tabela, sem cancelar no Adobe nem escrever no repositório, no formulário ou no workflow', async () => {
+  const wf = ['3101', '3102', '3103', '3104', '3105', '3106', '3107', '3108', '3109', '3110', '3111'];
+  const world = await batchWorld(['3101', '3102', '3103', '3104', '3105', '3106', '3108', '3111'], { target: wf });
+  const set = (n, status, events) => {
+    world.adobe.agreements[`AG-${n}`].status = status;
+    if (events) world.adobe.events[`AG-${n}`] = events;
+  };
+  // 3102: em andamento com 1 assinatura concluída (ESIGNED + ACTION_COMPLETED da mesma pessoa contam uma vez)
+  world.adobe.events['AG-3102'] = [
+    { type: 'CREATED', participantRole: 'SENDER', participantEmail: 'rh@example.com', date: '2026-06-20T09:00:00Z' },
+    { type: 'EMAIL_VIEWED', participantEmail: 'a@example.com', date: '2026-06-21T09:00:00Z' },
+    { type: 'ESIGNED', participantRole: 'SIGNER', participantEmail: 'a@example.com', date: '2026-06-21T10:00:00Z' },
+    { type: 'ACTION_COMPLETED', participantEmail: 'a@example.com', date: '2026-06-21T10:00:01Z' }
+  ];
+  set('3103', 'SIGNED');
+  set('3104', 'CANCELLED', [{ type: 'REJECTED' }]);
+  set('3105', 'CANCELLED', [{ type: 'RECALLED' }]);
+  set('3106', 'EXPIRED');
+  // 3107: acordo já concluído por outro caminho (sem cancelamento)
+  open(world, 'AG-3107', { workflowId: '3107', subworkflowId: '3107', sendonDone: true, state: 'completed' });
+  // 3108: dois acordos abertos; 3109: nenhum; 3110: registro sem acordo no Adobe (404); 3111: Adobe falha
+  open(world, 'AG-3108B', { workflowId: '3108', subworkflowId: '3199' });
+  seedAgreement(world, 'AG-3110', { workflowId: '3110', subworkflowId: '3110' });
+  const getAgreement = world.adobe.getAgreement;
+  world.adobe.getAgreement = async (id) => {
+    if (id === 'AG-3111') throw httpError(500, 'adobe down');
+    return getAgreement(id);
+  };
+  const ids = ['AG-3101', 'AG-3102', 'AG-3103', 'AG-3104', 'AG-3105', 'AG-3106', 'AG-3107', 'AG-3108', 'AG-3108B', 'AG-3110', 'AG-3111'];
+  const before = snapshot(world, ids);
+
+  const r = await authThenCancel(world, undefined, { path: '/cancel/preview' });
+  assert.equal(r.status, 200, await r.clone().text());
+  const body = await r.json();
+  const byWf = Object.fromEntries(body.items.map((i) => [i.workflowId, i]));
+  const expected = {
+    3101: ['abierto', true], 3102: ['firma_parcial', true], 3103: ['firmado', false], 3104: ['rechazado', false],
+    3105: ['ya_cancelado', true], 3106: ['no_cancelable', false], 3107: ['concluido', false], 3108: ['ambiguo', false],
+    3109: ['no_encontrado', false], 3110: ['no_existe_en_adobe', false], 3111: ['no_disponible', null]
+  };
+  assert.deepEqual(body.items.map((i) => i.workflowId), wf, 'mesma ordem do atributo');
+  for (const [id, [state, cancelable]] of Object.entries(expected)) {
+    assert.deepEqual([byWf[id].state, byWf[id].cancelable], [state, cancelable], id);
+    assert.ok(byWf[id].message, `${id} tem mensagem`);
+  }
+  assert.deepEqual(body.summary, {
+    total: 11, abierto: 1, firma_parcial: 1, firmado: 1, rechazado: 1, ya_cancelado: 1, no_cancelable: 1, concluido: 1,
+    ambiguo: 1, no_encontrado: 1, no_existe_en_adobe: 1, no_disponible: 1
+  });
+  assert.equal(body.subworkflowIgnored, false);
+
+  // detalhes por estado
+  assert.deepEqual([byWf[3101].agreementId, byWf[3101].adobeStatus], ['AG-3101', 'OUT_FOR_SIGNATURE']);
+  assert.equal(byWf[3101].signedCount, undefined);
+  assert.deepEqual([byWf[3102].signedCount, byWf[3102].lastSignedAt], [1, '2026-06-21T10:00:01Z']);
+  assert.equal(byWf[3103].adobeStatus, 'SIGNED');
+  assert.match(byWf[3103].message, /regularizar/);
+  assert.deepEqual(byWf[3108].agreements.map((a) => a.id).sort(), ['AG-3108', 'AG-3108B']);
+  assert.equal(byWf[3107].agreement.id, 'AG-3107');
+
+  // nada foi cancelado nem gravado
+  assert.equal(world.calls.filter((c) => c[0] === 'adobe.cancelAgreement').length, 0);
+  assert.equal(world.adobe.cancelled.length, 0);
+  assert.equal(snapshot(world, ids), before, 'registros e histórico intactos');
+  assert.equal(world.otcs.updateFormCalls.length, 0);
+  assert.equal(world.otcs.modelCalls.filter((c) => c[0] === 'updateTaskForm').length, 0);
+  assert.equal(world.otcs.sendons.length, 0);
+  assert.equal(world.otcs.task('9001', 2).status, 'current');
+  await world.close();
+});
+
+test('prévia: histórico ilegível (abierto com partialUnknown; CANCELLED => no_disponible), já cancelado por nós e orçamento (pendiente)', async () => {
+  const world = await batchWorld(['3101', '3102']);
+  world.adobe.eventsError = httpError(500, 'events down');
+  world.adobe.agreements['AG-3102'].status = 'CANCELLED';
+  let body = await (await authThenCancel(world, undefined, { path: '/cancel/preview' })).json();
+  assert.deepEqual(body.items.map((i) => [i.state, i.cancelable, i.partialUnknown]), [
+    ['abierto', true, true], ['no_disponible', null, undefined]
+  ]);
+
+  // cancelado por nós (registro marcado): ya_cancelado sem ler o histórico, mesmo com ele indisponível
+  world.adobe.eventsError = null;
+  world.adobe.agreements['AG-3102'].status = 'OUT_FOR_SIGNATURE';
+  assert.equal((await authThenCancel(world)).status, 200);
+  seedCancelFlow(world, { fields: { 'ID Flujo a Cancelar': ['3101', '3102'] } }); // o SendOn concluiu a tarefa: reabre para a prévia
+  world.adobe.eventsError = httpError(500, 'events down');
+  body = await (await authThenCancel(world, undefined, { path: '/cancel/preview' })).json();
+  assert.deepEqual(body.items.map((i) => [i.state, i.cancelable]), [['ya_cancelado', true], ['ya_cancelado', true]]);
+
+  // orçamento: o 1º item gasta o tempo, o 2º não é consultado
+  const w2 = await batchWorld(['3101', '3102'], { env: { CANCEL_BATCH_BUDGET_MS: '5000' } });
+  const getAgreement = w2.adobe.getAgreement;
+  w2.adobe.getAgreement = async (id) => { const out = await getAgreement(id); w2.clock.advance(6000); return out; };
+  body = await (await authThenCancel(w2, undefined, { path: '/cancel/preview' })).json();
+  assert.deepEqual(body.items.map((i) => [i.workflowId, i.state, i.cancelable]), [['3101', 'abierto', true], ['3102', 'pendiente', null]]);
+  assert.deepEqual(body.summary, { total: 2, abierto: 1, pendiente: 1 });
+  assert.equal(w2.calls.filter((c) => c[0] === 'adobe.getAgreement' && c[1] === 'AG-3102').length, 0);
+  await world.close();
+  await w2.close();
+});
+
+test('prévia: com vários alvos o subflujo é ignorado; com um alvo desempata', async () => {
+  const world = await cancelWorld();
+  open(world, 'AG-1', { subworkflowId: '3004' });
+  open(world, 'AG-2', { subworkflowId: '3005' });
+
+  seedCancelFlow(world, { fields: { 'ID Subflujo a Cancelar': '3005' } });
+  let body = await (await authThenCancel(world, undefined, { path: '/cancel/preview' })).json();
+  assert.deepEqual([body.items[0].state, body.items[0].agreementId, body.subworkflowIgnored], ['abierto', 'AG-2', false]);
+
+  seedCancelFlow(world, { fields: { 'ID Flujo a Cancelar': '3003 4444', 'ID Subflujo a Cancelar': '3005' } });
+  body = await (await authThenCancel(world, undefined, { path: '/cancel/preview' })).json();
+  assert.deepEqual(body.items.map((i) => i.state), ['ambiguo', 'no_encontrado']);
+  assert.equal(body.subworkflowIgnored, true);
+  assert.equal(world.adobe.cancelled.length, 0);
   await world.close();
 });
 

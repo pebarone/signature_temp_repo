@@ -200,6 +200,7 @@ function computeConfig(env = process.env, { projectRoot = PROJECT_ROOT } = {}) {
       modelo do /start: Basic no /auth + HMAC v2 com nonce) e o orquestrador cancela o acordo do fluxo alvo no Adobe.
       enabled=false (padrão): POST /cancel responde 404. As rotas administrativas (POST /admin/cancel/:agreementId e
       POST /admin/cancel-workflow/:workflowId, Basic Auth) não dependem deste flag.
+      POST /cancel processa vários fluxos (lote) e POST /cancel/preview só os consulta (nada é cancelado nem gravado).
       Os nomes abaixo são PROVISÓRIOS: o mapa do workflow de cancelamento ainda não existe no Content.
     */
     cancel: {
@@ -210,10 +211,21 @@ function computeConfig(env = process.env, { projectRoot = PROJECT_ROOT } = {}) {
       fields: {
         targetWorkflow: str(env.CANCEL_FIELD_TARGET_WORKFLOW, 'ID Flujo a Cancelar'),
         // Opcional no formulário: sem valor, o acordo é procurado em todos os subprocessos do fluxo alvo
-        targetSubworkflow: str(env.CANCEL_FIELD_TARGET_SUBWORKFLOW, 'ID Subflujo a Cancelar')
+        targetSubworkflow: str(env.CANCEL_FIELD_TARGET_SUBWORKFLOW, 'ID Subflujo a Cancelar'),
+        // Atributo (multivalor) onde o lote grava os WorkIDs cancelados antes do SendOn; vazio desliga a gravação
+        result: str(env.CANCEL_FIELD_RESULT, 'IDs Cancelados')
       },
+      // Máximo de fluxos por pedido (o atributo é multivalor): 1..100
+      maxTargets: Math.min(100, Math.max(1, int(env.CANCEL_MAX_TARGETS, 20))),
+      // Prazo único do lote (ms): a rota do OpenShift corta perto de 30 s. A espera pela reconciliação de cada item também
+      // é limitada ao tempo restante; alvos não iniciados ao estourar ficam pendentes (o WebReport repete). Mínimo de 1 s.
+      batchBudgetMs: Math.max(1000, int(env.CANCEL_BATCH_BUDGET_MS, 15 * 1000)),
       // true => o Adobe avisa os signatários do cancelamento (agreementCancellationInfo.notifyOthers). Padrão: não avisa.
       notifySigners: bool(env.CANCEL_NOTIFY_SIGNERS, false),
+      // true => o lote do POST /cancel PARA (stop) o fluxo original no Content logo depois de o Adobe confirmar, item a item
+      // (otcs.stopProcess; nunca exclui nem arquiva). Padrão false: só o Adobe; o passo seguinte do workflow de cancelamento
+      // para o original lendo `IDs Cancelados`. Exige permissão do usuário de integração para parar processos.
+      stopOriginal: bool(env.CANCEL_STOP_ORIGINAL, false),
       // Espera máxima pela reconciliação do acordo que já estava em curso antes de cancelar (ms); estourou => 503
       settleTimeoutMs: Math.max(1000, int(env.CANCEL_SETTLE_TIMEOUT_MS, 20 * 1000))
     }

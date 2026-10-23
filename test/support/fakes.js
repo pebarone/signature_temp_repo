@@ -203,6 +203,11 @@ function makeOtcs(calls = []) {
     attributesFailure: null, // se definido, getWorkflowAttributes lança
     updateFormFailures: 0,
     updateFormCalls: [],
+    stopped: [],             // stopProcess aplicados (ids dos processos parados)
+    stopFailures: 0,         // próximos N stopProcess falham (e o processo NÃO é parado)
+    stopFailStatus: 403,
+    stopFailsButStops: 0,    // próximos N stopProcess falham, mas o OTCS aplicou o stop (resposta perdida)
+    processStatusFailure: null, // se definido, getProcessStatus lança
     // As 4 tarefas padrão de um subprocesso no estágio dado
     standardTasks(subprocessId, stage) {
       const sub = Number(subprocessId);
@@ -349,6 +354,32 @@ function makeOtcs(calls = []) {
       }
       otcs.updateFormCalls.push({ processId: Number(processId), subprocessId: Number(subprocessId), taskId: Number(taskId), values });
       return { ok: true };
+    },
+    // PUT /v2/processes/{id}/status status=stop: o processo passa a 'stopped'
+    async stopProcess(processId) {
+      otcs.modelCalls.push(['stopProcess', Number(processId)]);
+      const wf = otcs.workflows[String(processId)];
+      if (otcs.stopFailsButStops > 0) {
+        otcs.stopFailsButStops--;
+        if (wf) wf.status = 'stopped';
+        throw httpError(504, 'gateway timeout');
+      }
+      if (otcs.stopFailures > 0) {
+        otcs.stopFailures--;
+        throw httpError(otcs.stopFailStatus, 'no permission to change the status of the process');
+      }
+      if (!wf) throw httpError(400, 'process not found');
+      wf.status = 'stopped';
+      otcs.stopped.push(Number(processId));
+      return {};
+    },
+    // wf_details.status do processo ('ontime' enquanto ativo)
+    async getProcessStatus(processId) {
+      otcs.modelCalls.push(['getProcessStatus', Number(processId)]);
+      if (otcs.processStatusFailure) throw otcs.processStatusFailure;
+      const wf = otcs.workflows[String(processId)];
+      if (!wf) throw httpError(404, 'process not found');
+      return { status: wf.status || 'ontime', currentTasks: wf.tasks.filter((t) => t.status === 'current').length };
     },
     async sendOnWorkflow(args) {
       calls.push(['otcs.sendon', args.disposition || 'sendon', args.taskId]);
@@ -566,11 +597,12 @@ function seedStartFlow(world, { processId = '3003', subprocessId = '3004', stage
 
 /*
   Workflow de cancelamento no OTCS falso, na tarefa de cancelamento, com o formulário (atributos do workflow) apontando
-  para o fluxo a cancelar. `fields` sobrescreve/remove (null) atributos pelo rótulo; `assignee` (userId) é o dono das
+  para o fluxo a cancelar (e o atributo multivalor de resultado "IDs Cancelados", vazio). O valor de um atributo pode ser
+  lista (multivalor do forms API), escalar ou texto separado. `fields` sobrescreve/remove (null) atributos pelo rótulo; `assignee` (userId) é o dono das
   tarefas (padrão: usuário de integração). Devolve o workflow.
 */
 function seedCancelFlow(world, { processId = '9001', subprocessId = processId, stage = 'cancel', fields = {}, assignee = null } = {}) {
-  const base = { 'ID Flujo a Cancelar': '3003', 'ID Subflujo a Cancelar': '', ...fields };
+  const base = { 'ID Flujo a Cancelar': '3003', 'ID Subflujo a Cancelar': '', 'IDs Cancelados': [], ...fields };
   world.otcs.formFields = {};
   for (const [label, value] of Object.entries(base)) {
     if (value !== null) world.otcs.formFields[label] = { key: `k_${label.replace(/\W/g, '')}`, value };

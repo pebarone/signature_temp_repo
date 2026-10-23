@@ -36,12 +36,13 @@ function createApp({
     allowLegacy: config.startLegacySignature
   });
 
-  // POST /cancel (WebReport do workflow de cancelamento): só existe com CANCEL_ENABLED=true; desligado cai no 404 padrão
-  // (e nem o preflight CORS o responde)
+  // POST /cancel e POST /cancel/preview (WebReport do workflow de cancelamento): só existem com CANCEL_ENABLED=true;
+  // desligado caem no 404 padrão (e nem o preflight CORS os responde)
   const cancelEnabled = !!(config.cancel?.enabled && cancellationService);
 
   /*
-    CORS só para /auth, /start e (se ligado) /cancel (chamados pelo navegador, a partir do WebReport no OTCS). Origem não
+    CORS só para /auth, /start e (se ligado) /cancel e /cancel/preview (chamados pelo navegador, a partir do WebReport no
+    OTCS; app.use('/cancel') já cobre o subcaminho /cancel/preview, preflight inclusive). Origem não
     permitida não recebe Access-Control-Allow-Origin (o navegador bloqueia); webhook, admin, logs e health ficam sem CORS.
   */
   const corsOrigins = config.corsOrigins || [];

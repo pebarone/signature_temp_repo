@@ -268,8 +268,8 @@ function createOtcsClient({
   /*
     Para um processo: PUT /v2/processes/{process_id}/status com status=stop (form-urlencoded; valores da spec do OTCS:
     suspend, resume, stop, archive; 400 = sem permissão para mudar o status).
-    NÃO USADO: o fluxo de cancelamento (ticket 2026060410003715) deixa o workflow de cancelamento encerrar o fluxo original
-    no Content. Fica disponível como alternativa documentada em docs/DESIGN_TICKET_2026060410003715.md.
+    Usado pelo lote do POST /cancel só com CANCEL_STOP_ORIGINAL=true (ticket 2026060410003715); desligado, o workflow de
+    cancelamento encerra o fluxo original no Content. Ver docs/DESIGN_TICKET_2026060410003715.md.
   */
   const stopProcess = (processId) => withTicket(async (tck) => {
     const rsp = await http.put(`${base}/v2/processes/${encodeURIComponent(processId)}/status`, qs.stringify({ status: 'stop' }), {
@@ -279,9 +279,27 @@ function createOtcsClient({
     return rsp.data;
   });
 
+  /*
+    Estado do processo (workflow pai): GET /v2/workflows/status/processes/{process_id} (o mesmo da lista de passos), campo
+    results.wf_details.status. => { status: texto do OTCS ('' se ausente), currentTasks: nº de passos ativos (null se
+    ausente) }. VALIDAR NO QA o texto devolvido para um processo parado; serve para reconhecer "já parado" quando o stop falha.
+  */
+  const getProcessStatus = (processId) => withTicket(async (tck) => {
+    const rsp = await http.get(`${base}/v2/workflows/status/processes/${encodeURIComponent(processId)}`, {
+      headers: { OTCSTicket: tck },
+      timeout: timeoutMs
+    });
+    const data = rsp.data?.results || rsp.data || {};
+    const current = data.step_list?.current;
+    return {
+      status: scalar(data.wf_details?.status).trim(),
+      currentTasks: Array.isArray(current) ? current.length : null
+    };
+  });
+
   return {
     ensureTicket, downloadNode, uploadToFolder, addVersion, nodeExists, sendOnWorkflow, getProcessSteps, getTaskForm,
-    updateTaskForm, getWorkflowAttributes, getCurrentUser, stopProcess
+    updateTaskForm, getWorkflowAttributes, getCurrentUser, stopProcess, getProcessStatus
   };
 }
 

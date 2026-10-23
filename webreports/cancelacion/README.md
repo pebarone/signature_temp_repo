@@ -1,108 +1,237 @@
-# WebReport "Cancelar Flujo de Firma" (cancelamento)
+# WebReport de cancelamento (`webreports/cancelacion/`)
 
-Página: [`Cancelar Flujo de Firma.html`](Cancelar%20Flujo%20de%20Firma.html) (nova; ticket 2026060410003715).
-Modelo: [`../firma-flujo-puro/Requisicion de Firma.html`](../firma-flujo-puro/Requisicion%20de%20Firma.html) (mesma estrutura, mesmo
-bloco de configuração, mesmo ramo `reasignar`, mesmo estilo). Protocolo v2 e regra de reatribuição: [`../README.md`](../README.md).
-Contrato do servidor (`POST /cancel`, códigos de resposta, o que falta do lado Content):
-[`../../docs/DESIGN_TICKET_2026060410003715.md`](../../docs/DESIGN_TICKET_2026060410003715.md).
+Ticket 2026060410003715 (cancelamento de fluxos, em lote). Desenho e contrato do servidor:
+[`../../docs/DESIGN_TICKET_2026060410003715.md`](../../docs/DESIGN_TICKET_2026060410003715.md). Protocolo v2 e regra de
+reatribuição: [`../README.md`](../README.md). Nada daqui foi publicado nem executado no OTCS ainda.
 
-| | QA | PROD |
+| Arquivo | O que é | Fala com o orquestrador? |
 |---|---|---|
-| Nó do WebReport (`REPORT_ID`) | a criar (placeholder `REPORT_ID_POR_ASIGNAR` na página) | a criar |
-| Usuário de integração (linha `WFTASKACTION:REASSIGN`) | 11742766 (AdminKeralty) | ID do AdminKeralty de PROD |
+| [`Cancelar Flujo de Firma.html`](Cancelar%20Flujo%20de%20Firma.html) | **página única** da tarefa "Cancelar Flujo de Firma" (`CANCEL_TASK_NAMES`): seleção, gravação, revisão e cancelamento | sim: `/auth`, `/cancel/preview`, `/cancel` |
+| [`Cancelar Flujo de Firma.sql`](Cancelar%20Flujo%20de%20Firma.sql) | LiveReport que alimenta a etapa de seleção (fonte de dados do WebReport) | não |
 
-## O que a página faz
+Modelo da página: [`../firma-flujo-puro/Requisicion de Firma.html`](../firma-flujo-puro/Requisicion%20de%20Firma.html)
+(mesma estrutura, mesmo bloco de configuração, mesmo ramo `reasignar`, mesmo estilo).
 
-Roda na tarefa **"Cancelar Flujo de Firma"** do workflow de cancelamento (nome em `CANCEL_TASK_NAMES` do servidor).
+## Mapa do workflow (uma tarefa)
 
-1. Ao abrir, **não chama o servidor**. Lê os atributos da tarefa `ID Flujo a Cancelar` e `ID Subflujo a Cancelar`
-   (`&SUBWORKID WFATTR:"..."`, em `<textarea>` ocultos como a página do fluxo puro) e os **mostra** para o usuário confirmar,
-   com o aviso de que cancelar **perde qualquer assinatura parcial**.
-   Se o ID do fluxo não é numérico (o WebReport mostra `?` quando vazio) ou o subflujo não é numérico, mostra o erro e **não** oferece o botão.
-2. O botão **Cancelar flujo** faz `POST /auth` `{workflowId, subworkflowId}` (o workflow de **cancelamento**: `&WORKID`/`&SUBWORKID`)
-   e `POST /cancel` `{workflowId, subworkflowId, timestamp, nonce, signature}`. O fluxo a cancelar **não viaja** no corpo: o servidor
-   o lê do formulário da tarefa; o que a página mostra é só informativo.
-3. `409 REASSIGN_REQUIRED` (com `handoff`): reatribui pelo ramo `accion=reasignar` (mesmo ramo e mesma função da página do fluxo
-   puro) e repete `/auth` + `/cancel` **uma vez**; se responder `REASSIGN_REQUIRED` de novo, mostra "No fue posible asignar la tarea".
-4. O servidor, com o acordo cancelado, faz o SendOn da tarefa. Por isso não há passo de "confirmar atribuição" depois.
+`Início → "Cancelar Flujo de Firma" → Fim`. A tarefa roda o WebReport. O formulário dela tem `ID Flujo a Cancelar` (multivalor),
+`ID Subflujo a Cancelar` (opcional) e `IDs Cancelados` (multivalor, gravado pelo lote). Com `CANCEL_STOP_ORIGINAL=false` (padrão)
+há um passo extra, "Detener flujos originales", entre a tarefa e o Fim; com `true` ele não é necessário (ver abaixo).
 
-### Respostas e mensagens (tudo em espanhol na página)
+## Fluxo da página
 
-| Resposta | Mensagem da página | Reintentar |
+Um só WebReport com ramos por `accion`: `guardar`, `leer` e `reasignar` (cada um só roda com a sua `accion`); sem `accion`, mostra a
+página (ELSE). Fonte de dados = o LiveReport. As etapas ficam na mesma página, nesta ordem.
+
+**Ao abrir**, a página lê `ID Flujo a Cancelar` (`WFATTR`, em `<textarea>` oculto) e **não chama o servidor**:
+- atributo **vazio** (o OTCS mostra `?`): vai para a etapa A;
+- atributo **com IDs** (reabertura, por exemplo pendentes de um lote anterior, ou IDs colados à mão): mostra os IDs e oferece
+  **"Revisar flujos"** (direto para a etapa C, sem regravar) e **"Cambiar selección"** (etapa A, já com esses IDs marcados).
+
+**A. Buscar e marcar.** O LiveReport lista as tarefas "Aguardar Firma" ativas. Filtros: ID do empregado, nome, cédula, documento,
+desde e hasta (parâmetros de URL `idempleado`, `nombre`, `cedula`, `documento`, `desde`, `hasta`; vazio = sem filtro). Tabela com
+checkboxes, "Seleccionar todos" e contador "Seleccionados: N de 20" (`MAX_FLUJOS`; passando dele a página não deixa marcar mais).
+A seleção fica em sessionStorage entre buscas (sem ele, só em memória). Um aviso diz que a revisão pode transferir a tarefa ao
+usuário de integração.
+
+**B. Gravar e conferir (antes de qualquer chamada ao servidor).** "Revisar N flujos" abre um modal com a lista; ao aceitar:
+1. valida no cliente (só dígitos, 1 a `MAX_FLUJOS`, sem repetidos);
+2. ramo `accion=guardar&ids=1,2,3&lista='1','2','3'` (`SETWFATTR`, forma de lista), resposta `GUARDADO_OK`;
+3. ramo `accion=leer` (só leitura): `LEIDO_OK` seguido dos valores do atributo, que devem ser **exatamente** os IDs enviados.
+Se a seleção for igual ao que já está gravado, a página não regrava. Só segue se a verificação bater.
+**Plano C** (falha, resposta sem confirmação, valor diferente ou não verificável): a página **não chama o servidor**, mostra os IDs e
+"Copiar IDs", e pede para colá-los no campo `ID Flujo a Cancelar` do formulário, guardar o formulário e recarregar a tarefa (F5):
+ao reabrir, a página mostra os IDs gravados e oferece a revisão.
+
+**C. Revisar.** `POST /auth` (workflow de cancelamento) e `POST /cancel/preview`; nada é cancelado nem gravado. Grupos:
+- **Se cancelarán**: `cancelable: true` (`abierto`, `firma_parcial`, `ya_cancelado`). Firma parcial mostra o aviso, a quantidade de
+  firmas e a data da última;
+- **Firmados — regularizar, no cancelar** (bloco destacado): `firmado`;
+- **No se cancelarán**: os demais, com o motivo (`rechazado`, `no_cancelable`, `concluido`, `ambiguo`, `no_encontrado`,
+  `no_existe_en_adobe`);
+- **No se pudieron revisar**: `no_disponible` e `pendiente`, com "Revisar de nuevo";
+- `resultFieldMissing: true`: erro de configuração (falta `IDs Cancelados` no formulário); não há botão de confirmar;
+- `subworkflowIgnored: true`: nota de que o subflujo foi ignorado;
+- `stopOriginal`: ajusta o texto de confirmação (ver "Parada do fluxo original").
+A prévia também oferece **"Cambiar selección"**.
+
+**D. Confirmar e cancelar.**
+- Com algum `firma_parcial`, o checkbox de ciência é obrigatório (o botão fica bloqueado até marcá-lo).
+- Botão "Cancelar estos N flujos", ou "Continuar sin cancelar ninguno" quando N é 0. Aviso: o servidor relê o atributo e processa
+  **todos** os fluxos da lista, não só os cancelables da prévia.
+- `POST /auth` e `POST /cancel`. Resultado item a item, com `contentStop`. Com `complete: false`, "Reintentar pendientes" repete a
+  partir de um `/auth` novo (idempotente no servidor). Com `complete: true`, a tarefa continua e a página diz que pode fechar a janela.
+
+**Reatribuição.** `409 REASSIGN_REQUIRED` (com `handoff`) na prévia ou no cancelamento dispara o ramo `accion=reasignar` (linha
+`WFTASKACTION:REASSIGN`) e repete a chamada uma vez, com `/auth` novo. Se falhar de novo: "No fue posible asignar la tarea".
+**A revisão transfere a tarefa ao AdminKeralty** quando ela ainda estava com o usuário: a página avisa (na etapa A, no modal e na
+prévia) para não fechar até terminar; fechar antes deixa a tarefa com o AdminKeralty.
+
+**Risco de "Cambiar selección" depois da revisão (VALIDAR NO QA).** Com a tarefa já no AdminKeralty, o usuário humano pode não ter
+mais permissão para gravar o atributo: o ramo `guardar` falha (ou o valor não muda) e a página cai no plano C com a explicação.
+Nesse caso é preciso colar os IDs à mão (se o formulário ainda permitir) ou pedir ao AdminKeralty/soporte que ajuste a tarefa.
+Mudar a seleção antes da primeira revisão não tem esse problema.
+
+## Mensagens da página por código
+
+Textos em espanhol, como na página. "Reintentar" diz se o botão faz sentido. Os erros da lista (`MISSING_TARGET`, `INVALID_TARGET`,
+`TOO_MANY_TARGETS`) também mostram "Cambiar selección".
+
+| Código (ou status) | Mensagem (resumo) | Reintentar |
 |---|---|---|
-| `200 { id, alreadyCancelled: false }` | "Flujo cancelado en Adobe Sign. El flujo de cancelación continúa." + ID do acordo | — |
-| `200 { id, alreadyCancelled: true }` | "El acuerdo ya estaba cancelado en Adobe Sign. El flujo de cancelación continúa." + ID | — |
-| `404 AGREEMENT_NOT_FOUND` | "No se encontró un acuerdo de firma para este flujo." + dica (acordo do orquestrador antigo: soporte adota com `POST /admin/adopt/{id}`) | sim |
-| `404 AGREEMENT_NOT_FOUND_IN_ADOBE` | "El acuerdo ya no existe en Adobe Sign..." | não |
-| `409 AMBIGUOUS` | "El flujo tiene más de un acuerdo de firma abierto. No se canceló ninguno." + **lista** (id, subflujo, documento, estado, criado) | não |
-| `409 AGREEMENT_CLOSED` | "El acuerdo más reciente de este flujo ya concluyó; no hay nada que cancelar." + resumo do acordo | não |
-| `409 ALREADY_SIGNED` | "El acuerdo ya fue firmado por todos en Adobe Sign; no se puede cancelar." | não |
-| `409 ALREADY_REJECTED` | "Un firmante ya rechazó el acuerdo en Adobe Sign; no se puede cancelar. El flujo original recibirá el rechazo." | não |
-| `409 NOT_CANCELABLE` | "El acuerdo está en un estado en el que Adobe Sign no permite cancelarlo." + `Estado en Adobe Sign: <adobeStatus>` | não |
-| `409 IN_PROGRESS` | "Ya hay una cancelación en curso para este acuerdo..." | sim |
-| `409 NOT_AT_CANCEL_STEP` | "El flujo de cancelación no está en el paso ..." | não |
-| `409 FLOW_NOT_FOUND` | "No se encontró el flujo de cancelación en Content Server." | não |
-| `409 REASSIGN_REQUIRED` | reatribui e repete uma vez (ver acima); sem `handoff`: "No fue posible asignar la tarea." | sim |
-| `422 MISSING_TARGET` / `INVALID_TARGET` | pede completar/corrigir o atributo `ID Flujo a Cancelar` / `ID Subflujo a Cancelar` | não |
-| `503 ADOBE_UNAVAILABLE` / `OTCS_UNAVAILABLE` / `RECONCILE_IN_PROGRESS` | "... No se modificó nada; intente nuevamente." | sim |
-| `503 SENDON_FAILED` | "El acuerdo ya fue cancelado en Adobe Sign, pero no se pudo continuar el flujo de cancelación." + "Repetir es seguro" | sim |
-| `404` sem `code` | "La cancelación de flujos no está habilitada en el servidor." (`CANCEL_ENABLED=false`) | não |
-| `500`, `400/401/403` sem `code`, outros | mensagem do servidor (ou texto padrão) | sim |
-| falha de rede | "No se pudo conectar con el servidor de firmas." | sim |
+| `AGREEMENT_NOT_FOUND` | No se encontró un acuerdo de firma; soporte adopta con `POST /admin/adopt/{id}` | sim |
+| `AGREEMENT_NOT_FOUND_IN_ADOBE` | El acuerdo ya no existe en Adobe Sign; no hay nada que cancelar | não |
+| `AMBIGUOUS` | Más de un acuerdo abierto; no se canceló ninguno. Cancelar por separado: un flujo en "ID Flujo a Cancelar" y el subflujo en "ID Subflujo a Cancelar" | não |
+| `AGREEMENT_CLOSED` | El acuerdo más reciente de este flujo ya concluyó | não |
+| `ALREADY_SIGNED` | El acuerdo ya fue firmado por todos; no se puede cancelar. Regularizar el flujo | não |
+| `ALREADY_REJECTED` | Un firmante rechazó el acuerdo; el flujo original recibirá el rechazo | não |
+| `NOT_CANCELABLE` | El estado del acuerdo en Adobe Sign no permite cancelarlo | não |
+| `IN_PROGRESS` | Ya hay una cancelación en curso para este acuerdo | sim |
+| `BUDGET_EXCEEDED` | No alcanzó el tiempo para este flujo; los ya cancelados no se vuelven a cancelar | sim |
+| `UNEXPECTED_ERROR` | Error inesperado; si persiste, avisar a soporte | sim |
+| `STOP_FAILED` (item `pending`, `cancelledInAdobe: true`) | Cancelado en Adobe Sign; falta detener el flujo en Content Server. Revisar permisos del usuario de integración | sim (Adobe no se cancela de nuevo) |
+| `NOT_AT_CANCEL_STEP` | El flujo no está en el paso "Cancelar Flujo de Firma" (quizá ya se completó) | não |
+| `FLOW_NOT_FOUND` | No se encontró el flujo de cancelación en Content Server | não |
+| `MISSING_TARGET` / `INVALID_TARGET` / `TOO_MANY_TARGETS` | Seleccionar o corregir "ID Flujo a Cancelar" (solo números; máximo de flujos del servidor) | não (cambiar selección) |
+| `ADOBE_UNAVAILABLE` / `OTCS_UNAVAILABLE` / `RECONCILE_IN_PROGRESS` | Adobe Sign, Content o sincronización no disponibles; no se modificó nada | sim |
+| `RESULT_FIELD_MISSING` | Error de configuración: falta "IDs Cancelados" en el formulario; no se canceló nada ni se avanzó | sim, tras corregir |
+| `RESULT_WRITE_FAILED` | Los flujos se procesaron, pero no se registró la lista de cancelados; no se avanzó la tarea | sim (es seguro) |
+| `SENDON_FAILED` | Los acuerdos ya fueron cancelados, pero no se pudo continuar el flujo de cancelación | sim (es seguro) |
+| `REASSIGN_REQUIRED` | Reasigna la tarea y repite una vez | sim |
+| 404 sin `code` | La cancelación de flujos no está habilitada en el servidor (`CANCEL_ENABLED=false`) | não |
+| falha de rede | No se pudo conectar con el servidor de firmas | sim |
+| plano C: `guardar` sem `GUARDADO_OK` | No se pudo guardar la selección (OpenText no confirmó); se muestran los IDs para pegarlos a mano | — |
+| plano C: `leer` não bate | El atributo no refleja la selección | — |
+| plano C: `leer` não verificável | No se pudo verificar la selección guardada | — |
+| `REPORT_ID` placeholder | Datos de la tarea inválidos (guardar) / Datos de reasignación inválidos (reasignar) | — |
 
-`AGREEMENT_NOT_FOUND_IN_ADOBE` não está na tabela do design, mas o serviço o emite (`cancellationService.js`), então a página o trata.
+## Parada do fluxo original (`CANCEL_STOP_ORIGINAL`)
 
-## O que mudar por ambiente (PROD)
+- Com `CANCEL_STOP_ORIGINAL=true` o orquestrador **para** (stop, nunca exclui nem arquiva) o fluxo original no Content, item a
+  item, logo depois de o Adobe confirmar o cancelamento. Então o passo "Detener flujos originales" do mapa **não é necessário** (e
+  não deve rodar junto, para não parar duas vezes). O texto da prévia diz: "Al confirmar, los flujos se cancelan en Adobe Sign y se
+  detienen en Content Server". Cada item do resultado mostra `contentStop`: "Detenido en Content", "Ya estaba detenido" ou
+  "No se pudo detener" (`disabled` não mostra nada).
+- Com o flag desligado (padrão): só o Adobe é cancelado, e há um **passo extra entre a tarefa e o Fim** que para os WorkIDs de
+  `IDs Cancelados`. Texto da prévia: "Los flujos se cancelan solo en Adobe Sign; el flujo original se detiene en el paso siguiente".
+- Se o stop falhar, o item fica `pending` (`STOP_FAILED`): nada é gravado nem há SendOn até repetir ("Reintentar pendientes"; o
+  Adobe não é cancelado de novo, só o stop é refeito).
+- O usuário de integração (AdminKeralty) precisa de permissão para parar processos (o OTCS responde 400 sem ela).
 
-Dois lugares: o bloco **CONFIGURACAO POR AMBIENTE** no topo do script e a linha `WFTASKACTION:REASSIGN` do ramo `reasignar`.
+## Configuração por ambiente
+
 Os itens comuns (`SERVER_URL`, usuário de integração, Basic, CORS) estão em
-[`../README.md`](../README.md#o-que-muda-em-prod-comum). Específicos desta página:
+[`../README.md`](../README.md#o-que-muda-em-prod-comum). Específicos desta página (bloco **CONFIGURACION POR AMBIENTE** do script
+e linha `WFTASKACTION:REASSIGN`):
 
-1. `REPORT_ID`: ID do nó do WebReport no ambiente. No repositório fica o placeholder `REPORT_ID_POR_ASIGNAR` (não é numérico:
-   enquanto não for trocado, a reatribuição falha com "Datos de reasignación inválidos" em vez de chamar um relatório errado).
-2. `BASIC_USER`/`BASIC_PASS`: placeholders `ADOBE-LOGS`/`ADOBE-LOGS-PASS`, iguais aos das outras páginas; o valor real só entra no WebReport publicado.
-3. Os nomes dos atributos lidos (`ID Flujo a Cancelar`, `ID Subflujo a Cancelar`) estão nas duas tags `WFATTR` do HTML e devem ser
-   **iguais** a `CANCEL_FIELD_TARGET_WORKFLOW` / `CANCEL_FIELD_TARGET_SUBWORKFLOW` do servidor (nomes provisórios). Mudou um lado, mude o outro.
-4. A página não tem botão de retorno nem `RETURN_URL` (o cancelamento não parte do SuccessFactors): ao terminar, diz que pode fechar a janela.
+| Valor | Onde | Observação |
+|---|---|---|
+| `REPORT_ID` | script | ID do nó deste WebReport no ambiente; usado pelos ramos `guardar`, `leer` e `reasignar`. Placeholder `REPORT_ID_POR_ASIGNAR`: sem ID numérico, a gravação e a reatribuição não rodam |
+| `MAX_FLUJOS` | script | Deve ser igual a `CANCEL_MAX_TARGETS` do servidor (padrão 20) |
+| `SERVER_URL`, `BASIC_USER`, `BASIC_PASS` | script | por ambiente; `ADOBE-LOGS` / `ADOBE-LOGS-PASS` são placeholders |
+| usuário de integração | linha `WFTASKACTION:REASSIGN` do ramo `reasignar` | QA: 11742766 (AdminKeralty); PROD: ID do AdminKeralty de PROD |
+| nomes dos atributos | tags `WFATTR` / `SETWFATTR` e constante `ATRIBUTO` | `ID Flujo a Cancelar` / `ID Subflujo a Cancelar` iguais a `CANCEL_FIELD_TARGET_*` do servidor |
+
+Lado do servidor (ConfigMap): `CANCEL_ENABLED`, `CANCEL_TASK_NAMES`, `CANCEL_FIELD_TARGET_WORKFLOW`,
+`CANCEL_FIELD_TARGET_SUBWORKFLOW`, `CANCEL_FIELD_RESULT` (padrão `IDs Cancelados`), `CANCEL_MAX_TARGETS` (padrão 20),
+`CANCEL_STOP_ORIGINAL` (padrão `false`), `CANCEL_BATCH_BUDGET_MS` (padrão 15000, prazo único do lote), `CANCEL_SETTLE_TIMEOUT_MS`
+(padrão 20000). Ver a tabela no design.
+
+## LiveReport (`Cancelar Flujo de Firma.sql`)
+
+- **Não foi executado em nenhum OTCS.** Os placeholders `<<TABLA_ATRIBUTOS>>`, `<<STATUS_TAREA_ACTIVA>>` e `<<ATTR_*>>` são
+  propositais: o arquivo não é SQL válido até serem preenchidos. As consultas de ajuda no fim do arquivo servem para
+  descobri-los no QA, uma a uma, com um WorkID conhecido.
+- Colunas, na ordem (a página lê por posição, `[LL_REPTAG_1]` a `[LL_REPTAG_8]`): 1 `WorkID`, 2 `SubWorkID`, 3 `Titulo`,
+  4 `Fecha`, 5 `IDEmpleado`, 6 `Nombre`, 7 `Cedula`, 8 `Documento`. A coluna 9 `DataID` existe só para a checagem de
+  permissão do LiveReport; a página não a usa.
+- Parâmetros `:A1` a `:A6` (idempleado, nombre, cedula, documento, desde, hasta). Todos aceitam vazio (sem filtro).
+- Dialeto: a versão Oracle está ativa; as linhas de SQL Server estão comentadas. Falta validar qual banco o ambiente usa.
+- O LiveReport também roda nos ramos `guardar`, `leer` e `reasignar` (o WebReport sempre executa a fonte); as linhas só são
+  emitidas na página.
 
 ## Checklist de QA
 
 Roteiro do design (acordo de teste `OUT_FOR_SIGNATURE`). Nada disto foi validado no OTCS ainda.
 
-- [ ] Servidor com `CANCEL_ENABLED=true` e o WebReport publicado (com `CANCEL_ENABLED=false`, o clique mostra "no está habilitada").
-- [ ] Ao abrir, a página mostra os valores de `ID Flujo a Cancelar` / `ID Subflujo a Cancelar` (`[LL_REPTAG_&SUBWORKID WFATTR:"...":DISPLAY /]`
-      resolve) e **não** faz nenhum pedido ao servidor antes do clique (DevTools, aba Network).
-- [ ] Atributo vazio (o OTCS mostra `?`): erro "no tiene el ID del flujo a cancelar", sem botão.
-- [ ] Cancelar um acordo `OUT_FOR_SIGNATURE`: acordo `CANCELLED` no Adobe, SendOn da tarefa de cancelamento, fluxo original **sem**
-      `Rechazado` indevido (o `AGREEMENT_RECALLED` não gera disposição).
-- [ ] Repetir (idempotência): segundo clique/recarga mostra "ya estaba cancelado" (200 `alreadyCancelled`) ou `NOT_AT_CANCEL_STEP` se a tarefa já avançou.
-- [ ] Fluxo ambíguo (dois acordos abertos): lista os acordos e não cancela nenhum.
+- [ ] Servidor com `CANCEL_ENABLED=true` e a página publicada. Com `CANCEL_ENABLED=false`, o clique em "Revisar" mostra "no está habilitada".
+- [ ] Mapa de uma tarefa (Início → "Cancelar Flujo de Firma" → Fim), com o campo `IDs Cancelados` no formulário.
+- [ ] Seleção: filtros funcionam; limite de 20 (ou o `CANCEL_MAX_TARGETS`); a seleção sobrevive a uma nova busca.
+- [ ] Seleção: um usuário sem permissão sobre um fluxo não o vê (checagem do LiveReport; ver VALIDAR NO QA, item 9).
+- [ ] "Revisar N flujos": grava `ID Flujo a Cancelar`, `LEIDO_OK` confere os valores, e **só então** aparece a primeira chamada ao
+      servidor (DevTools, aba Network: `guardar` e `leer` antes de `/auth`).
+- [ ] Plano C: simular `leer` com valor diferente / `guardar` sem `GUARDADO_OK`: nenhuma chamada ao servidor; "Copiar IDs"; colar no
+      formulário, guardar, F5: a página reabre mostrando os IDs.
+- [ ] Reabertura com IDs gravados (por exemplo, pendentes de um lote anterior): mostra os IDs, "Revisar flujos" vai direto à prévia
+      sem regravar, "Cambiar selección" volta à seleção com esses IDs marcados.
+- [ ] "Cambiar selección" **depois da revisão**, com a tarefa já no AdminKeralty: o que acontece com a gravação (esperado: pode
+      falhar e cair no plano C com a explicação). Registrar o comportamento real.
+- [ ] A revisão transfere a tarefa ao AdminKeralty (`REASSIGN_REQUIRED` → ramo `reasignar` → `REASIGNADO_OK` → repete) e o aviso aparece.
+- [ ] Atributo com valor não numérico: o servidor responde `INVALID_TARGET` e a página oferece "Cambiar selección".
+- [ ] Prévia: cada grupo aparece com o item certo; firma parcial exige a ciência; firmado fica fora do botão de confirmar.
+- [ ] Lote misto (cancelado, firmado, não encontrado): só os cancelados vão para `IDs Cancelados`; SendOn; o passo seguinte
+      (se houver) para só os WorkIDs de `IDs Cancelados`.
+- [ ] Acordo `OUT_FOR_SIGNATURE`: acordo `CANCELLED` no Adobe; fluxo original **sem** `Rechazado` indevido (o
+      `AGREEMENT_RECALLED` não gera disposição).
+- [ ] `CANCEL_STOP_ORIGINAL=true`: a prévia mostra "se detienen en Content Server"; após cancelar, o processo original aparece
+      parado no Content e o item mostra "Detenido en Content"; o passo "Detener flujos originales" não é usado.
+- [ ] Permissão do AdminKeralty para parar processos: com a permissão removida, o item vira `STOP_FAILED` ("falta detener"), sem
+      gravar `IDs Cancelados` nem SendOn; restaurada, "Reintentar pendientes" para o processo sem cancelar o Adobe de novo.
+- [ ] Repetição com o processo já parado: "Ya estaba detenido". Flag desligado: a prévia diz "se detiene en el paso siguiente".
+- [ ] Repetir (idempotência): `alreadyCancelled` ou `NOT_AT_CANCEL_STEP`, conforme o passo.
+- [ ] Fluxo ambíguo: não cancela nenhum; a página orienta cancelar sozinho, com o subflujo.
 - [ ] Fluxo já assinado: "ya fue firmado", nada cancelado.
-- [ ] Tarefa ainda com o usuário humano: `REASSIGN_REQUIRED` → reatribui pelo ramo `reasignar` (resposta `REASIGNADO_OK`) → repete e cancela.
-      Ramo `reasignar`: abrir `…?func=ll&objAction=RunReport&objId=<REPORT_ID>&workid=<W>&subworkid=<S>&taskid=<T>&accion=reasignar` e conferir.
-- [ ] `SENDON_FAILED` (simular no QA): a página avisa que o acordo já foi cancelado e Reintentar conclui sem cancelar de novo.
-- [ ] Sem `REASIGNADO_OK` na página normal (abrir a URL do WebReport sem `accion`).
+- [ ] Lote com `CANCEL_BATCH_BUDGET_MS` baixo: itens `BUDGET_EXCEEDED` (pendientes), sem gravar; "Reintentar pendientes" conclui.
+- [ ] `RESULT_FIELD_MISSING` (campo removido no QA): erro de configuração, nada cancelado; a prévia traz `resultFieldMissing`.
+- [ ] `RESULT_WRITE_FAILED` e `SENDON_FAILED` simulados: "Reintentar" conclui sem cancelar de novo.
+- [ ] Ramo `reasignar`: abrir `…?func=ll&objAction=RunReport&objId=<REPORT_ID>&workid=<W>&subworkid=<S>&taskid=<T>&accion=reasignar` e conferir.
+- [ ] Sem `accion`, a URL do WebReport só mostra a página (sem `GUARDADO_OK`, `LEIDO_OK` nem `REASIGNADO_OK`, sem gravação).
+
+## VALIDAR NO QA
+
+1. Formato de exibição do multivalor em `WFATTR ...:DISPLAY` (a página só extrai os números, para mostrar e comparar).
+2. `SETWFATTR`: existência e sintaxe (prefixo `&SUBWORKID`), forma `{[LL_REPTAG_&LISTA /]}`, e se funciona na tarefa em andamento.
+   Alternativas no comentário do arquivo: prefixo com lista de dois elementos (workid e subworkid), ou valor único com os
+   IDs separados por vírgula (o servidor aceita as duas).
+3. Segurança do ramo `guardar`: `ids` e `lista` entram como texto na tag (risco de injeção de tags). Procurar um operador de
+   padrão no `LL_WEBREPORT_IF`; se não houver, validar o formato (dígitos separados por vírgula) antes da tag. O GET com a
+   sessão do usuário é alcançável por link: restringir o WebReport a um grupo.
+4. `LL_WEBREPORT_STARTROW`/`ENDROW` e `[LL_REPTAG_1..8]` dentro dos três IF aninhados.
+5. Parâmetros de URL mapeados na aba Parameters (se faltar, pode sair vazio, `?` ou literal; a página trata).
+6. `&WORKID`, `&SUBWORKID` e `&TASKID` disponíveis na tarefa quando o WebReport abre.
+7. Formulário aberto pode sobrescrever o atributo ao enviar a tarefa; e se o formulário permite guardar sem enviar (plano C).
+8. Forma do array que o servidor envia a `IDs Cancelados` (`updateTaskForm`), e a leitura desse atributo multivalor pelo
+   servidor: não validadas no OTCS.
+9. Permissões do LiveReport: nome da opção de checagem e se o LiveReport exclui as linhas sem permissão; alternativa é
+   restringir por grupo. Os dois candidatos para a coluna 9 (DocID do contrato, DataID do mapa) estão no `.sql`.
+10. `REPORT_ID_POR_ASIGNAR` bloqueia a gravação e a reatribuição até ser trocado.
+11. SQL inteiro: tabelas e colunas, tabela de atributos, código de tarefa ativa, IDs de atributos e dialeto.
+12. Gravar o atributo depois que a tarefa foi transferida ao AdminKeralty ("Cambiar selección" pós-revisão): permissão do usuário
+    humano sobre a tarefa; ver o risco acima.
+13. Valores de status do processo usados pelo servidor para reconhecer "já parado" (`CANCEL_STOP_ORIGINAL`) e a permissão do
+    AdminKeralty para parar processos.
 
 ## Pendiente
 
-Pontos em que a página precisaria de algo que o servidor ou o mapa do Content ainda não fazem. Nada foi inventado na página:
-
-- **Nó do WebReport e mapa do workflow de cancelamento não existem no Content** (ver "O que falta do lado Content" no design):
-  atributos `ID Flujo a Cancelar` / `ID Subflujo a Cancelar` no formulário, tarefa com o nome de `CANCEL_TASK_NAMES`, tarefa seguinte que
-  cancela o fluxo original. `REPORT_ID` é placeholder até publicar.
-- **Aviso de assinatura parcial é genérico.** O `/cancel` não informa, antes de cancelar, quem já assinou nem o estado do acordo
-  (ponto 4 de "Em aberto" do design). Para mostrar "Fulano já assinou" o servidor precisaria de uma consulta prévia (sem efeito); hoje a
-  página só avisa que a assinatura parcial se perde.
-- **A página não valida o fluxo alvo no OTCS** (existe? está em "Aguardar Firma"?): o design deixa isso aberto ("Quem informa o ID e como é
-  validado"). Só o servidor responde `AGREEMENT_NOT_FOUND`/`AGREEMENT_CLOSED` depois do clique.
-- **`AMBIGUOUS` não é resolvível na página.** O servidor só aceita o subflujo vindo do atributo do formulário; a página lista os acordos
-  e pede corrigir `ID Subflujo a Cancelar` e abrir de novo (os valores mostrados são lidos no carregamento). Escolher o acordo na página
-  exigiria o servidor aceitar um alvo vindo do navegador, o que ele ignora de propósito.
-- **`AGREEMENT_NOT_FOUND`** de acordos do orquestrador antigo: a dica (adoção via `POST /admin/adopt/:id`, rota administrativa) é só
-  texto; não há como adotar pela página.
-- **Reabrir a página depois da reatribuição:** a tarefa sai do usuário humano; se ele recarregar a página antes do cancelamento
-  concluir, a leitura de `WFATTR`/`NOT_AT_CANCEL_STEP` depende de permissões do OTCS que não foram validadas.
-- **Não validado:** todo o comportamento das tags OTCS (`WFATTR`, `&ACCION`, forma entre aspas do `WFTASKACTION:REASSIGN`,
-  `URLPREFIXFULL`) é herdado da página do fluxo puro, mas só se confirma no QA. A página também não foi executada contra o servidor real:
-  só foi verificada a sintaxe do script e uma simulação com DOM/`fetch` falsos.
-- `PUT /agreements/{id}/state` do Adobe, `notifyOthers` e o evento `AGREEMENT_RECALLED` seguem pendentes de validação no QA (ponto 13 de "Em aberto").
+- **Nó do WebReport e mapa do workflow de cancelamento não existem no Content.** Faltam os atributos `ID Flujo a Cancelar`,
+  `IDs Cancelados` e `ID Subflujo a Cancelar` no formulário, a tarefa com o nome de `CANCEL_TASK_NAMES` e, com
+  `CANCEL_STOP_ORIGINAL=false`, o passo que para só os WorkIDs de `IDs Cancelados`. `REPORT_ID` é placeholder até publicar.
+- **LiveReport não executado** e com placeholders `<<...>>`.
+- **Aviso de firma parcial** mostra a quantidade e a data, mas o servidor não bloqueia o cancelamento: a página só exige
+  ciência. Decisão pendente (ver o design, "Em aberto", item 4).
+- **Fluxo ambíguo** não se resolve na página: o servidor só aceita subflujo com um fluxo, e a página não grava
+  `ID Subflujo a Cancelar`. Ela orienta cancelar esse fluxo sozinho, com o subflujo.
+- **Acordos do orquestrador antigo** (`no_encontrado`): a dica (adoção via `POST /admin/adopt/:id`, rota administrativa) é só
+  texto; a página não adota.
+- **Reabrir a página depois da reatribuição:** a tarefa sai do usuário humano. Se a página for recarregada antes de o
+  cancelamento concluir, a leitura de `WFATTR` e a resposta `NOT_AT_CANCEL_STEP` dependem de permissões do OTCS não validadas.
+- **Plano C** (copiar e colar) depende do formulário aberto; não foi testado.
+- **Não validado:** todo o comportamento das tags OTCS (`WFATTR`, `SETWFATTR`, `&ACCION`, a forma entre aspas do
+  `WFTASKACTION:REASSIGN`, `URLPREFIXFULL`), herdado da página do fluxo puro, só se confirma no QA. A página não foi
+  executada contra o servidor real: só a sintaxe do script e uma simulação com DOM e `fetch` falsos.
+- **Exclusão do fluxo original** não está implementada nem decidida (ver o design, "Em aberto", item 5).
+- **Orçamento de tempo x timeout da rota:** o servidor usa um prazo único de 15 s por pedido (a espera pela reconciliação
+  de cada item também é limitada ao tempo restante); o pior caso normal fica abaixo dos ~30 s da rota. Falta medir no QA
+  (ver o design, "Em aberto", item 16).
+- `PUT /agreements/{id}/state` do Adobe, `notifyOthers` e o evento `AGREEMENT_RECALLED` seguem pendentes de validação no QA
+  (ver o design, "Em aberto", item 13).
