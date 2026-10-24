@@ -40,7 +40,8 @@ usuário de integração.
 
 **B. Gravar e conferir (antes de qualquer chamada ao servidor).** "Revisar N flujos" abre um modal com a lista; ao aceitar:
 1. valida no cliente (só dígitos, 1 a `MAX_FLUJOS`, sem repetidos);
-2. ramo `accion=guardar&ids=1,2,3&lista='1','2','3'` (`SETWFATTR`, forma de lista), resposta `GUARDADO_OK`;
+2. ramo `accion=guardar&ids=1,2,3` (`WFACTION:REMOVEATTR:...:ALL` e `WFACTION:SETATTR:MV:"ID Flujo a Cancelar":1:<ids>`, um
+   valor com os IDs separados por vírgula), resposta `GUARDADO_OK`;
 3. ramo `accion=leer` (só leitura): `LEIDO_OK` seguido dos valores do atributo, que devem ser **exatamente** os IDs enviados.
 Se a seleção for igual ao que já está gravado, a página não regrava. Só segue se a verificação bater.
 **Plano C** (falha, resposta sem confirmação, valor diferente ou não verificável): a página **não chama o servidor**, mostra os IDs e
@@ -236,13 +237,24 @@ Roteiro do design (acordo de teste `OUT_FOR_SIGNATURE`). Nada disto foi validado
 ## VALIDAR NO QA
 
 1. Formato de exibição do multivalor em `WFATTR ...:DISPLAY` (a página só extrai os números, para mostrar e comparar).
-2. `SETWFATTR`: existência e sintaxe (prefixo `&SUBWORKID`), forma `{[LL_REPTAG_&LISTA /]}`, e se funciona na tarefa em andamento.
-   Alternativas no comentário do arquivo: prefixo com lista de dois elementos (workid e subworkid), ou valor único com os
-   IDs separados por vírgula (o servidor aceita as duas).
-3. Segurança do ramo `guardar`: `ids` e `lista` entram como texto na tag (risco de injeção de tags). Procurar um operador de
-   padrão no `LL_WEBREPORT_IF`; se não houver, validar o formato (dígitos separados por vírgula) antes da tag. O GET com a
-   sessão do usuário é alcançável por link: restringir o WebReport a um grupo.
-4. `LL_WEBREPORT_STARTROW`/`ENDROW` e `[LL_REPTAG_1..8]` dentro dos três IF aninhados.
+2. **Gravação: `WFACTION:SETATTR`, não `SETWFATTR`.** Pela documentação do WebReports, o `SETWFATTR` só grava num WebReport
+   com destino Workflow ou dentro de um passo WebReports (é o caso dos Set Attributes do QA: 650734, 702053, 11947900). Esta
+   página chama o WebReport por URL (standalone): no QA (23/10, workflow 12336820, tarefa 2) `accion=guardar&ids=11948126`
+   respondia `11948126 GUARDADO_OK` (a tag só ecoava o valor) e `accion=leer`, `LEIDO_OK ?`. Para WebReport standalone a
+   documentação indica `WFACTION:SETATTR`, com o **SubWorkID** na tag principal e as permissões do usuário sobre o workflow:
+   ```
+   [LL_REPTAG_&SUBWORKID WFACTION:REMOVEATTR:"ID Flujo a Cancelar":ALL /]
+   [LL_REPTAG_&SUBWORKID WFACTION:SETATTR:MV:"ID Flujo a Cancelar":1:[LL_REPTAG_&IDS /] /]
+   ```
+   O `REMOVEATTR ... ALL` limpa a seleção anterior (o primeiro valor é esvaziado, os demais saem); o `SETATTR:MV:...:1` grava os
+   IDs separados por vírgula no primeiro valor. **Validado no QA (23/10):** grava e o ramo `leer` confere (nome com espaços entre
+   aspas funciona). Ainda não testados: vários IDs (vírgula no valor) e a troca de seleção com valores anteriores.
+3. Segurança do ramo `guardar`: `ids` vem da URL e entra como texto dentro da tag `WFACTION` (um `:` ou `/]` mudaria a tag). A
+   página valida o formato, o WebReport não; o servidor rejeita não numéricos (`INVALID_TARGET`). O GET com a sessão do usuário
+   é alcançável por link: restringir o WebReport a um grupo.
+4. ~~`LL_WEBREPORT_STARTROW`/`ENDROW` dentro dos três IF aninhados.~~ Validado no QA (23/10): dentro dos IF a listagem não
+   funcionava. Os marcadores de linha não podem ficar dentro de um IF aberto: os três IF são fechados antes do `STARTROW`,
+   reabertos dentro da linha em volta do `<tr>` e reabertos de novo depois do `ENDROW`.
 5. Saída das colunas do LiveReport no WebReport: o JSON de `Atributos` (coluna 8) chega íntegro dentro do textarea e
    `Fecha` (coluna 6) no formato `AAAA-MM-DD HH24:MI`.
 6. `&WORKID`, `&SUBWORKID` e `&TASKID` disponíveis na tarefa quando o WebReport abre.

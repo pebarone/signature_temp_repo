@@ -4,14 +4,16 @@
 [// Modelo: webreports/firma-flujo-puro/Requisicion de Firma.html (misma estructura, mismo ramo reasignar, mismo estilo). /]
 [// Ramos por accion: guardar (graba la seleccion), leer (la verifica), reasignar (mueve la tarea al usuario de integracion); sin accion se muestra la pagina. /]
 [// Los ramos se anidan: cada uno solo corre con su accion y la pagina es el ultimo ELSE. /]
-[// TODO VALIDAR EN QA (seguridad): ids y lista llegan por la URL y se sustituyen como texto dentro de la tag SETWFATTR. Si el WebReport tiene un operador /]
-[// de comparacion por patron, validar aqui que ids tenga la forma digitos separados por coma ANTES de la tag; si no, restringir el WebReport por permisos. /]
+[// Seguridad: ids llega por la URL y entra como texto en la tag WFACTION (un ":" o "/]" cambiaria la tag). La pagina valida digitos separados por coma, /]
+[// el WebReport no: restringir el WebReport por permisos. El servidor igual rechaza valores no numericos (INVALID_TARGET). /]
 [LL_WEBREPORT_IF "[LL_REPTAG_&ACCION /]" == "guardar" /]
-[// VALIDAR EN QA: SETWFATTR. Documentada solo en foros; se dice que funciona en un paso WebReport / destino de workflow. La forma de lista multivalor no esta documentada. /]
-[// La pagina manda dos parametros: ids (1,2,3; lo que se muestra al usuario) y lista (los mismos ids entre comillas simples, '1','2','3', para armar la lista literal). /]
-[// Alternativas si esta forma no graba: prefijo con lista de dos elementos (workid y subworkid), como en WFTASKACTION; o un solo valor con los ids separados por coma (el servidor tambien los acepta asi). /]
+[// WFACTION:SETATTR y no SETWFATTR: SETWFATTR solo graba con destino Workflow o dentro de un paso WebReports; esta pagina llama al WebReport por URL /]
+[// (standalone) y SETWFATTR solo devolvia el valor sin grabar (QA 23/10). WFACTION espera el SubWorkID en la tag principal (aqui = WorkID del flujo de cancelacion) /]
+[// y respeta los permisos del usuario sobre el workflow. Primero se limpian todos los valores del multivalor (ALL: el primero se vacia, los demas se quitan) /]
+[// y despues se graba el primero con los ids separados por coma (el servidor acepta lista o texto separado). /]
 [// VALIDAR EN QA: con la tarea ya asignada al usuario de integracion (despues de la revision), el usuario que abre la pagina quiza no pueda grabar; la pagina lo trata como fallo (plan C). /]
-[LL_REPTAG_&SUBWORKID SETWFATTR:"ID Flujo a Cancelar":{[LL_REPTAG_&LISTA /]} /]
+[LL_REPTAG_&SUBWORKID WFACTION:REMOVEATTR:"ID Flujo a Cancelar":ALL /]
+[LL_REPTAG_&SUBWORKID WFACTION:SETATTR:MV:"ID Flujo a Cancelar":1:[LL_REPTAG_&IDS /] /]
 GUARDADO_OK
 [LL_WEBREPORT_ELSE /]
 [LL_WEBREPORT_IF "[LL_REPTAG_&ACCION /]" == "leer" /]
@@ -302,6 +304,8 @@ REASIGNADO_OK
       background: #f8fafc;
       resize: vertical;
     }
+    .diag { margin: 16px 0 0; font-size: 13px; color: var(--texto-suave); }
+    .diag pre { margin: 6px 0 0; padding: 8px 10px; background: #f8fafc; border: 1px solid var(--borde); border-radius: 8px; font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
     .btn.chico { min-height: 40px; padding: 8px 16px; font-size: 15px; }
     input:focus-visible, textarea:focus-visible, .chip button:focus-visible { outline: 3px solid var(--acento); outline-offset: 2px; }
     .modal-fondo {
@@ -403,6 +407,10 @@ REASIGNADO_OK
         <strong id="pc-titulo"></strong>
         <span id="pc-texto"></span>
       </div>
+      <details class="diag" id="pc-diag-caja" hidden>
+        <summary>Detalle técnico (para soporte)</summary>
+        <pre id="pc-diag"></pre>
+      </details>
       <h2 class="seccion">Pegar los IDs manualmente</h2>
       <ol class="pasos-c">
         <li>Copie los IDs con el botón.</li>
@@ -522,9 +530,23 @@ REASIGNADO_OK
          EstadoSubflujo, Atributos en JSON). Cada valor va en un textarea y el script lo lee como texto literal.
          VALIDAR EN QA: marcadores de fila y tags de columna por numero. -->
     <table id="origen"><tbody>
+[LL_WEBREPORT_ENDIF /]
+[LL_WEBREPORT_ENDIF /]
+[LL_WEBREPORT_ENDIF /]
 [LL_WEBREPORT_STARTROW /]
+[LL_WEBREPORT_IF "[LL_REPTAG_&ACCION /]" != "guardar" /]
+[LL_WEBREPORT_IF "[LL_REPTAG_&ACCION /]" != "leer" /]
+[LL_WEBREPORT_IF "[LL_REPTAG_&ACCION /]" != "reasignar" /]
+
       <tr><td><textarea>[LL_REPTAG_1 /]</textarea></td><td><textarea>[LL_REPTAG_2 /]</textarea></td><td><textarea>[LL_REPTAG_3 /]</textarea></td><td><textarea>[LL_REPTAG_4 /]</textarea></td><td><textarea>[LL_REPTAG_5 /]</textarea></td><td><textarea>[LL_REPTAG_6 /]</textarea></td><td><textarea>[LL_REPTAG_7 /]</textarea></td><td><textarea>[LL_REPTAG_8 /]</textarea></td></tr>
+[LL_WEBREPORT_ENDIF /]
+[LL_WEBREPORT_ENDIF /]
+[LL_WEBREPORT_ENDIF /]
 [LL_WEBREPORT_ENDROW /]
+[LL_WEBREPORT_IF "[LL_REPTAG_&ACCION /]" != "guardar" /]
+[LL_WEBREPORT_IF "[LL_REPTAG_&ACCION /]" != "leer" /]
+[LL_WEBREPORT_IF "[LL_REPTAG_&ACCION /]" != "reasignar" /]
+
     </tbody></table>
   </div>
 
@@ -543,7 +565,7 @@ REASIGNADO_OK
          7 Nombre del Documento, 6 DocID, 10 Email Firmante 1 (se muestra cuando Empleado esta vacio, como en los mapas
          Firma_Contratacion_Inactivo). Si un mapa no los tiene con ese tipo, la columna queda vacia;
        - ATRIBUTO: nombre del atributo de destino. Es solo texto para el usuario: el nombre que manda esta en las tags
-         SETWFATTR / WFATTR del WebReport (arriba) y debe ser igual a CANCEL_FIELD_TARGET_WORKFLOW del servidor;
+         WFACTION:SETATTR / WFATTR del WebReport (arriba) y debe ser igual a CANCEL_FIELD_TARGET_WORKFLOW del servidor;
        - usuario de integracion (11742766 en QA, AdminKeralty): NO va en este script.
          Esta fijado en la linea WFTASKACTION:REASSIGN del ramo reasignar del WebReport,
          con su comentario. Cambiarlo ahi al publicar en PROD.
@@ -554,7 +576,7 @@ REASIGNADO_OK
   const SERVER_URL = 'https://signature-orchestrator-api-2gim.onrender.com';
   const BASIC_USER = 'ADOBE-LOGS';
   const BASIC_PASS = 'ADOBE-LOGS-PASS';
-  const REPORT_ID = 'REPORT_ID_POR_ASIGNAR';
+  const REPORT_ID = '12335607';
   const MAX_FLUJOS = 20;
   const ATRIBUTO = 'ID Flujo a Cancelar';
   const ATRIBUTOS_FIRMA = { empleado: 4, documento: 7, docId: 6, correo: 10 };
@@ -1146,7 +1168,7 @@ REASIGNADO_OK
   async function pedirRamo(accion, extra) {
     const resp = await fetch(OTCS_URL + '?' + paramsRamo(accion, extra).toString(), { credentials: 'same-origin', cache: 'no-store' });
     const texto = await resp.text().catch(() => '');
-    return { ok: resp.ok, texto };
+    return { ok: resp.ok, status: resp.status, texto };
   }
 
   /* Reasigna la tarea al usuario de integracion fijado en el ramo reasignar del WebReport.
@@ -1213,9 +1235,15 @@ REASIGNADO_OK
     return extraerIds(i < 0 ? '' : texto.slice(i + MARCA_LEIDO.length));
   }
 
-  /* Devuelve { estado: 'verificado' | 'no_verificado' | 'fallo', motivo }.
-     1) ramo guardar (SETWFATTR) y marca GUARDADO_OK; 2) ramo leer: el atributo debe tener exactamente los IDs enviados.
-     Solo 'verificado' deja seguir al servidor. */
+  /* Respuesta de un ramo, resumida para el detalle tecnico del plan C (sin saltos de linea repetidos, maximo 500 caracteres). */
+  function resumenRamo(accion, r) {
+    const texto = String(r.texto || '').replace(/\s+/g, ' ').trim();
+    return accion + ' (HTTP ' + r.status + '): ' + (texto ? texto.slice(0, 500) + (texto.length > 500 ? '...' : '') : '(vacio)');
+  }
+
+  /* Devuelve { estado: 'verificado' | 'no_verificado' | 'fallo', motivo, diag }.
+     1) ramo guardar (WFACTION:SETATTR) y marca GUARDADO_OK; 2) ramo leer: el atributo debe tener exactamente los IDs enviados.
+     Solo 'verificado' deja seguir al servidor. diag: respuestas de los ramos, para soporte. */
   async function guardar(ids) {
     const error = validarIds(ids);
     if (error) return { estado: 'fallo', motivo: error };
@@ -1224,25 +1252,27 @@ REASIGNADO_OK
     }
     let r;
     try {
-      r = await pedirRamo('guardar', { ids: ids.join(','), lista: ids.map((id) => "'" + id + "'").join(',') });
+      r = await pedirRamo('guardar', { ids: ids.join(',') });
     } catch (_) {
       return { estado: 'fallo', motivo: 'Sin conexión con OpenText.' };
     }
+    const diagGuardar = resumenRamo('guardar', r);
     if (!r.ok || !r.texto.includes(MARCA_GUARDADO)) {
-      return { estado: 'fallo', motivo: 'OpenText no confirmó el guardado. Verifique su sesión y sus permisos sobre la tarea.' };
+      return { estado: 'fallo', motivo: 'OpenText no confirmó el guardado. Verifique su sesión y sus permisos sobre la tarea.', diag: diagGuardar };
     }
     let lectura;
     try {
       lectura = await pedirRamo('leer', {});
     } catch (_) {
-      return { estado: 'no_verificado', motivo: 'No fue posible verificar el atributo (sin conexión).' };
+      return { estado: 'no_verificado', motivo: 'No fue posible verificar el atributo (sin conexión).', diag: diagGuardar };
     }
+    const diag = diagGuardar + '\n' + resumenRamo('leer', lectura) + '\nIDs enviados: ' + ids.join(',');
     if (!lectura.ok || !lectura.texto.includes(MARCA_LEIDO)) {
-      return { estado: 'no_verificado', motivo: 'No fue posible verificar el atributo.' };
+      return { estado: 'no_verificado', motivo: 'No fue posible verificar el atributo.', diag };
     }
     return mismosIds(numerosLeidos(lectura.texto), ids)
       ? { estado: 'verificado', motivo: '' }
-      : { estado: 'fallo', motivo: 'El atributo "' + ATRIBUTO + '" no refleja la selección (OpenText respondió, pero el valor no cambió).' };
+      : { estado: 'fallo', motivo: 'El atributo "' + ATRIBUTO + '" no refleja la selección (OpenText respondió, pero el valor no cambió).', diag };
   }
 
   /* ---------- Plan C ---------- */
@@ -1253,6 +1283,8 @@ REASIGNADO_OK
     $('pc-texto').textContent = res.motivo +
       ' Si la tarea ya fue transferida al usuario de integración, quizá no admita cambios desde esta página.' +
       ' No se consultó nada al servidor de firmas.';
+    $('pc-diag').textContent = res.diag || '';
+    $('pc-diag-caja').hidden = !res.diag;
     $('ids-copia').value = ids.join(', ');
     $('estado-copia').textContent = '';
     $('estado-copia').className = 'estado-sel';
