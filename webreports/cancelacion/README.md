@@ -119,8 +119,10 @@ do cancelamento no Adobe, "envíe la cancelación del flujo en el content y demo
 sub-fluxo, e o usuário definiu que, sem especificação, o fluxo fecha. **O fluxo de firma nunca roda sozinho** em produção:
 é sempre sub-fluxo, e devem parar **os dois** (pai e firma). No OTCS o sub-fluxo pertence ao mesmo processo do pai
 (`wsubwork.subwork_workid` = `WorkID` do pai), e o stop (`PUT /v2/processes/{WorkID}/status`) é sobre esse processo.
-VALIDAR NO QA: depois do stop do pai, a tarefa "Aguardar Firma" do sub-fluxo sai do status 2 (o LiveReport deixa de listá-la).
-Se não sair, o servidor precisa parar também o sub-fluxo.
+**Validado no QA (24/10/2026):** cancelamento 12334448 do pai 12334150 (Flujo documental - Bienestar), sub-fluxo de firma
+12337316. Às 02:40:25 o acordo foi para `CANCELLED` no Adobe e o pai ficou "Workflow stopped" (`work_status` -2), sem tarefa
+em `current`: o "Aguardar Firma" do sub-fluxo deixou de estar ativa, sem parar o sub-fluxo à parte. `IDs Cancelados` =
+`12334150` e o SendOn concluiu o fluxo de cancelamento.
 
 - Com `CANCEL_STOP_ORIGINAL=true` o orquestrador **para** (stop, nunca exclui nem arquiva) o fluxo original no Content, item a
   item, logo depois de o Adobe confirmar o cancelamento. Então o passo "Detener flujos originales" do mapa **não é necessário** (e
@@ -199,7 +201,19 @@ Assim os IDs que mudam entre instâncias e mapas não ficam no SQL.
 
 ## Checklist de QA
 
-Roteiro do design (acordo de teste `OUT_FOR_SIGNATURE`). Nada disto foi validado no OTCS ainda.
+Roteiro do design (acordo de teste `OUT_FOR_SIGNATURE`).
+
+**Primeiro ponta a ponta no QA (24/10/2026, UTC), com `CANCEL_STOP_ORIGINAL=true`:** fluxo de cancelamento 12334140
+(com as permissões de workflow do AdminKeralty no mapa: 697/1023), alvo = fluxo Firma 12336731, acordo
+`CBJCHBCAABAA1TKdG7nu4_sJBYflDng6AXpxdk7vzX4n`.
+- 02:32:51: a tarefa "Cancelar Flujo de Firma" passa ao AdminKeralty (reatribuição pela página).
+- 02:32:58: acordo `CANCELLED` no Adobe (evento `RECALLED`, comentário "Flujo cancelado desde Content Server (workflow de
+  cancelación 12334140)"); webhook `AGREEMENT_RECALLED` recebido; fluxo 12336731 suspenso e parado ("Workflow stopped").
+- 02:32:58: `IDs Cancelados` = `12336731` (o `formUpdate` do servidor gravou o multivalor), SendOn da tarefa e o fluxo de
+  cancelamento concluído ("Fin").
+
+Os itens abaixo seguem como roteiro; os cobertos por esse teste são a gravação/conferência, a reatribuição, o cancelamento
+de um acordo `OUT_FOR_SIGNATURE`, o stop do original e o registro em `IDs Cancelados`.
 
 - [ ] Servidor com `CANCEL_ENABLED=true` e a página publicada. Com `CANCEL_ENABLED=false`, o clique em "Revisar" mostra "no está habilitada".
 - [ ] Mapa de uma tarefa (Início → "Cancelar Flujo de Firma" → Fim), com o campo `IDs Cancelados` no formulário.
@@ -272,9 +286,14 @@ Roteiro do design (acordo de teste `OUT_FOR_SIGNATURE`). Nada disto foi validado
 
 ## Pendiente
 
-- **Nó do WebReport e mapa do workflow de cancelamento não existem no Content.** Faltam os atributos `ID Flujo a Cancelar`,
-  `IDs Cancelados` e `ID Subflujo a Cancelar` no formulário, a tarefa com o nome de `CANCEL_TASK_NAMES` e, com
-  `CANCEL_STOP_ORIGINAL=false`, o passo que para só os WorkIDs de `IDs Cancelados`. `REPORT_ID` é placeholder até publicar.
+- **Mapa publicado no QA (23/10):** mapa "firma cancelamento" (versão 12334429), WebReport 12335607 ("Firma Cancelamento"),
+  atributos `ID Flujo a Cancelar` (texto, multivalor até 20), `ID Subflujo a Cancelar` e `IDs Cancelados`. Falta, com
+  `CANCEL_STOP_ORIGINAL=false`, o passo que para só os WorkIDs de `IDs Cancelados`.
+- **Permissão do usuário de integração no workflow (obrigatória).** No QA (workflow 12334430), o AdminKeralty tinha
+  `PERMISSIONS`/`MANAGER_PERMISSIONS` = 0 e o `step_list.current` vinha vazio: o servidor responde `NOT_AT_CANCEL_STEP`
+  ("quizá ya se completó") com a tarefa ativa, sem reatribuir nem concluir nada (a auditoria só mostra o início). Nos fluxos
+  de Contratación (ex. 11967303, iniciado pelo mesmo usuário) ele tem 679/1023 e vê a tarefa. O mapa de cancelamento precisa
+  dar ao AdminKeralty (ou a um grupo dele) as mesmas permissões de workflow do mapa de Contratación.
 - **LiveReport sem placeholders, mas ainda não executado** no OTCS; atributos conferidos só para o mapa Firma.
 - **Aviso de firma parcial** mostra a quantidade e a data, mas o servidor não bloqueia o cancelamento: a página só exige
   ciência. Decisão pendente (ver o design, "Em aberto", item 4).
