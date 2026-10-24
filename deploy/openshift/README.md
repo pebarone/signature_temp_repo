@@ -331,7 +331,9 @@ o `externalId` que permite a adoção automática pelo webhook. Sem ação, ning
 
 - **Importar o mapa antigo.** No código de referência, o mapa fica em `/tmp/agreements.json` do contêiner antigo; confirme
   no binário de produção. Copiado para `/data/state/agreements.json`, ele é importado no próximo start: o arquivo vira
-  `.migrated`, e ids já existentes não são sobrescritos.
+  `.migrated`, e ids já existentes não são sobrescritos. Copie o arquivo **antes** de parar ou recriar o pod antigo: o
+  `/tmp` não sobrevive à troca de pod, e o que sumir só volta por adoção. A importação também é o que permite cancelar
+  esses fluxos pelo WebReport de cancelamento (ver [`webreports/cancelacion/README.md`](../../webreports/cancelacion/README.md)).
 
   ```bash
   oc exec <pod-antigo> -- cat /tmp/agreements.json > ./agreements.json   # guardar em local restrito: tem e-mails
@@ -344,7 +346,9 @@ o `externalId` que permite a adoção automática pelo webhook. Sem ação, ning
   **Atenção:** os acordos importados sem `sendonDone` são reconciliados de verdade. O orquestrador grava o PDF assinado e
   conclui a tarefa de assinatura, e o workflow segue para a distribuição ao workspace. Antes de importar, tire do arquivo os
   acordos que já foram tratados à mão (PDF colocado no workspace, tarefa concluída por outra via), senão o documento pode
-  ser duplicado. Entradas sem `workflowId` vão para `needs_attention`.
+  ser duplicado. Entradas sem `workflowId` vão para `needs_attention`. Esses workflows seguem a versão antiga do mapa: se a
+  "Aguardar Firma" deles não estiver com o `OTCS_USER`, a disposição falha (ver "Tarefa Aguardar Firma" em
+  [`webreports/README.md`](../../webreports/README.md#tarefa-aguardar-firma-disposição)).
 - **Não importar** e tratar os pendentes pela operação, um a um, com `POST /admin/adopt/:id` (seção "Admin endpoints" do `readme.md` da raiz).
 
 ---

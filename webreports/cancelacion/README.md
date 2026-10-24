@@ -299,8 +299,15 @@ de um acordo `OUT_FOR_SIGNATURE`, o stop do original e o registro em `IDs Cancel
   ciência. Decisão pendente (ver o design, "Em aberto", item 4).
 - **Fluxo ambíguo** não se resolve na página: o servidor só aceita subflujo com um fluxo, e a página não grava
   `ID Subflujo a Cancelar`. Ela orienta cancelar esse fluxo sozinho, com o subflujo.
-- **Acordos do orquestrador antigo** (`no_encontrado`): a dica (adoção via `POST /admin/adopt/:id`, rota administrativa) é só
-  texto; a página não adota.
+- **Acordos do orquestrador antigo** (`no_encontrado`): o cancelamento só acha o acordo de um fluxo pelo SQLite
+  (`listByWorkflow`), e os acordos do serviço antigo não têm o `externalId` que permite a adoção automática. A dica (adoção
+  via `POST /admin/adopt/:id`, rota administrativa) é só texto; a página não adota.
+  - **Migração dos dados em PROD (pendente):** importar para o SQLite o mapa `agreements.json` do orquestrador antigo, para
+    que os fluxos abertos antes do deploy possam ser cancelados. O código já existe (`server/infra/legacyImport.js`, roda
+    no start); falta executar e conferir em PROD, seguindo o passo "3. Acordos em andamento no orquestrador antigo" de
+    [`deploy/openshift/README.md`](../../deploy/openshift/README.md).
+  - No código de referência o arquivo fica em `/tmp/agreements.json`, que se perde quando o pod antigo é recriado.
+    Confirmar antes se ele existe e quantos acordos tem. O que já tiver sumido só volta por adoção, um a um.
 - **Reabrir a página depois da reatribuição:** a tarefa sai do usuário humano. Se a página for recarregada antes de o
   cancelamento concluir, a leitura de `WFATTR` e a resposta `NOT_AT_CANCEL_STEP` dependem de permissões do OTCS não validadas.
 - **Plano C** (copiar e colar) depende do formulário aberto; não foi testado.

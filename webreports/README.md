@@ -139,6 +139,41 @@ servidor respondeu o 409 de duplicidade (A já era final, não "aberto"), escond
 SendOn e mandou `Rechazado`. Agora: o servidor recusa o não-PDF antes do Adobe (`NOT_PDF`), o mesmo fluxo sempre vê o acordo dele
 (`existing` + `final`, enquanto o resultado ainda não foi aplicado ao fluxo) e a trava de 15 min só vale para acordo aberto de outro fluxo.
 
+### Tarefa "Aguardar Firma" (disposição)
+
+O `REASSIGN` dos WebReports só cobre a tarefa de envio. A disposição (`Firmado`/`Rechazado`) é feita na tarefa
+**"Aguardar Firma"** do sub-fluxo de assinatura, que o OTCS cria depois do SendOn da tarefa de envio e atribui conforme o
+**mapa**. O orquestrador conclui essa tarefa como `OTCS_USER`. Nenhum WebReport a reatribui, então ela precisa nascer com o
+usuário de integração.
+
+**Achado em PROD** (ticket 2026100510004615, leituras GET de 20/10/2026):
+
+- Nos contratos enviados em 01 e 02/10, a "Aguardar Firma" estava atribuída ao AdminKeralty, mas o integrador antigo
+  rodava com o usuário nominal (o mesmo do `REASSIGN` do WebReport de PROD). Nenhum desses casos recebeu `Firmado`
+  automático, nem quando o PDF assinado chegou ao Content: há caso com o PDF como nova versão do nó e a tarefa ainda em
+  "Aguardar Firma".
+- Em 05/10 o mapa passou a atribuir a "Aguardar Firma" ao usuário nominal. Num teste de 08/10, com os mesmos IDs enviados
+  pelo WebReport (pai nos dois campos), o `Firmado` foi automático. Ou seja, os IDs não explicam a falha; o responsável da
+  tarefa explica a parte da disposição.
+- As recuperações manuais registradas nos históricos começaram todas por reatribuir a tarefa.
+
+A falta de PDF em parte dos casos é outra falha (entrega ou processamento do webhook) e não se distingue sem os logs de PROD.
+
+**Risco no rollout.** Hoje o mapa de PROD atribui a "Aguardar Firma" ao usuário nominal, e o orquestrador novo roda como
+AdminKeralty. O `executeDisposition` (`server/services/reconciliationService.js`) não confere o responsável da tarefa de
+assinatura (só o `ensureStartSent` confere o da tarefa de envio): o SendOn falha, o acordo entra em retry com backoff e
+termina em `needs_attention` (`retries_exhausted`, reaberto a cada 6 h). Como o PDF é entregue antes da disposição, cada
+acordo repetiria o cenário acima: PDF no nó, tarefa parada. Por isso:
+
+- O responsável da "Aguardar Firma" no mapa, o `OTCS_USER` do orquestrador e o ID do `REASSIGN` dos WebReports precisam
+  apontar para o **mesmo** usuário, e mudar juntos. Mapa no AdminKeralty com o integrador antigo (usuário nominal) repete
+  o defeito de 01–02/10; mapa no usuário nominal com o orquestrador novo faz a disposição falhar.
+- Workflows já iniciados seguem a versão do mapa com que começaram. Os que estiverem antes ou em "Aguardar Firma" na hora
+  da troca ficam com o responsável antigo e precisam ser reatribuídos à mão (senão vão para `needs_attention`).
+- Atribuir a tarefa a um grupo não foi testado.
+- No QA, o mapa Firma (650736) já está certo (teste de 21/10/2026, `Firmado` pelo orquestrador). Conferir os mapas de
+  Contratación e Documental antes de testá-los.
+
 ## O que muda em PROD (comum)
 
 Cada página tem o que depende do ambiente em dois lugares: o bloco **CONFIGURACAO POR AMBIENTE** no topo do script
@@ -157,17 +192,32 @@ e a linha `WFTASKACTION:REASSIGN` do ramo `reasignar`. Os itens específicos de 
    própria do WebReport (o texto fica visível a quem abre a página; ela só serve para `/auth`, não abre `/admin` nem `/logs`).
 5. `CORS_ORIGINS` do orquestrador: o padrão é a origem de `OTCS_BASE` (`https://otcs.g115.opentext.cloud` em PROD). Se o
    WebReport for servido de outra origem, liste-a.
+6. Mapas: a tarefa "Aguardar Firma" de cada sub-fluxo de assinatura atribuída ao mesmo usuário do item 2 (ver
+   [Tarefa "Aguardar Firma"](#tarefa-aguardar-firma-disposição)). Não é configuração do WebReport, mas sem ela a disposição
+   não acontece.
 
 ## Ordem de rollout (sem janela de erro)
 
 1. **Deploy do orquestrador** com as flags de transição ligadas: `START_LEGACY_GET_ENABLED=true` e
    `START_LEGACY_SIGNATURE=true`. Os WebReports antigos (GET sem HMAC / HMAC só do timestamp) continuam funcionando, agora
    sempre validados contra o OTCS; cada uso gera `warn` no log pedindo a atualização.
+
+   **Troca de usuário em PROD.** Isso só vale se o `OTCS_USER` for o mesmo usuário que o WebReport antigo usa no
+   `REASSIGN` (em PROD, o usuário nominal). Com o orquestrador novo rodando como AdminKeralty, o `/start` do WebReport
+   antigo responde 409 (`REASSIGN_REQUIRED` no sub-fluxo), que a página antiga não trata, e a disposição falha na
+   "Aguardar Firma" (ver [Tarefa "Aguardar Firma"](#tarefa-aguardar-firma-disposição)). Há dois caminhos:
+   - o orquestrador novo começa com o usuário nominal, e a passagem para AdminKeralty vira um corte à parte; ou
+   - o deploy já usa AdminKeralty, e no **mesmo corte** saem os WebReports novos (`REASSIGN` para AdminKeralty) e os
+     mapas com a "Aguardar Firma" atribuída a ele.
+
+   Em qualquer dos dois, o corte para AdminKeralty inclui reatribuir à mão a "Aguardar Firma" dos workflows já iniciados
+   (eles seguem a versão antiga do mapa). Depois, conferir em `/admin` que nenhum acordo foi para `needs_attention` por
+   falha na disposição.
 2. **Publicar os WebReports novos** (um por vez, QA antes de PROD). Os dois de envio (fluxo puro e Contratación) dependem do
    orquestrador que devolve `handoff`, `REASSIGN_REQUIRED`, `final`, `NOT_PDF` e `DUPLICATE_OPEN`: publique-os **depois** do deploy desse
    servidor. Com um servidor antigo, a página não reatribui mais ao abrir e o `/start` responde 409 ("La tarea no está asignada
    al usuario de integración."). O WebReport antigo de Contratación (REASSIGN na renderização) segue funcionando com o servidor
-   novo, mas continua com o defeito do incidente: só some ao publicar o novo. O WebReport de cancelamento só funciona com
+   novo, desde que com o mesmo usuário (ver a troca de usuário no item 1), mas continua com o defeito do incidente: só some ao publicar o novo. O WebReport de cancelamento só funciona com
    `CANCEL_ENABLED=true` no servidor (ver [`cancelacion/README.md`](cancelacion/README.md)).
 3. **Testar um envio** em cada WebReport (checklists das pastas e o checklist comum abaixo) e conferir nos logs que não há mais
    `warn` de uso legado.
