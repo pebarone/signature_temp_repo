@@ -346,7 +346,7 @@ REASIGNADO_OK
         <!-- Filtros en la pagina: el LiveReport trae todos los flujos en "Aguardar Firma" y aqui solo se ocultan filas (sin recargar). -->
         <div class="filtros">
           <label class="campo">Flujo<input type="text" id="q-flujo" autocomplete="off" inputmode="numeric"></label>
-          <label class="campo">Empleado (usuario)<input type="text" id="q-empleado" autocomplete="off"></label>
+          <label class="campo">Empleado (usuario o correo)<input type="text" id="q-empleado" autocomplete="off"></label>
           <label class="campo">Nombre<input type="text" id="q-nombre" autocomplete="off"></label>
           <label class="campo">Documento<input type="text" id="q-documento" autocomplete="off"></label>
           <label class="campo">Desde<input type="date" id="q-desde"></label>
@@ -540,7 +540,8 @@ REASIGNADO_OK
        - MAX_FLUJOS: tope de flujos por cancelacion. Debe ser IGUAL a CANCEL_MAX_TARGETS del orquestador (por defecto 20);
        - ATRIBUTOS_FIRMA: wf_attrid de los atributos del sub-flujo de firma que muestra la tabla. Son los mismos en todos
          los mapas de firma (clones del mapa Firma usados como sub-flujo en Contratacion y Documental): 4 Empleado (usuario),
-         7 Nombre del Documento, 6 DocID. Si un mapa no los tiene con ese tipo, la columna queda vacia;
+         7 Nombre del Documento, 6 DocID, 10 Email Firmante 1 (se muestra cuando Empleado esta vacio, como en los mapas
+         Firma_Contratacion_Inactivo). Si un mapa no los tiene con ese tipo, la columna queda vacia;
        - ATRIBUTO: nombre del atributo de destino. Es solo texto para el usuario: el nombre que manda esta en las tags
          SETWFATTR / WFATTR del WebReport (arriba) y debe ser igual a CANCEL_FIELD_TARGET_WORKFLOW del servidor;
        - usuario de integracion (11742766 en QA, AdminKeralty): NO va en este script.
@@ -556,7 +557,7 @@ REASIGNADO_OK
   const REPORT_ID = 'REPORT_ID_POR_ASIGNAR';
   const MAX_FLUJOS = 20;
   const ATRIBUTO = 'ID Flujo a Cancelar';
-  const ATRIBUTOS_FIRMA = { empleado: 4, documento: 7, docId: 6 };
+  const ATRIBUTOS_FIRMA = { empleado: 4, documento: 7, docId: 6, correo: 10 };
   /* ============================ fin de la configuracion ============================ */
 
   /* Valores de OTCS. WORKFLOW_ID / SUBWORKFLOW_ID son los del workflow de CANCELACION (la tarea donde corre este WebReport).
@@ -1308,11 +1309,13 @@ REASIGNADO_OK
     const emp = de(ATRIBUTOS_FIRMA.empleado, 14);
     const doc = de(ATRIBUTOS_FIRMA.documento, -1);
     const docId = de(ATRIBUTOS_FIRMA.docId, -1);
+    const correo = de(ATRIBUTOS_FIRMA.correo, -1);
     return {
       empleado: emp ? texto(emp.login) : '',
       nombre: emp ? texto(emp.nombre) || texto(emp.login) : '',
       documento: doc ? texto(doc.s) : '',
-      docId: docId ? texto(docId.s) : ''
+      docId: docId ? texto(docId.s) : '',
+      correo: correo ? texto(correo.s) : ''
     };
   }
 
@@ -1339,7 +1342,7 @@ REASIGNADO_OK
   }
 
   function etiquetaDe(f) {
-    return [f.nombre, f.documento].filter(Boolean).join(' - ');
+    return [f.nombre || f.correo, f.documento].filter(Boolean).join(' - ');
   }
 
   /* Filtros de la etapa A, aplicados sobre las filas ya cargadas. Texto: contiene, sin distinguir mayusculas ni acentos.
@@ -1355,7 +1358,7 @@ REASIGNADO_OK
     state.visibles = state.filas.filter((f) => {
       const dia = String(f.fecha || '').slice(0, 10);
       return contiene([f.workId].concat(f.subs).join(' '), q.flujo)
-        && contiene(f.empleado, q.empleado)
+        && contiene(f.empleado + ' ' + f.correo, q.empleado)
         && contiene(f.nombre + ' ' + f.empleado, q.nombre)
         && contiene(f.documento, q.documento)
         && (!q.desde || (dia && dia >= q.desde))
@@ -1379,7 +1382,7 @@ REASIGNADO_OK
         h('td', { class: 'num' }, f.subs.join(', ')),
         h('td', { class: 'largo', title: f.tituloFirma || null }, f.titulo),
         h('td', null, f.fecha),
-        h('td', null, f.empleado),
+        h('td', { class: 'largo' }, f.empleado || f.correo),
         h('td', { class: 'largo' }, f.nombre),
         h('td', { class: 'largo' }, f.documento)));
     });

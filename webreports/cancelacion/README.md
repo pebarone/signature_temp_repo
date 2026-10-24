@@ -32,7 +32,8 @@ página (ELSE). Fonte de dados = o LiveReport. As etapas ficam na mesma página,
 **A. Buscar e marcar.** O LiveReport traz todas as tarefas "Aguardar Firma" ativas (sub-fluxos de firma) e a página filtra na
 hora, sem recarregar: flujo (WorkID ou SubWorkID), empregado (login), nome, documento (contém, sem distinguir maiúsculas nem
 acentos), desde e hasta (início do sub-fluxo, inclusivos); vazio = sem filtro. Empregado, nome, documento e DocID saem do JSON
-de atributos com os `wf_attrid` de `ATRIBUTOS_FIRMA` (4, 7, 6, iguais em todos os clones do mapa Firma). Tabela com
+de atributos com os `wf_attrid` de `ATRIBUTOS_FIRMA` (4, 7, 6, iguais em todos os clones do mapa Firma). Quando o Empleado
+(4) vem vazio, como nos `Firma_Contratación_Inactivo` do QA, a coluna e o filtro de empregado usam o Email Firmante 1 (10). Tabela com
 checkboxes, "Seleccionar todos" e contador "Seleccionados: N de 20" (`MAX_FLUJOS`; passando dele a página não deixa marcar mais).
 A seleção fica em sessionStorage entre buscas (sem ele, só em memória). Um aviso diz que a revisão pode transferir a tarefa ao
 usuário de integração.
@@ -141,7 +142,7 @@ e linha `WFTASKACTION:REASSIGN`):
 |---|---|---|
 | `REPORT_ID` | script | ID do nó deste WebReport no ambiente; usado pelos ramos `guardar`, `leer` e `reasignar`. Placeholder `REPORT_ID_POR_ASIGNAR`: sem ID numérico, a gravação e a reatribuição não rodam |
 | `MAX_FLUJOS` | script | Deve ser igual a `CANCEL_MAX_TARGETS` do servidor (padrão 20) |
-| `ATRIBUTOS_FIRMA` | script | `wf_attrid` do sub-fluxo de firma: empleado 4 (tipo 14), documento 7 e docId 6 (tipo -1). Iguais em todos os mapas de firma (clones); só mudam se o formulário do mapa mudar |
+| `ATRIBUTOS_FIRMA` | script | `wf_attrid` do sub-fluxo de firma: empleado 4 (tipo 14), documento 7, docId 6 e correo 10 (Email Firmante 1, tipo -1). Iguais em todos os mapas de firma (clones); só mudam se o formulário do mapa mudar |
 | `SERVER_URL`, `BASIC_USER`, `BASIC_PASS` | script | por ambiente; `ADOBE-LOGS` / `ADOBE-LOGS-PASS` são placeholders |
 | usuário de integração | linha `WFTASKACTION:REASSIGN` do ramo `reasignar` | QA: 11742766 (AdminKeralty); PROD: ID do AdminKeralty de PROD |
 | nomes dos atributos | tags `WFATTR` / `SETWFATTR` e constante `ATRIBUTO` | `ID Flujo a Cancelar` / `ID Subflujo a Cancelar` iguais a `CANCEL_FIELD_TARGET_*` do servidor |
@@ -188,6 +189,9 @@ Assim os IDs que mudam entre instâncias e mapas não ficam no SQL.
 - Consultas de ajuda (com o `SubWorkID` de um fluxo em "Aguardar Firma"):
   `SELECT subworktask_taskid, subworktask_title, subworktask_status FROM wsubworktask WHERE subworktask_subworkid = <SubWorkID>`;
   `SELECT wf_attrid, wf_attrtype, wf_entrynum, wf_valint, wf_valstr FROM wfattrdata WHERE wf_id = <SubWorkID>`.
+- **Executado no QA em 23/10/2026:** 10 tarefas, mapas `Firma_Contratación_Inactivo`, `Firma_Contratación_Activo` e
+  `Firma_Documental`, todos com os mesmos `wf_attrid` (4 a 28) e DocID numérico; `WorkID` (pai) diferente de `SubWorkID`.
+  Nos `Inactivo` o Empleado (4) vem vazio (o usuário, quando há, está no Firmante 2).
 - A página lê estas 8 colunas por posição e filtra sozinha; testada só com dados simulados (navegador local, 23/10/2026).
 - O LiveReport também roda nos ramos `guardar`, `leer` e `reasignar` (o WebReport sempre executa a fonte); as linhas só são
   emitidas na página.
