@@ -321,3 +321,15 @@ no Content. O orquestrador **não** encerra o fluxo original.
 - **Tarefa do workflow de cancelamento** (`POST /cancel`): precisa estar `current` e atribuída ao usuário de integração
   (`409 REASSIGN_REQUIRED` com `handoff` se não); o SendOn (sem disposição) só acontece depois do cancelamento confirmado. Falha no
   SendOn => `503 SENDON_FAILED`; repetir é idempotente.
+- **Modo direto** (`POST /cancel/direct/auth`, `POST /cancel/direct` e `POST /cancel/direct/preview`; WebReport executado sozinho, sem
+  workflow; só existem com `CANCEL_ENABLED=true`, `CANCEL_DIRECT_ENABLED=true` **e** `CANCEL_DIRECT_AUTH_USER`/`CANCEL_DIRECT_AUTH_PASS`
+  (sem fallback para `START_AUTH_*`/`LOG_*`; sem elas as rotas não são montadas e o startup registra o erro), senão `404`): a assinatura vem
+  de `/cancel/direct/auth` (Basic próprio), feita com a chave derivada `HMAC(SIGNATURE_SECRET, 'cancel-direct')`; o `/auth` genérico não
+  vale nas rotas diretas e a assinatura direta não vale em `/start` nem `/cancel`. Os alvos (`targetWorkflowIds`, lista; `targetSubworkflowId`
+  opcional, só com um alvo) vêm no corpo e ficam vinculados ao HMAC v2 (a forma canônica ganha as linhas
+  `targetWorkflowIds` e `targetSubworkflowId` só quando `targetWorkflowIds` é enviado; sem ele nada muda). Não lê tarefa nem
+  formulário, não grava `IDs Cancelados` e não faz SendOn (`sentOn: false`). Cancela no Adobe e **sempre** para o fluxo original
+  (como `CANCEL_STOP_ORIGINAL=true`, independente do flag). Mesmos itens, `complete`/`pending` e idempotência do lote da tarefa;
+  `422` `MISSING_TARGET`/`INVALID_TARGET`/`TOO_MANY_TARGETS`. `requestedBy` (autodeclarado, fora do HMAC) só entra em
+  `cancel_source` (`webreport:direct[:<usuário>]`) e no comentário do Adobe. A autorização é a permissão sobre o WebReport no OTCS
+  e a credencial Basic direta; a auditoria fica só no banco e nos logs. `POST /admin/cancel-workflow` (`LOG_*`) é um caminho à parte. Ver [`webreports/cancelacion/README.md`](../webreports/cancelacion/README.md).

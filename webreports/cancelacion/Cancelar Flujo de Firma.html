@@ -4,6 +4,10 @@
 [// Modelo: webreports/firma-flujo-puro/Requisicion de Firma.html (misma estructura, mismo ramo reasignar, mismo estilo). /]
 [// Ramos por accion: guardar (graba la seleccion), leer (la verifica), reasignar (mueve la tarea al usuario de integracion); sin accion se muestra la pagina. /]
 [// Los ramos se anidan: cada uno solo corre con su accion y la pagina es el ultimo ELSE. /]
+[// DOS MODOS (el script los distingue por WORKID, SUBWORKID y TASKID: los tres numericos = TAREA; vacios o sin resolver = DIRECTO): /]
+[// TAREA: ejecutado desde la tarea "Cancelar Flujo de Firma" del workflow de cancelacion. Guarda la seleccion en el atributo, puede reasignar la tarea y llama a /cancel/preview y /cancel; el servidor lee los flujos del formulario, cancela y hace el SendOn. /]
+[// DIRECTO: ejecutado solo, sin workflow. No usa los ramos guardar, leer ni reasignar. Pide la firma a /cancel/direct/auth (Basic PROPIO, BASIC_USER_DIRECTO y BASIC_PASS_DIRECTO = CANCEL_DIRECT_AUTH_USER y CANCEL_DIRECT_AUTH_PASS) y manda los flujos elegidos a /cancel/direct/preview y /cancel/direct (la lista va firmada en el HMAC), cancela en Adobe Sign y SIEMPRE detiene el flujo original en Content Server. Exige CANCEL_DIRECT_ENABLED=true en el servidor y restringir ESTE WebReport por permisos (grupo autorizado): su fuente lleva la credencial directa. /]
+[// Si solo algunos de WORKID, SUBWORKID y TASKID llegan resueltos (por ejemplo una URL sin taskid), la pagina no elige ningun modo: muestra un error y no llama al servidor. /]
 [// Seguridad: ids llega por la URL y entra como texto en la tag WFACTION (un ":" o "/]" cambiaria la tag). La pagina valida digitos separados por coma, /]
 [// el WebReport no: restringir el WebReport por permisos. El servidor igual rechaza valores no numericos (INVALID_TARGET). /]
 [LL_WEBREPORT_IF "[LL_REPTAG_&ACCION /]" == "guardar" /]
@@ -343,7 +347,7 @@ REASIGNADO_OK
 
     <!-- ===== Etapa A: buscar y marcar ===== -->
     <section id="vista-seleccion" hidden>
-      <p class="intro">Busque los flujos que están en "Aguardar Firma" y márquelos (máximo <span id="max-flujos"></span>). Al pulsar "Revisar" se guarda la selección en esta tarea y se consulta el estado de cada acuerdo en Adobe Sign; todavía no se cancela nada.</p>
+      <p class="intro">Busque los flujos que están en "Aguardar Firma" y márquelos (máximo <span id="max-flujos"></span>). <span data-modo="tarea">Al pulsar "Revisar" se guarda la selección en esta tarea y se consulta el estado de cada acuerdo en Adobe Sign; todavía no se cancela nada.</span><span data-modo="directo" hidden>Al pulsar "Revisar" se consulta el estado de cada acuerdo en Adobe Sign; todavía no se cancela nada. Al confirmar, los acuerdos se cancelan en Adobe Sign y los flujos originales se detienen en Content Server.</span></p>
 
       <h2 class="seccion">Buscar</h2>
       <form id="form-busqueda" action="" novalidate>
@@ -390,7 +394,7 @@ REASIGNADO_OK
       <h2 class="seccion">Selección actual</h2>
       <ul class="chips" id="seleccion"></ul>
       <p class="estado-sel" id="sel-estado" role="status" aria-live="polite"></p>
-      <div class="aviso-caja" role="note">
+      <div class="aviso-caja" role="note" data-modo="tarea">
         <strong>La revisión puede transferir la tarea</strong>
         Si la tarea no está asignada al usuario de integración, "Revisar" la transfiere a él. Después no la verá en su bandeja: no cierre esta página hasta terminar. Cambiar la selección más tarde puede no ser posible (en ese caso se pegan los IDs a mano).
       </div>
@@ -434,8 +438,14 @@ REASIGNADO_OK
           <li><span class="firmante-etiqueta">Subflujo</span><span class="firmante-correo" id="destino-subflujo"></span></li>
         </ul>
         <p class="nota" id="nota-destino">
-          El servidor vuelve a leer la lista del atributo "ID Flujo a Cancelar" al cancelar y procesa <strong>todos</strong> los flujos de esa lista.
-          La revisión es informativa y no cancela nada.
+          <span data-modo="tarea">
+            El servidor vuelve a leer la lista del atributo "ID Flujo a Cancelar" al cancelar y procesa <strong>todos</strong> los flujos de esa lista.
+            La revisión es informativa y no cancela nada.
+          </span>
+          <span data-modo="directo" hidden>
+            Estos son los flujos que se envían al servidor; la lista queda firmada con la solicitud (si cambia la selección, hay que revisar de nuevo).
+            La revisión es informativa y no cancela nada.
+          </span>
         </p>
       </div>
 
@@ -513,7 +523,7 @@ REASIGNADO_OK
       <h2 id="modal-titulo">Revisar los flujos seleccionados</h2>
       <p id="modal-texto"></p>
       <ul id="modal-lista"></ul>
-      <p class="intro" style="margin:0">Aún no se cancela nada: la cancelación se confirma después de ver el estado de cada acuerdo. Si la tarea no está con el usuario de integración, se transferirá a él.</p>
+      <p class="intro" style="margin:0">Aún no se cancela nada: la cancelación se confirma después de ver el estado de cada acuerdo.<span data-modo="tarea"> Si la tarea no está con el usuario de integración, se transferirá a él.</span></p>
       <div class="acciones-modal">
         <button class="btn secundario chico" type="button" id="modal-volver">Volver</button>
         <button class="btn chico" type="button" id="modal-aceptar">Guardar y revisar</button>
@@ -524,8 +534,11 @@ REASIGNADO_OK
   <!-- Datos del flujo en OTCS. Van en textarea (contenido RCDATA: el HTML no interpreta etiquetas) y el script lee el valor como texto literal.
        ID Flujo a Cancelar es multivalor: el formato de DISPLAY no esta documentado (VALIDAR EN QA); el script solo extrae los numeros. -->
   <div hidden>
+    <!-- Modo DIRECTO (sin workflow): SUBWORKID llega vacio y no hay atributo que leer; el IF evita evaluar WFATTR sin workflow (VALIDAR EN QA). -->
+[LL_WEBREPORT_IF "[LL_REPTAG_&SUBWORKID /]" != "" /]
     <textarea id="dato-flujo" hidden readonly>[LL_REPTAG_&SUBWORKID WFATTR:"ID Flujo a Cancelar":DISPLAY /]</textarea>
     <textarea id="dato-subflujo" hidden readonly>[LL_REPTAG_&SUBWORKID WFATTR:"ID Subflujo a Cancelar":DISPLAY /]</textarea>
+[LL_WEBREPORT_ENDIF /]
     <!-- Filas devueltas por el LiveReport (columnas en este orden: WorkID, SubWorkID, TituloFlujo, TituloFirma, Mapa, Fecha,
          EstadoSubflujo, Atributos en JSON). Cada valor va en un textarea y el script lo lee como texto literal.
          VALIDAR EN QA: marcadores de fila y tags de columna por numero. -->
@@ -572,13 +585,23 @@ REASIGNADO_OK
      QA: orquestador en Render. PROD: Route de OpenShift.
      BASIC_USER / BASIC_PASS son placeholders: el valor real entra
      solo en el WebReport publicado, nunca en este archivo.
+     MODO DIRECTO (WebReport ejecutado sin workflow): no usa REPORT_ID ni el usuario de integracion, pero SI exige
+     CANCEL_DIRECT_ENABLED=true y CANCEL_DIRECT_AUTH_USER/PASS en el servidor (BASIC_USER_DIRECTO / BASIC_PASS_DIRECTO aqui). USUARIO_SOLICITANTE es opcional: login del usuario que abre la pagina,
+     solo para la auditoria del servidor (no autoriza nada). Vacio = no se envia. Rellenarlo solo con una tag de OTCS
+     que se haya validado en QA para entregar el login.
      ============================================================ */
   const SERVER_URL = 'https://signature-orchestrator-api-2gim.onrender.com';
   const BASIC_USER = 'ADOBE-LOGS';
   const BASIC_PASS = 'ADOBE-LOGS-PASS';
+  /* Modo directo: credencial PROPIA de POST /cancel/direct/auth. Deben ser IGUALES a CANCEL_DIRECT_AUTH_USER y CANCEL_DIRECT_AUTH_PASS
+     del servidor (sin relacion con BASIC_USER/BASIC_PASS ni con LOG_*). Placeholders: el valor real entra solo en el WebReport publicado.
+     Este WebReport DEBE estar restringido por permisos a un grupo autorizado: quien pueda leer su fuente puede cancelar flujos. */
+  const BASIC_USER_DIRECTO = 'CANCEL-DIRECT';
+  const BASIC_PASS_DIRECTO = 'CANCEL-DIRECT-PASS';
   const REPORT_ID = '12335607';
   const MAX_FLUJOS = 20;
   const ATRIBUTO = 'ID Flujo a Cancelar';
+  const USUARIO_SOLICITANTE = '';
   const ATRIBUTOS_FIRMA = { empleado: 4, documento: 7, docId: 6, correo: 10 };
   /* ============================ fin de la configuracion ============================ */
 
@@ -592,11 +615,23 @@ REASIGNADO_OK
   const DESTINO_FLUJO_RAW = valorDe('dato-flujo');
   const DESTINO_SUBFLUJO_RAW = valorDe('dato-subflujo');
 
+  /* Modo de la pagina. TAREA: los tres IDs de OTCS son numericos. DIRECTO: los tres estan SIN RESOLVER (vacios o con el texto de la
+     tag, porque la pagina corre sola, sin workflow). Cualquier otra combinacion es un error (CONTEXTO_INVALIDO). El modo directo
+     no usa los ramos guardar, leer ni reasignar. */
+  const CONTEXTO = [WORKFLOW_ID, SUBWORKFLOW_ID, TASK_ID];
+  const MODO_TAREA = CONTEXTO.every(esDigitos);
+  const MODO_DIRECTO = CONTEXTO.every(sinContexto);
+  /* Mezcla (por ejemplo una URL con workid pero sin taskid): no se elige ningun modo y no se llama al servidor (no falla abierto). */
+  const CONTEXTO_INVALIDO = !MODO_TAREA && !MODO_DIRECTO;
+  const MSG_CONTEXTO = 'Datos de la tarea inválidos: abra esta página desde la tarea "Cancelar Flujo de Firma" (o sin ningún dato de tarea, en modo directo).';
+  const RUTA_PREVIA = MODO_DIRECTO ? '/cancel/direct/preview' : '/cancel/preview';
+  const RUTA_CANCELAR = MODO_DIRECTO ? '/cancel/direct' : '/cancel';
+
   /* Marcas de los ramos. Se arman en JS para no aparecer en la pagina normal. */
   const MARCA_REASIGNADO = 'REASIGNADO' + '_OK';
   const MARCA_GUARDADO = 'GUARDADO' + '_OK';
   const MARCA_LEIDO = 'LEIDO' + '_OK';
-  const CLAVE_SEL = 'cancelar-sel-' + WORKFLOW_ID;
+  const CLAVE_SEL = MODO_DIRECTO ? 'cancelar-sel-directo' : 'cancelar-sel-' + WORKFLOW_ID;
   const COLUMNAS = ['workId', 'subWorkId', 'tituloFlujo', 'tituloFirma', 'mapa', 'fecha', 'estado', 'atributos'];
   const FILTROS = ['flujo', 'empleado', 'nombre', 'documento', 'desde', 'hasta'];
   const MSG_ASIGNAR = 'No fue posible asignar la tarea. Intente de nuevo.';
@@ -686,6 +721,19 @@ REASIGNADO_OK
     REASSIGN_REQUIRED: { mensaje: MSG_ASIGNAR, reintento: true }
   };
 
+  /* Textos que cambian en el modo directo (no hay tarea, formulario ni atributos). Se mezclan sobre CODIGOS con defCodigo(). */
+  const CODIGOS_DIRECTO = {
+    AMBIGUOUS: { detalle: 'Pida a soporte que lo cancele indicando el subflujo (POST /admin/cancel-workflow/{ID del flujo}).' },
+    MISSING_TARGET: { mensaje: 'No se indicó ningún flujo a cancelar. Seleccione al menos un flujo.' },
+    INVALID_TARGET: { mensaje: 'La lista de flujos a cancelar tiene valores no válidos (solo números). Cambie la selección.' },
+    TOO_MANY_TARGETS: { mensaje: 'Se seleccionaron más flujos de los permitidos. Cambie la selección para reducirla.' }
+  };
+
+  function defCodigo(codigo) {
+    const base = CODIGOS[codigo];
+    return base && MODO_DIRECTO && CODIGOS_DIRECTO[codigo] ? Object.assign({}, base, CODIGOS_DIRECTO[codigo]) : base;
+  }
+
   /* Estado del flujo original en Content (item.contentStop del /cancel; 'disabled' = el servidor no lo detiene: no se muestra). */
   const CONTENT_STOP = {
     stopped: { etq: 'Detenido en Content', tipo: 'ok' },
@@ -694,11 +742,13 @@ REASIGNADO_OK
   };
 
   /* Unico estado de la pagina. modo: seleccion | revision | planc. ultima: accion que repite Reintentar ('revisar' | 'cancelar').
-     destinoIds: lo que hay grabado en el atributo (lo que el servidor va a leer). seleccion: Map workId -> etiqueta. */
+     destinoIds: lo que hay grabado en el atributo (lo que el servidor va a leer); en el modo directo, la seleccion enviada.
+     seleccion: Map workId -> etiqueta. Solo modo directo: reintentoIds = pendientes del ultimo /cancel/direct (lo unico que repite
+     "Reintentar pendientes"; null = toda la seleccion); resultados = Map workId -> item acumulado entre intentos. */
   const state = {
     modo: 'seleccion', ocupado: false, intentado: false, paso: 'trabajo', handoff: null, reasignado: false, ultima: 'revisar',
     destinoIds: [], destinoSubflujo: '', cancelables: 0, hayParcial: false, stopOriginal: false, yaEjecutado: false,
-    filas: [], visibles: [], seleccion: new Map()
+    filas: [], visibles: [], seleccion: new Map(), reintentoIds: null, resultados: new Map()
   };
 
   /* ---------- Utilidades ---------- */
@@ -713,6 +763,13 @@ REASIGNADO_OK
 
   function esDigitos(v) {
     return /^\d+$/.test(String(v));
+  }
+
+  /* Valor de contexto sin resolver: vacio, '?' (como el OTCS muestra algunos valores vacios), o con el texto de la tag sin
+     evaluar (LL_REPTAG, WORKID, TASKID, corchetes o &). */
+  function sinContexto(v) {
+    const t = String(v === undefined || v === null ? '' : v).trim();
+    return t === '' || t === '?' || /LL_REPTAG|WORKID|TASKID|[&[\]]/i.test(t);
   }
 
   function esObjeto(v) {
@@ -781,14 +838,16 @@ REASIGNADO_OK
   function errorServidor(r, porDefecto) {
     const data = r.data;
     const codigo = typeof data.code === 'string' ? data.code : '';
-    const def = CODIGOS[codigo];
+    const def = defCodigo(codigo);
     const err = new Error(def ? def.mensaje : (mensajeDeError(data) || porDefecto));
     err.codigo = codigo;
     if (def) {
       err.sinReintento = !def.reintento;
       if (def.detalle) err.detalle = def.detalle;
     } else if (r.status === 404) {
-      err.message = 'La cancelación de flujos no está habilitada en el servidor.';
+      err.message = MODO_DIRECTO
+        ? 'La cancelación directa no está habilitada en el servidor (CANCEL_DIRECT_ENABLED).'
+        : 'La cancelación de flujos no está habilitada en el servidor.';
       err.sinReintento = true;
     }
     if (codigo === 'TOO_MANY_TARGETS' && Number.isFinite(data.max)) {
@@ -988,8 +1047,11 @@ REASIGNADO_OK
     $('nota-subflujo-ignorado').hidden = data.subworkflowIgnored !== true;
     const hayNoCancelables = grupos.firmados.length + grupos.resto.length + grupos.transitorios.length > 0;
     state.stopOriginal = data.stopOriginal === true;
-    $('nota-confirmar').textContent =
-      (state.stopOriginal
+    $('nota-confirmar').textContent = MODO_DIRECTO
+      ? 'Al confirmar, los acuerdos se cancelan en Adobe Sign y los flujos originales se detienen en Content Server (no continúan). ' +
+        'El servidor procesa toda la lista revisada' +
+        (hayNoCancelables ? ': los flujos que no se pueden cancelar quedan sin cambios y se informa el motivo' : '') + '.'
+      : (state.stopOriginal
         ? 'Al confirmar, los flujos se cancelan en Adobe Sign y se detienen en Content Server. '
         : 'Los flujos se cancelan solo en Adobe Sign; el flujo original se detiene en el paso siguiente. ') +
       'El servidor procesa toda la lista del atributo' +
@@ -1025,7 +1087,7 @@ REASIGNADO_OK
   function filaResultado(it) {
     const outcome = it.outcome;
     const codigo = typeof it.code === 'string' ? it.code : '';
-    const def = CODIGOS[codigo];
+    const def = defCodigo(codigo);
     let etq = 'Desconocido';
     let tipo = 'neutro';
     if (outcome === 'cancelled') { etq = it.alreadyCancelled === true ? 'Ya estaba cancelado' : 'Cancelado'; tipo = 'ok'; }
@@ -1063,14 +1125,48 @@ REASIGNADO_OK
     return 'Cancelados: ' + c + ' · No cancelados: ' + r + ' · Pendientes: ' + p;
   }
 
+  /* Modo directo: el resultado se acumula entre intentos (el reintento solo manda los pendientes, pero la pantalla muestra todos
+     los flujos de la seleccion en su orden). Devuelve los items a mostrar y fija lo que repetira "Reintentar pendientes". */
+  function acumularResultados(data) {
+    const nuevos = Array.isArray(data.items) ? data.items.filter(esObjeto) : [];
+    nuevos.forEach((it) => state.resultados.set(String(it.workflowId), it));
+    const items = state.destinoIds.map((id) => state.resultados.get(id)).filter(Boolean);
+    const pendientes = items.filter((i) => i.outcome === 'pending').map((i) => String(i.workflowId));
+    state.reintentoIds = data.complete !== true && pendientes.length ? pendientes : null;
+    return items;
+  }
+
+  /* Fin del modo directo con complete:true. Nada de "la tarea continua": no hay tarea ni SendOn. */
+  function mostrarFinDirecto(items) {
+    const cancelados = items.filter((i) => i.outcome === 'cancelled').length;
+    const sinCancelar = items.length - cancelados;
+    state.yaEjecutado = true;
+    limpiarSeleccionLocal();
+    ORDEN_PASOS.forEach((p) => pintarPaso(p, 'hecho'));
+    if (cancelados > 0 && sinCancelar === 0) {
+      mostrarInsignia('ok');
+      setEstado('Proceso terminado. Los acuerdos se cancelaron en Adobe Sign y los flujos originales se detuvieron en Content Server.', 'ok');
+    } else if (cancelados > 0) {
+      mostrarInsignia('aviso');
+      setEstado('Proceso terminado con diferencias. Se cancelaron ' + cancelados + ' flujo(s) en Adobe Sign y se detuvieron en Content Server; ' +
+        sinCancelar + ' no se pudieron cancelar (vea el motivo de cada uno).', 'aviso');
+    } else {
+      mostrarInsignia('aviso');
+      setEstado('Proceso terminado, pero no se canceló ningún flujo (vea el motivo de cada uno).', 'aviso');
+    }
+    mostrarDetalle(resumenItems(items) + '. Puede cerrar esta ventana o recargar la página para una nueva búsqueda.');
+  }
+
   function mostrarFinCancelacion(data) {
-    const items = Array.isArray(data.items) ? data.items.filter(esObjeto) : [];
+    const items = MODO_DIRECTO ? acumularResultados(data) : (Array.isArray(data.items) ? data.items.filter(esObjeto) : []);
     const notaSub = data.subworkflowIgnored === true ? ' "ID Subflujo a Cancelar" se ignoró (hay varios flujos).' : '';
     $('vista-prevista').hidden = true;
     ocultar(['btn-confirmar', 'btn-revisar', 'btn-cambiar']);
     pintarResultado(items);
     mostrarDetalle(resumenItems(items));
-    if (data.complete === true) {
+    if (MODO_DIRECTO && data.complete === true) {
+      mostrarFinDirecto(items);
+    } else if (data.complete === true) {
       state.yaEjecutado = true;
       ORDEN_PASOS.forEach((p) => pintarPaso(p, 'hecho'));
       mostrarInsignia('ok');
@@ -1084,7 +1180,9 @@ REASIGNADO_OK
       pintarPaso(state.paso, 'aviso');
       mostrarInsignia('aviso');
       const pend = items.filter((i) => i.outcome === 'pending').length;
-      setEstado('Quedan ' + (pend || 'algunos') + ' flujo(s) pendiente(s). No se registró nada ni se avanzó la tarea: repetir es seguro.', 'aviso');
+      setEstado('Quedan ' + (pend || 'algunos') + ' flujo(s) pendiente(s). ' + (MODO_DIRECTO
+        ? 'Repetir es seguro: solo se reintentan los pendientes y los ya cancelados no se cancelan de nuevo.'
+        : 'No se registró nada ni se avanzó la tarea: repetir es seguro.'), 'aviso');
       const b = $('btn-reintentar');
       b.textContent = 'Reintentar pendientes';
       b.hidden = false;
@@ -1127,25 +1225,42 @@ REASIGNADO_OK
     return { ok: resp.ok, status: resp.status, data: data && typeof data === 'object' ? data : {} };
   }
 
-  /* Campos del pedido. Son los mismos en /auth, /cancel/preview y /cancel (la firma los cubre): solo el workflow de cancelacion.
-     Los flujos a cancelar NO viajan: el servidor los lee del formulario de la tarea. */
-  function camposCancelacion() {
+  /* Campos del pedido. Son los mismos en /auth y en la ruta (la firma los cubre).
+     TAREA: solo el workflow de cancelacion; los flujos a cancelar NO viajan: el servidor los lee del formulario de la tarea.
+     DIRECTO: los flujos viajan (targetWorkflowIds, la misma lista y orden en /auth y en la ruta: el HMAC los vincula).
+     No se manda targetSubworkflowId: la seleccion es por WorkID (se cancela y detiene el flujo padre) y el servidor rechaza como
+     AMBIGUOUS un flujo con varios acuerdos abiertos en vez de cancelar solo uno. requestedBy (opcional) no entra en el HMAC. */
+  function camposCancelacion(ids) {
+    if (MODO_DIRECTO) {
+      const campos = { targetWorkflowIds: ids.slice() };
+      if (USUARIO_SOLICITANTE) campos.requestedBy = USUARIO_SOLICITANTE;
+      return campos;
+    }
     return { workflowId: WORKFLOW_ID, subworkflowId: SUBWORKFLOW_ID };
   }
 
   async function obtenerFirma(campos) {
-    const cabeceras = { ...CABECERAS, Authorization: 'Basic ' + btoa(BASIC_USER + ':' + BASIC_PASS) };
-    const r = await postJson(SERVER_URL + '/auth', campos, cabeceras);
+    if (CONTEXTO_INVALIDO) throw new Error(MSG_CONTEXTO);
+    /* Modo directo: /cancel/direct/auth con la credencial propia; modo tarea: el /auth de siempre */
+    const usuario = MODO_DIRECTO ? BASIC_USER_DIRECTO : BASIC_USER;
+    const clave = MODO_DIRECTO ? BASIC_PASS_DIRECTO : BASIC_PASS;
+    const cabeceras = { ...CABECERAS, Authorization: 'Basic ' + btoa(usuario + ':' + clave) };
+    const r = await postJson(SERVER_URL + (MODO_DIRECTO ? '/cancel/direct/auth' : '/auth'), campos, cabeceras);
+    if (MODO_DIRECTO && r.status === 404) {
+      const err = new Error('La cancelación directa no está habilitada en el servidor (CANCEL_DIRECT_ENABLED y CANCEL_DIRECT_AUTH_USER/PASS).');
+      err.sinReintento = true;
+      throw err;
+    }
     if (!r.ok || !r.data.signature) {
       throw new Error('No se pudieron obtener las credenciales de autenticación.');
     }
     return { timestamp: r.data.timestamp, nonce: r.data.nonce, signature: r.data.signature };
   }
 
-  /* /auth + la ruta (/cancel/preview o /cancel). Devuelve la respuesta tal cual (ok, status, data).
-     Cada pedido usa un /auth nuevo (el nonce es de un solo uso). */
-  async function pedir(ruta) {
-    const campos = camposCancelacion();
+  /* /auth + la ruta (RUTA_PREVIA o RUTA_CANCELAR). Devuelve la respuesta tal cual (ok, status, data).
+     Cada pedido usa un /auth nuevo (el nonce es de un solo uso). ids: solo en el modo directo (la lista a enviar). */
+  async function pedir(ruta, ids) {
+    const campos = camposCancelacion(ids);
     const firma = await obtenerFirma(campos);
     return postJson(SERVER_URL + ruta, { ...campos, ...firma }, CABECERAS);
   }
@@ -1201,7 +1316,8 @@ REASIGNADO_OK
 
   /* Pedido con reasignacion. Si el servidor exige reasignar antes (REASSIGN_REQUIRED: la tarea sigue con el usuario),
      reasigna y repite /auth + la ruta una sola vez (nuevo /auth: el nonce ya se uso). */
-  async function conReasignacion(ruta, textoTrabajo) {
+  async function conReasignacion(ruta, textoTrabajo, ids) {
+    if (MODO_DIRECTO) return pedir(ruta, ids); // sin tarea no hay nada que reasignar (el servidor no devuelve REASSIGN_REQUIRED)
     let r = await pedir(ruta);
     if (reasignaRequerido(r) && r.data.handoff) {
       state.handoff = r.data.handoff;
@@ -1506,7 +1622,7 @@ REASIGNADO_OK
       state.seleccion.set(id, fila ? etiquetaDe(fila) : (previa.get(id) || ''));
     });
     setEstadoSel('', '');
-    $('btn-volver-guardados').hidden = state.destinoIds.length === 0;
+    $('btn-volver-guardados').hidden = !MODO_TAREA || state.destinoIds.length === 0;
     mostrarModo('seleccion');
     refrescar();
   }
@@ -1514,7 +1630,7 @@ REASIGNADO_OK
   /* Desde el plan C: vuelve a la seleccion tal como estaba (no la reemplaza por lo grabado). */
   function volverASeleccionActual() {
     setEstadoSel('', '');
-    $('btn-volver-guardados').hidden = state.destinoIds.length === 0;
+    $('btn-volver-guardados').hidden = !MODO_TAREA || state.destinoIds.length === 0;
     mostrarModo('seleccion');
     refrescar();
   }
@@ -1541,7 +1657,9 @@ REASIGNADO_OK
   function abrirModal() {
     const ids = Array.from(state.seleccion.keys());
     if (!ids.length) return;
-    $('modal-texto').textContent = 'Se guardarán ' + ids.length + (ids.length === 1 ? ' flujo' : ' flujos') + ' en el atributo "' + ATRIBUTO + '" de esta tarea y se revisará su estado en Adobe Sign:';
+    $('modal-texto').textContent = MODO_DIRECTO
+      ? 'Se revisará en Adobe Sign el estado de ' + ids.length + (ids.length === 1 ? ' flujo:' : ' flujos:')
+      : 'Se guardarán ' + ids.length + (ids.length === 1 ? ' flujo' : ' flujos') + ' en el atributo "' + ATRIBUTO + '" de esta tarea y se revisará su estado en Adobe Sign:';
     const ul = $('modal-lista');
     ul.textContent = '';
     state.seleccion.forEach((etq, id) => ul.appendChild(h('li', null, h('span', { class: 'id' }, id), etq ? h('span', null, etq) : null)));
@@ -1567,11 +1685,15 @@ REASIGNADO_OK
      consulta al servidor. Sin ids (los flujos ya estaban grabados, o "Revisar de nuevo"): va directo a la prevista.
      Si los ids son los mismos que ya hay grabados, no vuelve a grabar. */
   async function revisar(ids) {
-    if (state.ocupado) return;
+    if (state.ocupado || CONTEXTO_INVALIDO) return;
     state.ocupado = true;
     state.intentado = true;
     state.ultima = 'revisar';
-    const guardarAntes = Array.isArray(ids) && !mismosIds(ids, state.destinoIds);
+    const guardarAntes = MODO_TAREA && Array.isArray(ids) && !mismosIds(ids, state.destinoIds);
+    if (MODO_DIRECTO && Array.isArray(ids)) { // sin atributo que grabar: la seleccion es la lista que viajara al servidor
+      state.destinoIds = ids.slice();
+      pintarDatos();
+    }
     mostrarModo('revision');
     reiniciarVista();
     $('bloque-destino').hidden = guardarAntes;
@@ -1590,7 +1712,7 @@ REASIGNADO_OK
         $('bloque-destino').hidden = false;
       }
       pasoActivo('trabajo');
-      const r = await conReasignacion('/cancel/preview', 'Consultando en Adobe Sign');
+      const r = await conReasignacion(RUTA_PREVIA, 'Consultando en Adobe Sign', state.destinoIds);
       if (!r.ok) throw errorServidor(r, 'No se pudo revisar los flujos.');
       renderPrevista(r.data);
     } catch (err) {
@@ -1605,7 +1727,9 @@ REASIGNADO_OK
 
   /* Etapa D: /auth + POST /cancel. Reintentar la repite desde /auth (idempotente en el servidor). */
   async function cancelarLote() {
-    if (state.ocupado) return;
+    if (state.ocupado || CONTEXTO_INVALIDO) return;
+    const reintento = state.ultima === 'cancelar'; // Reintentar (o repeticion tras un error): conserva resultados y pendientes
+    if (MODO_DIRECTO && !reintento) { state.resultados = new Map(); state.reintentoIds = null; }
     state.ocupado = true;
     state.intentado = true;
     state.ultima = 'cancelar';
@@ -1615,7 +1739,8 @@ REASIGNADO_OK
     mostrarPasos('Cancelando en Adobe Sign', false);
     try {
       pasoActivo('trabajo');
-      const r = await conReasignacion('/cancel', 'Cancelando en Adobe Sign');
+      /* Modo directo: tras un lote incompleto, Reintentar manda SOLO los pendientes (nuevo /auth con esa lista); es idempotente. */
+      const r = await conReasignacion(RUTA_CANCELAR, 'Cancelando en Adobe Sign', state.reintentoIds || state.destinoIds);
       if (!r.ok) throw errorServidor(r, 'No se pudo cancelar los flujos.');
       mostrarFinCancelacion(r.data);
     } catch (err) {
@@ -1631,16 +1756,38 @@ REASIGNADO_OK
 
   /* ---------- Arranque ---------- */
 
+  /* Contexto mezclado: solo el error, sin botones ni eventos; nada llega al servidor. */
+  function mostrarContextoInvalido() {
+    console.error('[cancelar] contexto de tarea inválido:', CONTEXTO);
+    mostrarModo('revision');
+    reiniciarVista();
+    $('bloque-destino').hidden = true;
+    mostrarInsignia('error');
+    setEstado(MSG_CONTEXTO, 'error');
+  }
+
   function iniciar() {
+    if (CONTEXTO_INVALIDO) {
+      mostrarContextoInvalido();
+      return;
+    }
     $('max-flujos').textContent = String(MAX_FLUJOS);
     state.filas = leerFilas();
     state.visibles = state.filas.slice();
     pintarTabla();
 
     /* Lo que ya hay en el atributo (reapertura: pendientes de un lote anterior, o IDs pegados a mano). */
-    const guardados = extraerIds(DESTINO_FLUJO_RAW);
+    /* Modo de la pagina: muestra solo los textos de su modo (data-modo) y, en el directo, no hay atributo que leer ni subflujo. */
+    document.querySelectorAll('[data-modo]').forEach((el) => {
+      el.hidden = el.getAttribute('data-modo') !== (MODO_DIRECTO ? 'directo' : 'tarea');
+    });
+    if (MODO_DIRECTO) {
+      $('destino').hidden = true;
+      $('modal-aceptar').textContent = 'Revisar';
+    }
+    const guardados = MODO_TAREA ? extraerIds(DESTINO_FLUJO_RAW) : [];
     state.destinoIds = guardados;
-    state.destinoSubflujo = esDigitos(DESTINO_SUBFLUJO_RAW) ? DESTINO_SUBFLUJO_RAW : '';
+    state.destinoSubflujo = MODO_TAREA && esDigitos(DESTINO_SUBFLUJO_RAW) ? DESTINO_SUBFLUJO_RAW : '';
 
     $('chk-todos').addEventListener('change', (e) => alternarTodos(e.target.checked));
     $('chk-todos-2').addEventListener('change', (e) => alternarTodos(e.target.checked));
@@ -1674,7 +1821,7 @@ REASIGNADO_OK
       $('inicio-reabierto').hidden = true;
       const crudo = DESTINO_FLUJO_RAW;
       mostrarModo('seleccion');
-      if (crudo && crudo !== '?') setEstadoSel('El atributo "' + ATRIBUTO + '" tiene un valor que no se reconoce: ' + crudo.slice(0, 120), 'aviso');
+      if (MODO_TAREA && crudo && crudo !== '?') setEstadoSel('El atributo "' + ATRIBUTO + '" tiene un valor que no se reconoce: ' + crudo.slice(0, 120), 'aviso');
       refrescar();
     }
   }

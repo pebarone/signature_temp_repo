@@ -117,6 +117,9 @@ WF_ATTR_INTEGRATION_STATE=Estado Integración Firma
 
 # Flow cancellation (see "Flow cancellation"). The names below are PROVISIONAL: the cancellation workflow map does not exist yet
 CANCEL_ENABLED=false                  # true => POST /cancel (WebReport of the cancellation workflow) exists; false => 404. /admin/cancel* do not depend on it
+CANCEL_DIRECT_ENABLED=false           # true (and CANCEL_ENABLED=true, and both credentials below) => POST /cancel/direct/auth, /cancel/direct and /cancel/direct/preview exist (WebReport run on its own, no workflow; always stops the original flow); otherwise 404
+CANCEL_DIRECT_AUTH_USER=              # Basic Auth user of POST /cancel/direct/auth. NO fallback to START_AUTH_* or LOG_*; empty => direct mode is not mounted (error logged at startup)
+CANCEL_DIRECT_AUTH_PASS=              # Basic Auth password of POST /cancel/direct/auth (keep it in a Secret)
 CANCEL_TASK_NAMES=Cancelar Flujo de Firma         # task of the cancellation workflow that runs the WebReport (prefix match, comma list)
 CANCEL_FIELD_TARGET_WORKFLOW=ID Flujo a Cancelar  # label of the task form attribute with the ID of the flow to cancel (mandatory, numeric)
 CANCEL_FIELD_TARGET_SUBWORKFLOW=ID Subflujo a Cancelar  # label of the optional attribute with its sub-process (numeric)
@@ -304,6 +307,19 @@ cancellation is confirmed); `404` no agreement known for the flow (the old orche
 wrong step; `422` missing/invalid target attribute; `503` Adobe or OTCS unavailable (nothing marked) or `SENDON_FAILED`
 (agreement cancelled, task not sent on: repeating is safe). Error bodies are `{ error, code, ... }`.
 
+**Direct mode** (`POST /cancel/direct/auth`, `POST /cancel/direct/preview` and `POST /cancel/direct`; only with `CANCEL_ENABLED=true`, `CANCEL_DIRECT_ENABLED=true`
+**and** `CANCEL_DIRECT_AUTH_USER`/`CANCEL_DIRECT_AUTH_PASS`, otherwise `404`). The same WebReport run on its own, without a workflow: there is no task, form or SendOn.
+`POST /cancel/direct/auth` (its own Basic credentials, no fallback to `START_AUTH_*`/`LOG_*`) is called with
+`{targetWorkflowIds: [...], targetSubworkflowId?, requestedBy?}` and returns `{ v: 2, timestamp, nonce, signature }` signed with a **derived key**
+(`HMAC-SHA256(SIGNATURE_SECRET, 'cancel-direct')`); the routes verify with that key, so signatures from the generic `/auth` never work on the direct
+routes and direct signatures never work on `/start` or `/cancel`. The route is then called with the same fields plus `timestamp`, `nonce`, `signature`.
+The targets are bound to the HMAC (when `targetWorkflowIds` is present the canonical string gets two extra lines, the target list and
+`targetSubworkflowId`; without it the canonical string is unchanged). It cancels each agreement on Adobe and **always** stops the original
+flow in the Content Server, regardless of `CANCEL_STOP_ORIGINAL`. The response is `{ mode: "direct", complete, sentOn: false, items,
+summary, stopOriginal: true, subworkflowIgnored }`; `422` `MISSING_TARGET` / `INVALID_TARGET` / `TOO_MANY_TARGETS`. `requestedBy`
+is self-declared (not in the HMAC) and only goes to `cancel_source` and the Adobe comment. Authorization relies on the WebReport
+permissions in the OTCS and the direct Basic credentials (which sit in the published script: restrict that WebReport); `POST /admin/cancel-workflow` (`LOG_*`) is a separate, pre-existing path. See `webreports/cancelacion/README.md`.
+
 Rules: the open agreement is looked up by `workflowId` (and the exact `subworkflowId`, if given) — never the agreement of
 another sub-process; a reconciliation already running on the agreement is awaited first (`CANCEL_SETTLE_TIMEOUT_MS`, else `503 RECONCILE_IN_PROGRESS`);
 the Adobe state is checked next (`CANCELLED`/`ABORTED` => idempotent, no new cancellation, except `CANCELLED` caused by a signer's
@@ -432,7 +448,7 @@ it does not provide an atomic lock against other processes writing the same node
 
 - No sensitive tokens are exposed on the frontend. The WebReport only holds the Basic credential of `/auth` (use `START_AUTH_*`, which does not open `/admin` or `/logs`); the HMAC key never leaves the server.
 - `/start` cannot be forged from the browser: the signature binds the request fields, expires in 2 min and its nonce is single use; the server re-reads the workflow in the OTCS and uses those values (from the start task form when the integration user holds it, or from the workflow attributes while a standalone task is still with the user; the `SendOn` only happens once the integration user holds the task).
-- CORS is limited to `/auth`, `/start` and (only with `CANCEL_ENABLED=true`) `/cancel`, and to the OTCS origin (`CORS_ORIGINS`). `/cancel` never takes the target flow from the browser: it comes from the cancellation task form in the OTCS.
+- CORS is limited to `/auth`, `/start` and (only with `CANCEL_ENABLED=true`; `/cancel/direct*` also needs `CANCEL_DIRECT_ENABLED=true`) `/cancel`, and to the OTCS origin (`CORS_ORIGINS`). `/cancel` never takes the target flow from the browser: it comes from the cancellation task form in the OTCS.
 - Passwords and keys are read from the `.env` file.
 - Webhook filters out irrelevant events and only processes mapped agreements; events are deduplicated and failures are retried, never swallowed.
 

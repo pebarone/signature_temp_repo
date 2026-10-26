@@ -6,8 +6,13 @@
 //                                 um a um (cancelWorkflow), grava os cancelados no atributo de resultado e faz o SendOn da
 //                                 tarefa do workflow de cancelamento
 //   previewFromTask(input)     -> POST /cancel/preview: classifica cada alvo SEM cancelar nem gravar nada
-// O orquestrador NÃO encerra o fluxo original no Content: isso é do workflow de cancelamento. Por isso o acordo
-// cancelado fica "concluído" (agreementState.cancelRequestedPatch) e o AGREEMENT_RECALLED posterior não gera Rechazado.
+//   cancelDirect(input)        -> POST /cancel/direct (MODO DIRETO: WebReport executado sozinho, sem workflow): os alvos vêm do
+//                                 corpo (vinculados ao HMAC), cancela no Adobe e SEMPRE para o fluxo original no Content; sem
+//                                 tarefa, formulário nem SendOn
+//   previewDirect(input)       -> POST /cancel/direct/preview: prévia do modo direto (nada é cancelado nem parado)
+// No modo da tarefa o orquestrador só para o fluxo original no Content com CANCEL_STOP_ORIGINAL; sem ele isso é do workflow
+// de cancelamento. Em todo caso o acordo cancelado fica "concluído" (agreementState.cancelRequestedPatch) e o
+// AGREEMENT_RECALLED posterior não gera Rechazado.
 // Decisões e pontos em aberto: docs/DESIGN_TICKET_2026060410003715.md.
 const { describeError } = require('../infra/util');
 const { locate, normalizeName } = require('../domain/workflowSteps');
@@ -24,6 +29,8 @@ const DEFAULT_BATCH_BUDGET_MS = 15000;
 const DEFAULT_MAX_TARGETS = 20;
 const MAX_SENDON_COMMENT_LENGTH = 1000;
 const DEFAULT_COMMENT = 'Flujo cancelado desde Content Server.';
+const DIRECT_COMMENT = 'Flujo cancelado desde Content Server (WebReport de cancelación).';
+const MAX_REQUESTED_BY_LENGTH = 64;
 const CANCEL_ERROR_MESSAGE = 'Error al cancelar el flujo.';
 
 const clean = (v) => (v === undefined || v === null ? '' : String(v).trim());
@@ -46,6 +53,11 @@ const notRegistered = (id) => fail(404, `Acuerdo ${id} no registrado en el orque
 // Comentário do cancelamento (o Adobe o mostra a quem for avisado): sem controles, limitado, com texto padrão
 const cleanComment = (c) =>
   clean(String(c ?? '').replace(/[\u0000-\u001f\u007f]+/g, ' ')).slice(0, MAX_COMMENT_LENGTH) || DEFAULT_COMMENT;
+
+// Usuário que a página do modo direto declara ter feito o pedido: texto simples de uma linha (só para auditoria e log;
+// NUNCA autorização, porque é autodeclarado). Vazio se não for texto ou se nada sobrar depois da limpeza.
+const cleanRequestedBy = (v) =>
+  (typeof v === 'string' ? v.replace(/[^A-Za-z0-9._@-]+/g, '').slice(0, MAX_REQUESTED_BY_LENGTH) : '');
 
 // Entrada do formulário da tarefa pelo rótulo (exato; senão ignorando acentos/caixa)
 const fieldEntry = (fields, label) => {
@@ -429,8 +441,9 @@ function createCancellationService({
   }
 
   // Item do lote para um alvo: cancelWorkflow (lógica e idempotência unitárias) traduzido em cancelled/refused/pending;
-  // com cancel.stopOriginal, o Adobe confirmado é seguido do stop do original (falha => pending STOP_FAILED)
-  async function cancelTarget(workflowId, { subworkflowId, comment, source, settleTimeoutMs }) {
+  // com stopOriginal (cancel.stopOriginal no modo da tarefa; sempre no modo direto), o Adobe confirmado é seguido do stop
+  // do original (falha => pending STOP_FAILED)
+  async function cancelTarget(workflowId, { subworkflowId, comment, source, settleTimeoutMs, stopOriginal = false }) {
     try {
       const out = await cancelWorkflow(workflowId, { subworkflowId, comment, source, settleTimeoutMs });
       const item = {
@@ -442,7 +455,7 @@ function createCancellationService({
         contentStop: 'disabled',
         message: out.alreadyCancelled ? 'El acuerdo ya estaba cancelado.' : 'Acuerdo cancelado.'
       };
-      if (!config.cancel?.stopOriginal) return item;
+      if (!stopOriginal) return item;
       const stop = await stopOriginalFlow(workflowId);
       if (typeof stop === 'string') return { ...item, contentStop: stop };
       const permissions = [400, 401, 403].includes(stop.httpStatus)
@@ -486,6 +499,21 @@ function createCancellationService({
       .slice(0, MAX_SENDON_COMMENT_LENGTH);
   }
 
+  // Laço do lote (comum à tarefa e ao modo direto): prazo único, um item por vez, resumo por resultado
+  async function runBatch(ids, { subworkflowId, comment, source, stopOriginal }) {
+    const deadline = makeDeadline();
+    const settleCap = Number(config.cancel?.settleTimeoutMs) || DEFAULT_SETTLE_TIMEOUT_MS;
+    const items = [];
+    for (const workflowId of ids) {
+      const remaining = deadline.remaining();
+      items.push(remaining <= 0
+        ? budgetItem(workflowId)
+        : await cancelTarget(workflowId, { subworkflowId, comment, source, stopOriginal, settleTimeoutMs: Math.min(settleCap, remaining) }));
+    }
+    const count = (outcome) => items.filter((i) => i.outcome === outcome).length;
+    return { items, summary: { total: items.length, cancelled: count('cancelled'), refused: count('refused'), pending: count('pending') } };
+  }
+
   /*
     POST /cancel (WebReport do workflow de cancelamento), em LOTE. Os alvos vêm SEMPRE do formulário da tarefa (nunca do
     corpo), ver readTask/readTargets. Processa em sequência com cancelWorkflow dentro de cancel.batchBudgetMs; cada item
@@ -511,19 +539,9 @@ function createCancellationService({
     }
 
     const stopOriginal = !!cfg.stopOriginal;
-    const deadline = makeDeadline();
-    const settleCap = Number(cfg.settleTimeoutMs) || DEFAULT_SETTLE_TIMEOUT_MS;
     const source = `workflow:${task.processId}/${task.subprocessId}`;
     const comment = `Flujo cancelado desde Content Server (workflow de cancelación ${task.processId}).`;
-    const items = [];
-    for (const workflowId of ids) {
-      const remaining = deadline.remaining();
-      items.push(remaining <= 0
-        ? budgetItem(workflowId)
-        : await cancelTarget(workflowId, { subworkflowId, comment, source, settleTimeoutMs: Math.min(settleCap, remaining) }));
-    }
-    const count = (outcome) => items.filter((i) => i.outcome === outcome).length;
-    const summary = { total: items.length, cancelled: count('cancelled'), refused: count('refused'), pending: count('pending') };
+    const { items, summary } = await runBatch(ids, { subworkflowId, comment, source, stopOriginal });
     const where = `${task.processId}/${task.subprocessId}/${task.taskId}`;
 
     if (summary.pending) {
@@ -643,21 +661,8 @@ function createCancellationService({
     }
   }
 
-  /*
-    POST /cancel/preview: mesma leitura e validação do /cancel (tarefa ativa, atribuída, alvos do formulário), mas só
-    CONSULTA: nenhum cancelAgreement, nenhuma escrita no repositório (sem hold/inflight/settle), nenhum updateTaskForm e
-    nenhum SendOn. Mesmo orçamento de tempo: alvos não iniciados ao estourar => state 'pendiente'.
-    => { items, summary: { total, <state>: n }, subworkflowIgnored, resultFieldMissing? (true só se a gravação está ligada e o atributo falta) }. Estados e `cancelable`: ver a spec do lote
-    (cancelable null = não se sabe: no_disponible e pendiente).
-  */
-  async function previewFromTask(input = {}) {
-    const { task, form } = await readTask(input);
-    const { ids, subworkflowId, subworkflowIgnored } = readTargets(form, task, input);
-
-    // A prévia segue normalmente; resultFieldMissing avisa a página antes de confirmar o cancelamento
-    const resultLabel = clean(config.cancel?.fields?.result);
-    const resultFieldMissing = !!resultLabel && !fieldEntry(form.fields, resultLabel)?.key;
-
+  // Laço da prévia (comum à tarefa e ao modo direto): mesmo prazo do lote; alvos não iniciados ao estourar => 'pendiente'
+  async function runPreview(ids, subworkflowId) {
     const deadline = makeDeadline();
     const items = [];
     for (const workflowId of ids) {
@@ -674,10 +679,89 @@ function createCancellationService({
     }
     const summary = { total: items.length };
     for (const i of items) summary[i.state] = (summary[i.state] || 0) + 1;
+    return { items, summary };
+  }
+
+  /*
+    POST /cancel/preview: mesma leitura e validação do /cancel (tarefa ativa, atribuída, alvos do formulário), mas só
+    CONSULTA: nenhum cancelAgreement, nenhuma escrita no repositório (sem hold/inflight/settle), nenhum updateTaskForm e
+    nenhum SendOn. Mesmo orçamento de tempo: alvos não iniciados ao estourar => state 'pendiente'.
+    => { items, summary: { total, <state>: n }, subworkflowIgnored, resultFieldMissing? (true só se a gravação está ligada e o atributo falta) }. Estados e `cancelable`: ver a spec do lote
+    (cancelable null = não se sabe: no_disponible e pendiente).
+  */
+  async function previewFromTask(input = {}) {
+    const { task, form } = await readTask(input);
+    const { ids, subworkflowId, subworkflowIgnored } = readTargets(form, task, input);
+
+    // A prévia segue normalmente; resultFieldMissing avisa a página antes de confirmar o cancelamento
+    const resultLabel = clean(config.cancel?.fields?.result);
+    const resultFieldMissing = !!resultLabel && !fieldEntry(form.fields, resultLabel)?.key;
+
+    const { items, summary } = await runPreview(ids, subworkflowId);
     return { items, summary, stopOriginal: !!config.cancel?.stopOriginal, subworkflowIgnored, ...(resultFieldMissing ? { resultFieldMissing: true } : {}) };
   }
 
-  return { cancelAgreement, cancelWorkflow, cancelFromTask, previewFromTask };
+  // ---------- modo direto (WebReport executado sozinho, sem workflow) ----------
+
+  /*
+    Alvos do corpo (já autenticado: o HMAC v2 + nonce vinculam targetWorkflowIds e targetSubworkflowId, ver
+    middleware/hmac.js). targetWorkflowIds precisa ser LISTA (senão 422 INVALID_TARGET). O subprocesso opcional só vale
+    com UM alvo (com vários é ignorado: subworkflowIgnored). 422 MISSING_TARGET / INVALID_TARGET / TOO_MANY_TARGETS.
+  */
+  function readDirectTargets(input) {
+    const max = Number(config.cancel?.maxTargets) || DEFAULT_MAX_TARGETS;
+    const raw = input.targetWorkflowIds;
+    if (!Array.isArray(raw)) {
+      throw fail(422, 'targetWorkflowIds debe ser una lista de IDs numéricos.', { code: 'INVALID_TARGET', invalid: [] });
+    }
+    // Só texto ou número por item (objetos e afins nunca viram ID; null/undefined são vazios e saem em parseTargets)
+    const { ids, invalid, overLimit } = parseTargets(
+      raw.map((x) => (x == null || typeof x === 'string' || typeof x === 'number' ? x : '[inválido]')), { max }
+    );
+    const sub = clean(input.targetSubworkflowId);
+    const badSubs = sub && !isNumeric(sub) ? [sub] : [];
+    if (invalid.length || badSubs.length) {
+      throw fail(422, 'El ID del flujo o del subflujo a cancelar no es válido.', {
+        code: 'INVALID_TARGET', invalid: [...invalid, ...badSubs]
+      });
+    }
+    if (!ids.length) throw fail(422, 'No se indicó ningún flujo a cancelar.', { code: 'MISSING_TARGET' });
+    if (overLimit) {
+      throw fail(422, `Se pueden cancelar como máximo ${max} flujos por solicitud.`, { code: 'TOO_MANY_TARGETS', max });
+    }
+    const subworkflowIgnored = ids.length > 1 && !!sub;
+    if (subworkflowIgnored) {
+      logger.warn(`[CANCEL] Directo: hay ${ids.length} flujos a cancelar; el subflujo ${sub} se ignora (solo vale con un flujo)`);
+    }
+    return { ids, subworkflowId: ids.length === 1 ? sub : '', subworkflowIgnored };
+  }
+
+  /*
+    POST /cancel/direct: cancela o lote no Adobe e SEMPRE para o fluxo original no Content (não há passo seguinte de um
+    workflow de cancelamento que o faça), qualquer que seja CANCEL_STOP_ORIGINAL. Nunca lê tarefa nem formulário, não
+    grava atributos e não faz SendOn (sentOn: false). complete = nenhum item pendente; repetir é seguro (alreadyCancelled /
+    already_stopped). `requestedBy` (autodeclarado pela página) só entra no source e no comentário, para auditoria.
+  */
+  async function cancelDirect(input = {}) {
+    const { ids, subworkflowId, subworkflowIgnored } = readDirectTargets(input);
+    const user = cleanRequestedBy(input.requestedBy);
+    const source = user ? `webreport:direct:${user}` : 'webreport:direct';
+    const comment = DIRECT_COMMENT + (user ? ` Solicitado por ${user}.` : '');
+    const { items, summary } = await runBatch(ids, { subworkflowId, comment, source, stopOriginal: true });
+    const resumen = `${summary.cancelled} cancelados, ${summary.refused} rechazados, ${summary.pending} pendientes`;
+    if (summary.pending) logger.warn(`[CANCEL] Directo (${source}): lote incompleto (${resumen}); se debe repetir`);
+    else logger.info(`[CANCEL] Directo (${source}): lote concluido (${resumen})`);
+    return { mode: 'direct', complete: !summary.pending, sentOn: false, items, summary, stopOriginal: true, subworkflowIgnored };
+  }
+
+  // POST /cancel/direct/preview: só consulta (nada é cancelado nem parado)
+  async function previewDirect(input = {}) {
+    const { ids, subworkflowId, subworkflowIgnored } = readDirectTargets(input);
+    const { items, summary } = await runPreview(ids, subworkflowId);
+    return { mode: 'direct', items, summary, stopOriginal: true, subworkflowIgnored };
+  }
+
+  return { cancelAgreement, cancelWorkflow, cancelFromTask, previewFromTask, cancelDirect, previewDirect };
 }
 
 module.exports = { createCancellationService, CANCEL_ERROR_MESSAGE };

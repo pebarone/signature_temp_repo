@@ -5,7 +5,7 @@ const express = require('express');
 const cors = require('cors');
 
 const { createBasicAuth } = require('./http/middleware/basicAuth');
-const { createVerifySignature } = require('./http/middleware/hmac');
+const { createVerifySignature, deriveKey, DIRECT_SCOPE } = require('./http/middleware/hmac');
 const { webhookRoutes } = require('./http/routes/webhook');
 const { startRoutes } = require('./http/routes/start');
 const { cancelRoutes } = require('./http/routes/cancel');
@@ -37,19 +37,49 @@ function createApp({
   });
 
   // POST /cancel e POST /cancel/preview (WebReport do workflow de cancelamento): só existem com CANCEL_ENABLED=true;
-  // desligado caem no 404 padrão (e nem o preflight CORS os responde)
+  // desligado caem no 404 padrão (e nem o preflight CORS os responde). POST /cancel/direct e /cancel/direct/preview (modo
+  // direto, WebReport sem workflow) exigem, além disso, CANCEL_DIRECT_ENABLED=true E credencial própria
+  // (CANCEL_DIRECT_AUTH_USER/PASS, sem fallback): sem ela as rotas diretas não são montadas (404) e o startup registra o erro.
   const cancelEnabled = !!(config.cancel?.enabled && cancellationService);
+  const directCredentials = !!(config.cancel?.directAuthUser && config.cancel?.directAuthPass);
+  // Reusar a credencial do /auth genérico ou dos logs anularia a separação: o modo direto também não é montado
+  const samePair = (user, pass) =>
+    !!user && config.cancel?.directAuthUser === String(user).trim() && config.cancel?.directAuthPass === String(pass ?? '').trim();
+  const directReused = directCredentials &&
+    (samePair(config.startAuth?.user, config.startAuth?.pass) || samePair(config.logUser, config.logPass));
+  if (cancelEnabled && config.cancel?.directEnabled && !directCredentials) {
+    logger.error('[CANCEL] CANCEL_DIRECT_ENABLED=true sin CANCEL_DIRECT_AUTH_USER/PASS: cancelación directa deshabilitada');
+  } else if (cancelEnabled && config.cancel?.directEnabled && directReused) {
+    logger.error('[CANCEL] CANCEL_DIRECT_AUTH_USER/PASS iguales a START_AUTH_* o LOG_*: cancelación directa deshabilitada');
+  }
+  const cancelDirectEnabled = cancelEnabled && !!config.cancel?.directEnabled && directCredentials && !directReused;
+  // Modo direto: credencial Basic própria e chave de assinatura DERIVADA (escopo 'cancel-direct'); o /auth genérico e o
+  // /cancel/direct/auth não assinam um para o outro
+  const directKey = config.signatureSecret ? deriveKey(config.signatureSecret, DIRECT_SCOPE) : '';
+  const directBasicAuth = createBasicAuth({
+    user: config.cancel?.directAuthUser, pass: config.cancel?.directAuthPass, realm: 'CancelDirect'
+  });
+  const verifyDirectSignature = createVerifySignature({
+    secret: directKey,
+    now,
+    logger,
+    consumeNonce: (nonce, ttlMs) => repo.consumeNonce(nonce, ttlMs),
+    allowLegacy: false
+  });
 
   /*
-    CORS só para /auth, /start e (se ligado) /cancel e /cancel/preview (chamados pelo navegador, a partir do WebReport no
-    OTCS; app.use('/cancel') já cobre o subcaminho /cancel/preview, preflight inclusive). Origem não
-    permitida não recebe Access-Control-Allow-Origin (o navegador bloqueia); webhook, admin, logs e health ficam sem CORS.
+    CORS só para /auth, /start e (se ligado) /cancel, /cancel/preview e (modo direto ligado) /cancel/direct* (inclui /cancel/direct/auth; chamados pelo
+    navegador, a partir do WebReport no OTCS; app.use('/cancel') já cobre os subcaminhos, preflight inclusive). Com o modo
+    direto desligado, /cancel/direct* fica fora do CORS (nem o preflight é respondido: 404, como o /cancel desligado). Origem
+    não permitida não recebe Access-Control-Allow-Origin (o navegador bloqueia); webhook, admin, logs e health ficam sem CORS.
   */
   const corsOrigins = config.corsOrigins || [];
-  const startCors = cors({
+  const baseCors = cors({
     origin: corsOrigins.includes('*') ? '*' : corsOrigins,
     maxAge: 600
   });
+  const startCors = (req, res, next) =>
+    (!cancelDirectEnabled && /^\/cancel\/direct(\/|$)/i.test(req.baseUrl + req.path) ? next() : baseCors(req, res, next));
   app.use(cancelEnabled ? ['/auth', '/start', '/cancel'] : ['/auth', '/start'], startCors);
   app.use(express.json({ limit: '10mb' }));
   app.use(express.urlencoded({ extended: true }));
@@ -59,7 +89,11 @@ function createApp({
 
   app.use(webhookRoutes({ config, logger, reconciliation }));
   app.use(startRoutes({ config, logger, signatureService, startBasicAuth, verifySignature, now }));
-  if (cancelEnabled) app.use(cancelRoutes({ logger, cancellationService, verifySignature }));
+  if (cancelEnabled) {
+    app.use(cancelRoutes({
+      logger, cancellationService, verifySignature, directEnabled: cancelDirectEnabled, directBasicAuth, verifyDirectSignature, directKey, now
+    }));
+  }
   app.use(adminRoutes({ config, logger, repo, reconciliation, tokenStore, basicAuth, cancellationService, now }));
   app.use(logsRoutes({ logger, basicAuth }));
 

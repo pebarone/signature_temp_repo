@@ -21,13 +21,20 @@ const canonicalEmails = (fields) =>
     .sort()
     .join(',');
 
+// Alvos do cancelamento direto: lista -> cada item text()-ado, unidos por ',' na ordem dada. Qualquer valor que não seja
+// lista vira text(valor): um tipo adulterado (ex.: a string '1,2' no lugar de ['1','2']) nunca casa com a assinatura da lista.
+const canonicalTargets = (v) => (Array.isArray(v) ? v.map(text).join(',') : text(v));
+
 /*
   Forma canônica v2 do /start (pura): vincula a assinatura aos campos do envio.
   v2\n<timestamp>\n<nonce>\n<workflowId>\n<subworkflowId>\n<nodeId>\n<attachId>\n<emails>\n<docName>
   Campos ausentes viram string vazia; todos passam por String() + trim.
+  Cancelamento direto (WebReport fora de uma tarefa): SÓ se vier targetWorkflowIds (não undefined/null) são acrescentadas
+  duas linhas, \n<targetWorkflowIds>\n<targetSubworkflowId>, que vinculam a assinatura aos fluxos escolhidos. Sem
+  targetWorkflowIds o canônico é idêntico ao de sempre (/start e /cancel da tarefa).
 */
 function canonicalStart(fields = {}) {
-  return [
+  const lines = [
     'v2',
     text(fields.timestamp),
     text(fields.nonce),
@@ -37,8 +44,17 @@ function canonicalStart(fields = {}) {
     text(fields.attachId),
     canonicalEmails(fields),
     text(fields.docName)
-  ].join('\n');
+  ];
+  if (fields.targetWorkflowIds !== undefined && fields.targetWorkflowIds !== null) {
+    lines.push(canonicalTargets(fields.targetWorkflowIds), text(fields.targetSubworkflowId));
+  }
+  return lines.join('\n');
 }
+
+// Chave derivada por escopo: HMAC-SHA256(secret, scope) em hex. O modo direto do cancelamento assina e verifica com
+// deriveKey(SIGNATURE_SECRET, DIRECT_SCOPE): assinaturas do /auth genérico nunca valem nas rotas diretas e vice-versa.
+const DIRECT_SCOPE = 'cancel-direct';
+const deriveKey = (secret, scope) => crypto.createHmac('sha256', String(secret)).update(String(scope)).digest('hex');
 
 const signStart = (secret, fields) =>
   crypto.createHmac('sha256', secret).update(canonicalStart(fields)).digest('hex');
@@ -101,5 +117,5 @@ function createVerifySignature({
 }
 
 module.exports = {
-  createVerifySignature, sign, signStart, canonicalStart, newNonce, MAX_AGE_MS, NONCE_TTL_MS
+  createVerifySignature, sign, signStart, canonicalStart, deriveKey, DIRECT_SCOPE, newNonce, MAX_AGE_MS, NONCE_TTL_MS
 };

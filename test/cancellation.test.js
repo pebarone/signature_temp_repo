@@ -13,6 +13,7 @@ const { parseWebhookPayload } = require('../server/domain/eventPolicy');
 const {
   CANCEL_STATES, TARGET, classifyCancelState, selectCancelTarget, parseTargets, classifyCancelOutcome, countSignatures, isProcessFinishedStatus
 } = require('../server/domain/cancellation');
+const { canonicalStart, signStart, deriveKey, DIRECT_SCOPE } = require('../server/http/middleware/hmac');
 const { cancelRequestedPatch } = require('../server/domain/agreementState');
 const { ServiceError } = require('../server/services/signatureService');
 const {
@@ -51,8 +52,10 @@ const recalled = (world, id = 'AG-1', opts = {}) =>
 const cancelWorld = (env = {}, opts = {}) => buildWorld({ listen: true, env: { CANCEL_ENABLED: 'true', ...env }, ...opts });
 
 // Protocolo do WebReport: POST /auth (Basic) e POST /cancel (ou /cancel/preview, via `path`) com o que voltou. `extra` entra no corpo sem passar pelo /auth.
-async function authThenCancel(world, fields = { workflowId: '9001', subworkflowId: '9001' }, { tamper = {}, extra = {}, path = '/cancel' } = {}) {
-  const auth = await post(world, '/auth', fields, ADMIN);
+async function authThenCancel(world, fields = { workflowId: '9001', subworkflowId: '9001' }, {
+  tamper = {}, extra = {}, path = '/cancel', authPath = '/auth', authHeaders = ADMIN
+} = {}) {
+  const auth = await post(world, authPath, fields, authHeaders);
   assert.equal(auth.status, 200);
   const creds = await auth.json();
   return post(world, path, { ...fields, ...tamper, ...extra, ...creds });
@@ -122,6 +125,9 @@ test('cancelRequestedPatch: encerra o acordo aberto sem disposição; acordo já
 test('config: cancelamento desligado por padrão, nomes provisórios e variáveis CANCEL_*', () => {
   assert.deepEqual(computeConfig({}).cancel, {
     enabled: false,
+    directEnabled: false,
+    directAuthUser: '',
+    directAuthPass: '',
     taskNames: ['Cancelar Flujo de Firma'],
     fields: { targetWorkflow: 'ID Flujo a Cancelar', targetSubworkflow: 'ID Subflujo a Cancelar', result: 'IDs Cancelados' },
     notifySigners: false,
@@ -133,10 +139,11 @@ test('config: cancelamento desligado por padrão, nomes provisórios e variávei
   const c = computeConfig({
     CANCEL_ENABLED: 'true', CANCEL_TASK_NAMES: 'Cancelar A, Cancelar B', CANCEL_FIELD_TARGET_WORKFLOW: 'Fluxo',
     CANCEL_FIELD_TARGET_SUBWORKFLOW: 'Subfluxo', CANCEL_NOTIFY_SIGNERS: '1', CANCEL_SETTLE_TIMEOUT_MS: '45000',
-    CANCEL_FIELD_RESULT: 'Cancelados', CANCEL_STOP_ORIGINAL: 'true', CANCEL_MAX_TARGETS: '50', CANCEL_BATCH_BUDGET_MS: '25000'
+    CANCEL_FIELD_RESULT: 'Cancelados', CANCEL_STOP_ORIGINAL: 'true', CANCEL_MAX_TARGETS: '50', CANCEL_BATCH_BUDGET_MS: '25000',
+    CANCEL_DIRECT_ENABLED: 'true', CANCEL_DIRECT_AUTH_USER: ' dir-user ', CANCEL_DIRECT_AUTH_PASS: 'dir:pass'
   }).cancel;
   assert.deepEqual(c, {
-    enabled: true, taskNames: ['Cancelar A', 'Cancelar B'],
+    enabled: true, directEnabled: true, directAuthUser: 'dir-user', directAuthPass: 'dir:pass', taskNames: ['Cancelar A', 'Cancelar B'],
     fields: { targetWorkflow: 'Fluxo', targetSubworkflow: 'Subfluxo', result: 'Cancelados' }, notifySigners: true, stopOriginal: true,
     settleTimeoutMs: 45000, maxTargets: 50, batchBudgetMs: 25000
   });
@@ -2045,5 +2052,494 @@ test('POST /admin/cancel-workflow/:workflowId: Basic Auth, subworkflowId opciona
   const signed = await post(world, '/admin/cancel-workflow/3003', {}, ADMIN);
   assert.equal(signed.status, 409);
   assert.equal((await signed.json()).code, 'ALREADY_SIGNED');
+  await world.close();
+});
+
+/* ---------- MODO DIRETO: WebReport executado sozinho (sem workflow): POST /cancel/direct e /cancel/direct/preview ---------- */
+
+// Credencial PRÓPRIA do modo direto (sem fallback para START_AUTH_* nem LOG_*)
+const DIRECT_ENV = { CANCEL_DIRECT_ENABLED: 'true', CANCEL_DIRECT_AUTH_USER: 'cancel-direct', CANCEL_DIRECT_AUTH_PASS: 'dir:pa:ss' };
+const DIRECT_ADMIN = { authorization: basicHeader('cancel-direct', 'dir:pa:ss') };
+
+// Mundo com o modo direto ligado e um acordo aberto por fluxo de `wfIds`; NÃO existe workflow de cancelamento
+async function directWorld(wfIds, env = {}) {
+  const world = await cancelWorld({ ...DIRECT_ENV, OTCS_BASE: `${OTCS_ORIGIN}/cs/cs/api`, ...env });
+  for (const id of wfIds) open(world, `AG-${id}`, { workflowId: String(id), subworkflowId: String(id) });
+  return world;
+}
+
+// Protocolo do WebReport no modo direto: POST /cancel/direct/auth (Basic próprio) e a rota recebem os MESMOS campos (os alvos entram no HMAC)
+const direct = (world, targets, { path = '/cancel/direct', fields = {}, tamper = {}, extra = {} } = {}) =>
+  authThenCancel(world, { targetWorkflowIds: targets, ...fields }, {
+    path, tamper, extra, authPath: '/cancel/direct/auth', authHeaders: DIRECT_ADMIN
+  });
+
+const TASK_APIS = ['getProcessSteps', 'getCurrentUser', 'getTaskForm', 'updateTaskForm'];
+const usedTaskApis = (world) => world.otcs.modelCalls.filter((c) => TASK_APIS.includes(c[0]));
+
+test('hmac: canonicalStart sem targetWorkflowIds fica idêntico; com alvos vincula lista, ordem e subflujo', () => {
+  const base = { timestamp: '1700', nonce: 'n1', workflowId: '9001', subworkflowId: '9002' };
+  const legacy = 'v2\n1700\nn1\n9001\n9002\n\n\n\n';
+  assert.equal(canonicalStart(base), legacy);
+  assert.equal(canonicalStart({ ...base, targetWorkflowIds: undefined, targetSubworkflowId: '7' }), legacy);
+  assert.equal(canonicalStart({ ...base, targetWorkflowIds: null, targetSubworkflowId: '7' }), legacy);
+  assert.equal(canonicalStart({}), ['v2', '', '', '', '', '', '', '', ''].join('\n'));
+
+  const withTargets = (targetWorkflowIds, targetSubworkflowId) => canonicalStart({ ...base, targetWorkflowIds, targetSubworkflowId });
+  assert.equal(withTargets(['3101', 3102], '7'), `${legacy}\n3101,3102\n7`);
+  assert.equal(withTargets([' 3101 '], undefined), `${legacy}\n3101\n`);
+  assert.equal(withTargets([], undefined), `${legacy}\n\n`, 'lista vazia também é vinculada (presente)');
+
+  const secret = 'segredo-de-teste';
+  const sig = (ids, sub) => signStart(secret, { ...base, targetWorkflowIds: ids, targetSubworkflowId: sub });
+  const ref = sig(['3101', '3102'], '7');
+  assert.equal(sig(['3101', '3102'], '7'), ref);
+  assert.notEqual(sig(['3102', '3101'], '7'), ref, 'ordem');
+  assert.notEqual(sig(['3101', '3102', '3103'], '7'), ref, 'alvo a mais');
+  assert.notEqual(sig(['3101'], '7'), ref, 'alvo a menos');
+  assert.notEqual(sig(['3101', '3102'], '8'), ref, 'subflujo');
+  assert.notEqual(sig(['3101', '3102'], undefined), ref, 'subflujo removido');
+  // sem alvos a assinatura é a de sempre; com alvos ela muda
+  assert.notEqual(signStart(secret, base), ref);
+
+  // tipo adulterado: um valor que não é lista vira text(valor); só o texto idêntico à lista coincide (e o serviço
+  // recusa não-lista com 422, ver o teste das rotas)
+  assert.notEqual(sig({ a: 1 }, '7'), ref);
+  assert.notEqual(sig(3101, '7'), ref);
+  assert.notEqual(sig('3101;3102', '7'), ref);
+});
+
+test('modo direto com a credencial do /auth genérico ou dos logs reaproveitada: não monta as rotas diretas e registra o erro', async () => {
+  const worlds = [
+    await directWorld(['3101'], { CANCEL_DIRECT_AUTH_USER: 'admin', CANCEL_DIRECT_AUTH_PASS: 'pa:ss' }),
+    await directWorld(['3101'], {
+      START_AUTH_USER: 'start-user', START_AUTH_PASS: 'start:pass',
+      CANCEL_DIRECT_AUTH_USER: 'start-user', CANCEL_DIRECT_AUTH_PASS: 'start:pass'
+    })
+  ];
+  for (const [i, world] of worlds.entries()) {
+    assert.ok(world.logger.has('error', /CANCEL_DIRECT_AUTH_USER\/PASS iguales a START_AUTH_\* o LOG_\*: cancelación directa deshabilitada/), String(i));
+    for (const p of ['/cancel/direct/auth', '/cancel/direct', '/cancel/direct/preview']) {
+      const r = await post(world, p, { targetWorkflowIds: ['3101'] }, ADMIN);
+      assert.equal(r.status, 404, `${i} ${p}`);
+    }
+  }
+  assert.equal(worlds[0].adobe.cancelled.length, 0);
+
+  // só o usuário igual (senha diferente) não é reaproveitamento: o modo direto monta
+  const ok = await directWorld(['3101'], { CANCEL_DIRECT_AUTH_USER: 'admin', CANCEL_DIRECT_AUTH_PASS: 'outra' });
+  assert.equal(ok.logger.has('error', /iguales a START_AUTH_/), false);
+  assert.notEqual((await post(ok, '/cancel/direct/auth', { targetWorkflowIds: ['3101'] }, { authorization: basicHeader('admin', 'outra') })).status, 404);
+  for (const w of [...worlds, ok]) await w.close();
+});
+
+test('modo direto desligado, sem CANCEL_ENABLED ou sem credencial própria: 404 em /cancel/direct* (auth, preview, cancel), sem CORS e sem tocar Adobe/OTCS', async () => {
+  const worlds = [
+    // CANCEL_ENABLED ligado, CANCEL_DIRECT_ENABLED desligado (padrão)
+    await directWorld(['3101'], { CANCEL_DIRECT_ENABLED: 'false' }),
+    // CANCEL_DIRECT_ENABLED ligado, mas CANCEL_ENABLED desligado
+    await directWorld(['3101'], { CANCEL_ENABLED: 'false' }),
+    // ligado sem a senha própria (ou sem o usuário): não monta as rotas e registra o erro
+    await directWorld(['3101'], { CANCEL_DIRECT_AUTH_PASS: '' }),
+    await directWorld(['3101'], { CANCEL_DIRECT_AUTH_USER: '' })
+  ];
+  assert.deepEqual(worlds.map((w) => [w.config.cancel.enabled, w.config.cancel.directEnabled]), [[true, false], [false, true], [true, true], [true, true]]);
+  assert.equal(worlds[0].logger.has('error', /CANCEL_DIRECT_ENABLED=true sin CANCEL_DIRECT_AUTH_USER\/PASS/), false);
+  assert.equal(worlds[1].logger.has('error', /CANCEL_DIRECT_ENABLED=true sin/), false, 'sem CANCEL_ENABLED o modo direto nem é avaliado');
+  for (const w of worlds.slice(2)) {
+    assert.ok(w.logger.has('error', /CANCEL_DIRECT_ENABLED=true sin CANCEL_DIRECT_AUTH_USER\/PASS: cancelación directa deshabilitada/));
+  }
+
+  for (const world of worlds) {
+    for (const p of ['/cancel/direct/auth', '/cancel/direct', '/cancel/direct/preview']) {
+      // credenciais diretas corretas e uma assinatura qualquer: nada existe
+      const r = await post(world, p, { targetWorkflowIds: ['3101'], timestamp: '1', nonce: 'n'.repeat(16), signature: 'a'.repeat(64) }, DIRECT_ADMIN);
+      assert.equal(r.status, 404, p);
+      assert.deepEqual(await r.json(), { error: 'Endpoint not found' });
+      const pre = await preflight(world, p);
+      assert.equal(pre.status, 404, `preflight ${p}`);
+      assert.equal(pre.headers.get('access-control-allow-origin'), null);
+      // caixa diferente: o Express roteia sem distinguir, o portão do CORS também
+      const preUpper = await preflight(world, p.toUpperCase());
+      assert.equal(preUpper.headers.get('access-control-allow-origin'), null, `preflight ${p.toUpperCase()}`);
+    }
+    assert.equal(world.adobe.cancelled.length, 0);
+    assert.deepEqual(world.otcs.stopped, []);
+    assert.equal(world.otcs.modelCalls.length, 0, 'nem o OTCS foi consultado');
+    assert.equal(world.repo.get('AG-3101').state, 'pending');
+  }
+
+  // com o modo direto desligado, o /cancel da tarefa e o seu CORS seguem iguais
+  const [off] = worlds;
+  assert.equal((await preflight(off, '/cancel')).headers.get('access-control-allow-origin'), OTCS_ORIGIN);
+  assert.equal((await preflight(off, '/cancel/preview')).headers.get('access-control-allow-origin'), OTCS_ORIGIN);
+  for (const w of worlds) await w.close();
+});
+
+test('POST /cancel/direct: vários alvos, cancela no Adobe e PARA cada original (mesmo com CANCEL_STOP_ORIGINAL=false), sem tarefa, formulário nem SendOn', async () => {
+  const world = await directWorld(['3101', '3102', '3103'], { CANCEL_STOP_ORIGINAL: 'false' });
+  seedCancelFlow(world); // um workflow de cancelamento qualquer: o modo direto nunca o consulta
+  assert.equal(world.config.cancel.stopOriginal, false);
+
+  const r = await direct(world, ['3101', '3102', '3103']);
+  assert.equal(r.status, 200, await r.clone().text());
+  const item = (id) => ({
+    workflowId: id, outcome: 'cancelled', agreementId: `AG-${id}`, alreadyCancelled: false, adobeStatus: 'CANCELLED',
+    contentStop: 'stopped', message: 'Acuerdo cancelado.'
+  });
+  assert.deepEqual(await r.json(), {
+    mode: 'direct',
+    complete: true,
+    sentOn: false,
+    items: [item('3101'), item('3102'), item('3103')],
+    summary: { total: 3, cancelled: 3, refused: 0, pending: 0 },
+    stopOriginal: true,
+    subworkflowIgnored: false
+  });
+
+  assert.deepEqual(world.adobe.cancelled.map((c) => c.id), ['AG-3101', 'AG-3102', 'AG-3103']);
+  assert.match(world.adobe.cancelled[0].comment, /^Flujo cancelado desde Content Server \(WebReport de cancelación\)\.$/);
+  assert.deepEqual(world.otcs.stopped, [3101, 3102, 3103]);
+  // ordem por item: Adobe confirmado -> stop original
+  assert.deepEqual(world.otcs.modelCalls.filter((c) => c[0] === 'stopProcess'), [['stopProcess', 3101], ['stopProcess', 3102], ['stopProcess', 3103]]);
+  assert.deepEqual(usedTaskApis(world), [], 'nunca lê passos, usuário, formulário nem grava atributos');
+  assert.equal(world.otcs.sendons.length, 0);
+  assert.equal(world.calls.filter((c) => c[0] === 'otcs.sendon').length, 0);
+  assert.equal(world.otcs.updateFormCalls.length, 0);
+  assert.equal(world.otcs.task('9001', 2).status, 'current', 'o workflow de cancelamento não é tocado');
+  for (const id of ['3101', '3102', '3103']) {
+    const rec = world.repo.get(`AG-${id}`);
+    assert.deepEqual([rec.state, rec.sendonDone, rec.cancelSource], ['cancelled', true, 'webreport:direct']);
+  }
+  // o eco RECALLED do Adobe não gera Rechazado
+  assert.equal(world.otcs.dispositionCalls().length, 0);
+  assert.ok(world.logger.has('info', /\[CANCEL\] Directo \(webreport:direct\): lote concluido \(3 cancelados, 0 rechazados, 0 pendientes\)/));
+
+  // CORS como o /cancel: origem do OTCS
+  for (const p of ['/cancel/direct', '/cancel/direct/preview']) {
+    assert.equal((await preflight(world, p)).headers.get('access-control-allow-origin'), OTCS_ORIGIN, p);
+  }
+  await world.close();
+});
+
+test('com o modo direto ligado, o /cancel da tarefa segue igual (sem mode, com SendOn)', async () => {
+  const world = await directWorld(['3003']);
+  seedCancelFlow(world);
+  const r = await authThenCancel(world);
+  assert.equal(r.status, 200, await r.clone().text());
+  const body = await r.json();
+  assert.deepEqual([body.complete, body.sentOn, body.stopOriginal, 'mode' in body], [true, true, false, false]);
+  assert.equal(world.otcs.sendons.length, 1);
+  assert.deepEqual(world.otcs.stopped, [], 'no modo da tarefa o stop continua dependendo de CANCEL_STOP_ORIGINAL');
+  assert.equal(world.repo.get('AG-3003').cancelSource, 'workflow:9001/9001');
+  await world.close();
+});
+
+test('POST /cancel/direct e /direct/preview: HMAC v2 vincula os alvos — adulterar, repetir, v1 e assinatura da tarefa são recusados sem cancelar', async () => {
+  const world = await directWorld(['3101', '3102', '3103'], { START_LEGACY_SIGNATURE: 'true' });
+  const sub = '3101';
+  const fields = { targetWorkflowIds: ['3101'] };
+
+  for (const p of ['/cancel/direct', '/cancel/direct/preview']) {
+    assert.equal((await post(world, p, fields)).status, 401, `${p} sem assinatura`);
+    assert.equal((await post(world, p, { ...fields, timestamp: '1', signature: 'zz' })).status, 400, `${p} malformada`);
+    const v1 = await post(world, p, { ...fields, ...startBodyV1(world) });
+    assert.equal(v1.status, 403, p);
+    assert.deepEqual(await v1.json(), { error: 'Unsupported signature version.' });
+
+    // alvo a mais, outro alvo, ordem trocada, alvo removido, subflujo acrescentado, tipo adulterado: todos 'Invalid signature'
+    const two = { targetWorkflowIds: ['3101', '3102'] };
+    const tampers = [
+      [fields, { targetWorkflowIds: ['3101', '3102'] }],
+      [fields, { targetWorkflowIds: ['3102'] }],
+      [two, { targetWorkflowIds: ['3102', '3101'] }],
+      [two, { targetWorkflowIds: ['3101'] }],
+      [fields, { targetSubworkflowId: sub }],
+      [{ ...fields, targetSubworkflowId: sub }, { targetSubworkflowId: '9' }],
+      [{ ...fields, targetSubworkflowId: sub }, { targetSubworkflowId: undefined }],
+      [fields, { targetWorkflowIds: { 0: '3101' } }],
+      [fields, { targetWorkflowIds: 3103 }]
+    ];
+    for (const [signed, tamper] of tampers) {
+      const r = await authThenCancel(world, signed, { path: p, tamper });
+      assert.equal(r.status, 403, `${p} ${JSON.stringify(tamper)}`);
+      assert.deepEqual(await r.json(), { error: 'Invalid signature.' });
+    }
+    // a assinatura do /cancel da tarefa (sem alvos) não serve para escolher alvos
+    const fromTask = await authThenCancel(world, { workflowId: '9001', subworkflowId: '9001' }, { path: p, extra: { targetWorkflowIds: ['3101'] } });
+    assert.equal(fromTask.status, 403, `${p} assinatura da tarefa`);
+  }
+
+  // nonce de uso único; timestamp fora da janela
+  const creds = await (await post(world, '/cancel/direct/auth', fields, DIRECT_ADMIN)).json();
+  const okBody = { ...fields, ...creds };
+  assert.equal((await post(world, '/cancel/direct', okBody)).status, 200);
+  const replay = await post(world, '/cancel/direct', okBody);
+  assert.equal(replay.status, 403);
+  assert.deepEqual(await replay.json(), { error: 'Solicitud ya utilizada.' });
+  const old = await (await post(world, '/cancel/direct/auth', fields, DIRECT_ADMIN)).json();
+  world.clock.advance(3 * 60 * 1000);
+  assert.equal((await post(world, '/cancel/direct', { ...fields, ...old })).status, 403);
+
+  assert.deepEqual(world.adobe.cancelled.map((c) => c.id), ['AG-3101'], 'só a chamada válida cancelou');
+  assert.deepEqual(world.otcs.stopped, [3101]);
+  await world.close();
+});
+
+test('POST /cancel/direct: alvos inválidos => 422 (MISSING_TARGET / INVALID_TARGET / TOO_MANY_TARGETS), nada é consultado', async () => {
+  const world = await directWorld(['3101', '3102', '3103'], { CANCEL_MAX_TARGETS: '2' });
+  const call = async (targets, opts) => {
+    const r = await direct(world, targets, opts);
+    return [r.status, await r.json()];
+  };
+
+  const [sEmpty, bEmpty] = await call([]);
+  assert.deepEqual([sEmpty, bEmpty.code], [422, 'MISSING_TARGET']);
+  assert.equal(bEmpty.error, 'No se indicó ningún flujo a cancelar.');
+  assert.deepEqual((await call(['', ' ', null]))[1].code, 'MISSING_TARGET');
+
+  const [sBad, bBad] = await call(['3101', 'abc', '12x']);
+  assert.deepEqual([sBad, bBad.code, bBad.invalid], [422, 'INVALID_TARGET', ['abc', '12x']]);
+  assert.deepEqual((await call([{ id: 3101 }]))[1].code, 'INVALID_TARGET');
+  assert.deepEqual((await call(['-5']))[1].code, 'INVALID_TARGET');
+
+  // não-lista: texto, número, objeto, ausente (null/undefined) => INVALID_TARGET, mesmo com assinatura válida
+  assert.deepEqual((await call('3101'))[1].code, 'INVALID_TARGET');
+  assert.deepEqual((await call(3101))[1].code, 'INVALID_TARGET');
+  assert.deepEqual((await call({ 0: '3101' }))[1].code, 'INVALID_TARGET');
+  assert.deepEqual((await call(null))[1].code, 'INVALID_TARGET');
+  assert.deepEqual((await call(undefined))[1].code, 'INVALID_TARGET');
+  // a string '3101,3102' tem o mesmo texto canônico da lista ['3101','3102'] (a assinatura confere), mas o serviço a recusa
+  const asString = await authThenCancel(world, { targetWorkflowIds: ['3101', '3102'] }, {
+    path: '/cancel/direct', tamper: { targetWorkflowIds: '3101,3102' }, authPath: '/cancel/direct/auth', authHeaders: DIRECT_ADMIN
+  });
+  assert.equal(asString.status, 422);
+  assert.equal((await asString.json()).code, 'INVALID_TARGET');
+
+  // subflujo não numérico
+  const [sSub, bSub] = await call(['3101'], { fields: { targetSubworkflowId: '30x5' } });
+  assert.deepEqual([sSub, bSub.code, bSub.invalid], [422, 'INVALID_TARGET', ['30x5']]);
+
+  // limite (CANCEL_MAX_TARGETS=2): duplicados não contam
+  const [sMany, bMany] = await call(['3101', '3102', '3103']);
+  assert.deepEqual([sMany, bMany.code, bMany.max], [422, 'TOO_MANY_TARGETS', 2]);
+  assert.equal((await call(['3101', '3101', '3102', '3102']))[0], 200);
+
+  // as mesmas validações valem na prévia
+  for (const targets of [[], ['abc'], 'x', ['3101', '3102', '3103']]) {
+    assert.equal((await direct(world, targets, { path: '/cancel/direct/preview' })).status, 422, JSON.stringify(targets));
+  }
+
+  assert.deepEqual(usedTaskApis(world), []);
+  assert.deepEqual(world.adobe.cancelled.map((c) => c.id), ['AG-3101', 'AG-3102'], 'só o pedido com duplicados válidos cancelou');
+  await world.close();
+});
+
+test('POST /cancel/direct: o subflujo vale com UM alvo (desempata) e é ignorado com vários (subworkflowIgnored)', async () => {
+  const world = await cancelWorld({ ...DIRECT_ENV });
+  open(world, 'AG-1', { subworkflowId: '3004' }); // fluxo 3003 com dois acordos abertos, em subprocessos diferentes
+  open(world, 'AG-2', { subworkflowId: '3005' });
+  open(world, 'AG-9', { workflowId: '4444', subworkflowId: '4444' });
+
+  // sem subflujo: ambíguo (recusa definitiva do item), nada cancelado nem parado
+  const ambiguous = await (await direct(world, ['3003'])).json();
+  assert.deepEqual([ambiguous.complete, ambiguous.items[0].outcome, ambiguous.items[0].code], [true, 'refused', 'AMBIGUOUS']);
+  assert.equal(world.adobe.cancelled.length, 0);
+  assert.deepEqual(world.otcs.stopped, []);
+
+  // um alvo com subflujo: só o AG-2
+  const one = await (await direct(world, ['3003'], { fields: { targetSubworkflowId: '3005' } })).json();
+  assert.deepEqual([one.complete, one.subworkflowIgnored, one.items[0].agreementId, one.items[0].contentStop], [true, false, 'AG-2', 'stopped']);
+  assert.deepEqual(world.adobe.cancelled.map((c) => c.id), ['AG-2']);
+  assert.equal(world.repo.get('AG-1').state, 'pending');
+
+  // vários alvos: o subflujo é ignorado (e avisado); o AG-2 já está cancelado, então o AG-1 é o único aberto do 3003
+  const many = await (await direct(world, ['4444', '3003'], { fields: { targetSubworkflowId: '3005' } })).json();
+  assert.equal(many.subworkflowIgnored, true);
+  assert.deepEqual(many.items.map((i) => [i.workflowId, i.outcome, i.agreementId]), [['4444', 'cancelled', 'AG-9'], ['3003', 'cancelled', 'AG-1']]);
+  assert.ok(world.logger.has('warn', /Directo: hay 2 flujos a cancelar; el subflujo 3005 se ignora/));
+
+  // a prévia aplica a mesma regra
+  const prev = await (await direct(world, ['3003'], { path: '/cancel/direct/preview', fields: { targetSubworkflowId: '3005' } })).json();
+  assert.deepEqual([prev.mode, prev.subworkflowIgnored], ['direct', false]);
+  await world.close();
+});
+
+test('POST /cancel/direct: lote misto (assinado => refused, Adobe fora do ar => pending) deixa complete:false; repetir fecha e é idempotente', async () => {
+  const world = await directWorld(['3101', '3102', '3103']);
+  world.adobe.agreements['AG-3102'].status = 'SIGNED';
+  world.adobe.cancelFailures = 1; // o 1º cancelamento (3101) falha e a reconsulta mostra o acordo ainda aberto
+
+  const body = await (await direct(world, ['3101', '3102', '3103'])).json();
+  assert.deepEqual([body.mode, body.complete, body.sentOn], ['direct', false, false]);
+  assert.deepEqual(body.items.map((i) => [i.workflowId, i.outcome, i.code, i.contentStop]), [
+    ['3101', 'pending', 'ADOBE_UNAVAILABLE', undefined],
+    ['3102', 'refused', 'ALREADY_SIGNED', undefined],
+    ['3103', 'cancelled', undefined, 'stopped']
+  ]);
+  assert.deepEqual(body.summary, { total: 3, cancelled: 1, refused: 1, pending: 1 });
+  assert.deepEqual(world.otcs.stopped, [3103], 'o recusado e o pendente não são parados');
+  assert.ok(world.logger.has('warn', /Directo \(webreport:direct\): lote incompleto/));
+
+  // repetir: o que já foi cancelado volta como alreadyCancelled (e o stop é refeito, idempotente)
+  const again = await (await direct(world, ['3101', '3102', '3103'])).json();
+  assert.deepEqual(again.items.map((i) => [i.workflowId, i.outcome, i.alreadyCancelled]), [
+    ['3101', 'cancelled', false], ['3102', 'refused', undefined], ['3103', 'cancelled', true]
+  ]);
+  assert.equal(again.complete, true);
+  assert.deepEqual(world.otcs.stopped.sort(), [3101, 3103, 3103]);
+  assert.equal(world.adobe.cancelled.length, 2, 'cada acordo foi cancelado uma única vez no Adobe');
+  assert.equal(world.otcs.sendons.length, 0);
+  await world.close();
+});
+
+test('POST /cancel/direct: falha ao parar o original => pending STOP_FAILED (complete:false); repetir só refaz o stop', async () => {
+  const world = await directWorld(['3101', '3102']);
+  world.otcs.stopFailures = 1; // o stop do 3101 falha com 403
+
+  const body = await (await direct(world, ['3101', '3102'])).json();
+  assert.deepEqual([body.complete, body.sentOn, body.stopOriginal], [false, false, true]);
+  const [first, second] = body.items;
+  assert.deepEqual([first.outcome, first.code, first.cancelledInAdobe, first.contentStop], ['pending', 'STOP_FAILED', true, 'failed']);
+  assert.match(first.message, /cancelado en Adobe Sign, pero no se pudo detener el flujo en Content Server/);
+  assert.match(first.message, /permisos del usuario de integración/);
+  assert.deepEqual([second.outcome, second.contentStop], ['cancelled', 'stopped']);
+  assert.equal(world.repo.get('AG-3101').state, 'cancelled', 'o Adobe/registro já estão cancelados');
+
+  const again = await (await direct(world, ['3101', '3102'])).json();
+  assert.equal(again.complete, true);
+  assert.deepEqual(again.items.map((i) => [i.workflowId, i.alreadyCancelled, i.contentStop]), [
+    ['3101', true, 'stopped'], ['3102', true, 'stopped']
+  ]);
+  assert.equal(world.adobe.cancelled.length, 2, 'nenhum novo cancelamento no Adobe');
+  assert.ok(world.otcs.stopped.includes(3101));
+
+  // o stop falha mas o processo já está parado => already_stopped (sucesso idempotente)
+  const w2 = await directWorld(['3101']);
+  w2.otcs.stopFailsButStops = 1;
+  const ok = await (await direct(w2, ['3101'])).json();
+  assert.deepEqual([ok.complete, ok.items[0].contentStop], [true, 'already_stopped']);
+  await world.close();
+  await w2.close();
+});
+
+test('POST /cancel/direct/preview: estados de cada alvo; não cancela, não para, não grava e não lê tarefa', async () => {
+  const world = await directWorld(['3101', '3102']);
+  world.adobe.agreements['AG-3102'].status = 'SIGNED';
+
+  const r = await direct(world, ['3101', '3102', '3103'], { path: '/cancel/direct/preview' });
+  assert.equal(r.status, 200, await r.clone().text());
+  const body = await r.json();
+  assert.deepEqual([body.mode, body.stopOriginal, body.subworkflowIgnored], ['direct', true, false]);
+  assert.deepEqual(body.items.map((i) => [i.workflowId, i.state, i.cancelable]), [
+    ['3101', 'abierto', true], ['3102', 'firmado', false], ['3103', 'no_encontrado', false]
+  ]);
+  assert.deepEqual(body.summary, { total: 3, abierto: 1, firmado: 1, no_encontrado: 1 });
+  assert.equal('complete' in body, false);
+
+  assert.equal(world.adobe.cancelled.length, 0);
+  assert.deepEqual(world.otcs.stopped, []);
+  assert.equal(world.otcs.modelCalls.filter((c) => c[0] === 'stopProcess' || c[0] === 'getProcessStatus').length, 0);
+  assert.deepEqual(usedTaskApis(world), []);
+  assert.equal(world.otcs.sendons.length, 0);
+  assert.equal(world.repo.get('AG-3101').state, 'pending');
+  assert.equal(world.repo.get('AG-3101').cancelRequestedAt, null);
+  await world.close();
+});
+
+test('modo direto: requestedBy autodeclarado é sanitizado (uma linha, [A-Za-z0-9._@-], 64) e só vai ao source e ao comentário', async () => {
+  const world = await directWorld(['3101', '3102', '3103', '3104', '3105']);
+  const run = async (id, requestedBy) => {
+    await world.cancellation.cancelDirect({ targetWorkflowIds: [id], requestedBy });
+    return world.repo.get(`AG-${id}`).cancelSource;
+  };
+  const commentOf = (id) => world.adobe.cancelled.find((c) => c.id === `AG-${id}`).comment;
+
+  assert.equal(await run('3101', ' pedro.barone@keralty.com '), 'webreport:direct:pedro.barone@keralty.com');
+  assert.equal(commentOf('3101'), 'Flujo cancelado desde Content Server (WebReport de cancelación). Solicitado por pedro.barone@keralty.com.');
+
+  const dirty = await run('3102', 'Ped ro\r\nX-Evil: <b>1</b>');
+  assert.match(dirty, /^webreport:direct:[A-Za-z0-9._@-]+$/);
+  assert.equal(dirty, 'webreport:direct:PedroX-Evilb1b');
+  assert.doesNotMatch(commentOf('3102'), /[\r\n]/);
+
+  assert.equal(await run('3103', 'a'.repeat(200)), `webreport:direct:${'a'.repeat(64)}`);
+  // não-texto ou nada que sobre: sem usuário
+  assert.equal(await run('3104', { toString: () => 'x' }), 'webreport:direct');
+  assert.equal(await run('3105', '¡¿ !'), 'webreport:direct');
+  assert.equal(commentOf('3105'), 'Flujo cancelado desde Content Server (WebReport de cancelación).');
+
+  // por HTTP: requestedBy não entra no HMAC (a página o manda no /auth e na rota, mas adulterá-lo não invalida a assinatura)
+  const w2 = await directWorld(['3101']);
+  const r = await direct(w2, ['3101'], { fields: { requestedBy: 'maria' }, tamper: { requestedBy: 'outra' } });
+  assert.equal(r.status, 200);
+  assert.equal(w2.repo.get('AG-3101').cancelSource, 'webreport:direct:outra');
+  await world.close();
+  await w2.close();
+});
+
+test('modo direto: deriveKey separa por escopo e é estável (HMAC-SHA256 do segredo sobre o escopo)', () => {
+  const k = deriveKey('segredo', DIRECT_SCOPE);
+  assert.equal(DIRECT_SCOPE, 'cancel-direct');
+  assert.match(k, /^[a-f0-9]{64}$/);
+  assert.equal(k, deriveKey('segredo', 'cancel-direct'));
+  assert.notEqual(k, deriveKey('segredo', 'outro'));
+  assert.notEqual(k, deriveKey('outro-segredo', DIRECT_SCOPE));
+  assert.notEqual(k, 'segredo');
+});
+
+test('modo direto: credencial e assinatura próprias — o /auth genérico não assina para o direto, nem o direto para /start e /cancel', async () => {
+  const world = await directWorld(['3101', '3102'], { START_AUTH_USER: 'start-user', START_AUTH_PASS: 'start:pass' });
+  seedCancelFlow(world);
+  const START = { authorization: basicHeader('start-user', 'start:pass') };
+  const fields = { targetWorkflowIds: ['3101'] };
+
+  // 1) /auth genérico (START_AUTH_*; sem elas, LOG_*) assina, mas a assinatura NÃO vale nas rotas diretas
+  const logOnly = await directWorld(['3101']); // sem START_AUTH_*: o /auth genérico usa LOG_USER/LOG_PASS
+  for (const [w, headers] of [[world, START], [logOnly, ADMIN]]) {
+    for (const p of ['/cancel/direct', '/cancel/direct/preview']) {
+      const r = await authThenCancel(w, fields, { path: p, authPath: '/auth', authHeaders: headers });
+      assert.equal(r.status, 403, p);
+      assert.deepEqual(await r.json(), { error: 'Invalid signature.' });
+    }
+    assert.equal(w.adobe.cancelled.length, 0);
+  }
+  await logOnly.close();
+
+  // 2) as credenciais START_AUTH_* / LOG_* não entram no /cancel/direct/auth (sem fallback); nem sem credencial
+  for (const headers of [START, ADMIN, {}, { authorization: basicHeader('cancel-direct', 'errada') }, { authorization: basicHeader('outro', 'dir:pa:ss') }]) {
+    assert.equal((await post(world, '/cancel/direct/auth', fields, headers)).status, 401, JSON.stringify(headers));
+  }
+  // e a credencial direta não vale no /auth genérico
+  assert.equal((await post(world, '/auth', fields, DIRECT_ADMIN)).status, 401);
+
+  // 3) a assinatura emitida com a credencial direta funciona de ponta a ponta (prévia e cancelamento)
+  const prev = await direct(world, ['3101'], { path: '/cancel/direct/preview' });
+  assert.equal(prev.status, 200, await prev.clone().text());
+  const ok = await direct(world, ['3101']);
+  assert.equal(ok.status, 200, await ok.clone().text());
+  assert.deepEqual([(await ok.json()).complete, world.otcs.stopped], [true, [3101]]);
+  const creds = await (await post(world, '/cancel/direct/auth', fields, DIRECT_ADMIN)).json();
+  assert.deepEqual(Object.keys(creds).sort(), ['nonce', 'signature', 'timestamp', 'v']);
+  assert.equal(creds.v, 2);
+
+  // 4) a assinatura direta NÃO vale no /cancel da tarefa, no /cancel/preview nem no /start (nem com os mesmos campos)
+  const taskFields = { workflowId: '9001', subworkflowId: '9001' };
+  for (const p of ['/cancel', '/cancel/preview']) {
+    const r = await authThenCancel(world, taskFields, { path: p, authPath: '/cancel/direct/auth', authHeaders: DIRECT_ADMIN });
+    assert.equal(r.status, 403, p);
+    assert.deepEqual(await r.json(), { error: 'Invalid signature.' });
+  }
+  const startFields = { userEmail1: 'a@example.com', nodeId: 1001, attachId: 2002, docName: 'c.pdf', workflowId: 3003, subworkflowId: 3004, taskId: 2 };
+  const startCreds = await (await post(world, '/cancel/direct/auth', startFields, DIRECT_ADMIN)).json();
+  const startRes = await post(world, '/start', { ...startFields, ...startCreds });
+  assert.equal(startRes.status, 403);
+  assert.deepEqual(await startRes.json(), { error: 'Invalid signature.' });
+  assert.equal(world.otcs.sendons.length, 0);
+  assert.deepEqual(world.adobe.cancelled.map((c) => c.id), ['AG-3101'], 'só o pedido direto válido cancelou');
+
+  // 5) o inverso: a assinatura do /auth genérico segue valendo no /cancel da tarefa (sem mudança)
+  const generic = await authThenCancel(world, taskFields, { path: '/cancel/preview', authHeaders: START });
+  assert.equal(generic.status, 200, await generic.clone().text());
   await world.close();
 });

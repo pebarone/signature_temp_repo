@@ -35,6 +35,14 @@ O `/cancel` segue o mesmo modelo (HMAC v2 + nonce; a assinatura v1 é recusada) 
 de cancelamento no OTCS. Detalhes e códigos de resposta: [`cancelacion/README.md`](cancelacion/README.md) e
 [`../docs/DESIGN_TICKET_2026060410003715.md`](../docs/DESIGN_TICKET_2026060410003715.md).
 
+A mesma página de cancelamento tem um **modo direto** (executada sozinha, sem workflow; só com `CANCEL_DIRECT_ENABLED=true` e as credenciais
+`CANCEL_DIRECT_AUTH_USER`/`CANCEL_DIRECT_AUTH_PASS`, sem fallback): chama `POST /cancel/direct/auth` (Basic próprio) com
+`{targetWorkflowIds, requestedBy?}` e depois `POST /cancel/direct/preview` ou `POST /cancel/direct` com os mesmos campos. A assinatura é
+feita com uma chave derivada (`HMAC(SIGNATURE_SECRET, 'cancel-direct')`): a do `/auth` genérico não vale nas rotas diretas e a direta não vale
+em `/start` nem `/cancel`. A lista dos fluxos fica vinculada ao HMAC (com `targetWorkflowIds` o canônico ganha as linhas
+`targetWorkflowIds` e `targetSubworkflowId`, sem ele nada muda). Cancela no Adobe e sempre para o original; sem tarefa, reatribuição nem
+SendOn. Esse WebReport deve ficar restrito por permissões: a fonte leva a credencial direta.
+
 O `/start` também devolve `handoff` (`workflowId`, `subworkflowId`, `taskId`, `integrationUserId`, `assigned`), com os IDs
 de tarefa que a página usa para reatribuir (`integrationUserId` é só informativo: o destino fica fixo no WebReport, ver
 abaixo). Se a tarefa estiver em sub-fluxo e precisar ser reatribuída **antes** do envio, responde `409` com

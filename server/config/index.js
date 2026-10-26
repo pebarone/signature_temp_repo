@@ -201,10 +201,18 @@ function computeConfig(env = process.env, { projectRoot = PROJECT_ROOT } = {}) {
       enabled=false (padrão): POST /cancel responde 404. As rotas administrativas (POST /admin/cancel/:agreementId e
       POST /admin/cancel-workflow/:workflowId, Basic Auth) não dependem deste flag.
       POST /cancel processa vários fluxos (lote) e POST /cancel/preview só os consulta (nada é cancelado nem gravado).
-      Os nomes abaixo são PROVISÓRIOS: o mapa do workflow de cancelamento ainda não existe no Content.
+      Os nomes abaixo são os do mapa do workflow de cancelamento publicado no QA (23/10); confirme-os em PROD.
+      directEnabled=false (padrão): o modo DIRETO (WebReport executado sozinho, sem workflow) fica desligado; POST
+      /cancel/direct/auth, /cancel/direct e /cancel/direct/preview só existem com enabled E directEnabled E as credenciais
+      CANCEL_DIRECT_AUTH_USER/PASS, senão caem no 404 padrão.
     */
     cancel: {
       enabled: bool(env.CANCEL_ENABLED, false),
+      directEnabled: bool(env.CANCEL_DIRECT_ENABLED, false),
+      // Credencial Basic PRÓPRIA de POST /cancel/direct/auth (modo direto). SEM fallback para START_AUTH_* nem LOG_*: o /auth
+      // genérico fica embutido em WebReports de firma que muitos usuários leem. Sem as duas, o modo direto não é montado.
+      directAuthUser: str(env.CANCEL_DIRECT_AUTH_USER),
+      directAuthPass: str(env.CANCEL_DIRECT_AUTH_PASS),
       // Tarefa do workflow de cancelamento que roda o WebReport (nome normalizado COMEÇA com um destes, como SIGN_TASK_NAMES)
       taskNames: list(env.CANCEL_TASK_NAMES, ['Cancelar Flujo de Firma']),
       // Rótulos dos atributos do formulário dessa tarefa (GET /v1/forms/processes/tasks/update): o fluxo a cancelar
