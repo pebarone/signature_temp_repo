@@ -1,5 +1,6 @@
 # Deployment do orquestrador. Requisitos de storage em README.md: um pod, PVC RWO, estratégia Recreate.
-# A imagem é definida em kustomization.yaml (images:), não aqui: aplique sempre com `oc apply -k deploy/openshift`.
+# A imagem é definida no kustomization.yaml de cada ambiente (images:), não aqui: aplique com `oc apply -k deploy/openshift/prod`
+# (ou `.../qa`).
 apiVersion: apps/v1
 kind: Deployment
 metadata:

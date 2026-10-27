@@ -1,16 +1,15 @@
-# Aplica os recursos de configuração do orquestrador: oc apply -k deploy/openshift
+# PROD: oc apply -k deploy/openshift/prod
 # O Secret NÃO entra aqui: é criado separadamente com oc create secret (ver README, passo 2.2).
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
-  - pvc.yaml
-  - configmap.yaml
-  - deployment.yaml
-  - service.yaml
-  - route.yaml
+  - ../base
+patches:
+  - path: configmap-env.yaml
+  - path: route-env.yaml
 # Único lugar da imagem (ver README, passo 2.5). Registry interno do OpenShift:
 #   image-registry.openshift-image-registry.svc:5000/<namespace>/signature-orchestrator
-# Para trocar sem editar: kustomize edit set image signature-orchestrator=<registry>/<namespace>/signature-orchestrator:<tag>
+# Para trocar sem editar: cd deploy/openshift/prod && kustomize edit set image signature-orchestrator=<registry>/<namespace>/signature-orchestrator:<tag>
 images:
   - name: signature-orchestrator
     newName: <registry>/<namespace>/signature-orchestrator

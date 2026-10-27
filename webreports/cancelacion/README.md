@@ -91,13 +91,13 @@ Fora de uma tarefa o OTCS entrega essas tags vazias ou sem resolver; as duas coi
 | Como abre | tarefa "Cancelar Flujo de Firma" do workflow de cancelamento | o WebReport sozinho (URL `RunReport`, menu...), sem workflow |
 | Alvos | gravados em `ID Flujo a Cancelar`; o servidor os relê do formulário | vão no corpo (`targetWorkflowIds`) e ficam **vinculados ao HMAC** |
 | Rotas | `/auth`, `/cancel/preview`, `/cancel` | `/cancel/direct/auth`, `/cancel/direct/preview`, `/cancel/direct` |
-| Credencial Basic do pedido de assinatura | `START_AUTH_*` (ou `LOG_*`), em `BASIC_USER`/`BASIC_PASS` | **própria**: `CANCEL_DIRECT_AUTH_USER`/`CANCEL_DIRECT_AUTH_PASS`, em `BASIC_USER_DIRECTO`/`BASIC_PASS_DIRECTO`; **sem fallback** para `START_AUTH_*` nem `LOG_*` |
+| Credencial Basic do pedido de assinatura | `START_AUTH_*` (ou `LOG_*`), em `BASIC_USER`/`BASIC_PASS` | **a mesma**, em `BASIC_USER`/`BASIC_PASS`; `CANCEL_DIRECT_AUTH_USER`/`CANCEL_DIRECT_AUTH_PASS`, se as duas estiverem definidas, substituem essa credencial no modo direto |
 | Ramos `guardar` / `leer` / `reasignar`, plano C | usa | **não usa** (nem o bloco `WFATTR`, protegido por um `IF` de `&SUBWORKID`) |
 | Fluxo original | para só com `CANCEL_STOP_ORIGINAL=true` (senão, passo seguinte do mapa) | **sempre para**, qualquer que seja `CANCEL_STOP_ORIGINAL` (não há passo seguinte) |
 | `IDs Cancelados`, SendOn da tarefa | sim | **não há** (`sentOn: false`) |
-| Habilitação no servidor | `CANCEL_ENABLED` | `CANCEL_ENABLED` **e** `CANCEL_DIRECT_ENABLED` (padrão `false`) **e** as duas credenciais diretas; senão as três rotas diretas dão `404` (preflight CORS inclusive). `CANCEL_DIRECT_ENABLED=true` sem `CANCEL_DIRECT_AUTH_USER`/`PASS` não monta as rotas e registra no startup `[CANCEL] CANCEL_DIRECT_ENABLED=true sin CANCEL_DIRECT_AUTH_USER/PASS: cancelación directa deshabilitada` |
+| Habilitação no servidor | `CANCEL_ENABLED` | `CANCEL_ENABLED` **e** `CANCEL_DIRECT_ENABLED` (padrão `false`) **e** uma credencial Basic (`CANCEL_DIRECT_AUTH_*` ou, sem elas, a do `/auth`); senão as três rotas diretas dão `404` (preflight CORS inclusive). `CANCEL_DIRECT_ENABLED=true` sem nenhuma credencial não monta as rotas e registra no startup `[CANCEL] CANCEL_DIRECT_ENABLED=true sin credencial Basic (CANCEL_DIRECT_AUTH_*, START_AUTH_* o LOG_*): cancelación directa deshabilitada` |
 
-**Protocolo.** "Revisar": `POST /cancel/direct/auth` (Basic `BASIC_USER_DIRECTO`/`BASIC_PASS_DIRECTO`) com `{targetWorkflowIds: ["3101","3102"], requestedBy?}`
+**Protocolo.** "Revisar": `POST /cancel/direct/auth` (Basic `BASIC_USER`/`BASIC_PASS`) com `{targetWorkflowIds: ["3101","3102"], requestedBy?}`
 e `POST /cancel/direct/preview` com os **mesmos** campos mais `timestamp`, `nonce` e `signature` (mesma lista e mesma ordem, em texto).
 "Cancelar": novo `/cancel/direct/auth` e `POST /cancel/direct`. Cada chamada consome um nonce; v1 é recusada, como no `/cancel`.
 
@@ -136,12 +136,12 @@ entra no HMAC.
 - Seleção em `sessionStorage` com a chave `cancelar-sel-directo`; limpa quando o lote conclui.
 - O texto "la tarea" não aparece; o final é "Los acuerdos se cancelaron en Adobe Sign y los flujos originales se detuvieron en Content
   Server". Se algum item não foi cancelado (assinado, ambíguo...), o final é um aviso com o motivo de cada um.
-- `404` nas rotas diretas → "La cancelación directa no está habilitada en el servidor (CANCEL_DIRECT_ENABLED)".
+- `404` nas rotas diretas → "La cancelación directa no está habilitada en el servidor (CANCEL_DIRECT_ENABLED)"; no
+  `/cancel/direct/auth` → "... (CANCEL_DIRECT_ENABLED y credencial Basic)".
 
 **Segurança e auditoria.** O modo direto não tem tarefa que prove quem pode cancelar: a autorização é a **permissão sobre o WebReport no
-OTCS** (restringir **este** WebReport a um grupo autorizado, e quem pode ver/editar a fonte) e a credencial Basic **própria** do
-`/cancel/direct/auth` (`CANCEL_DIRECT_AUTH_*`), que fica no script publicado: quem a ler pode assinar qualquer lista e cancelar. Por
-isso ela é separada da credencial do `/auth` genérico e a assinatura tem escopo. O HMAC vincula a lista revisada à chamada (não dá
+OTCS** (restringir **este** WebReport a um grupo autorizado, e quem pode ver/editar a fonte) e a credencial Basic do
+`/cancel/direct/auth` (`CANCEL_DIRECT_AUTH_*` ou, sem elas, a do `/auth` genérico, `BASIC_USER`/`BASIC_PASS`), que fica no script publicado: quem a ler pode assinar qualquer lista e cancelar. **Risco aceito:** com uma credencial só, quem puder ler a fonte de qualquer WebReport que a embuta pode usar o mesmo Basic para chamar `/admin` e para cancelar ou parar fluxos pelo modo direto. A assinatura tem escopo próprio: a do `/auth` não vale nas rotas diretas, e a direta não vale em `/cancel` nem em `/start`. O HMAC vincula a lista revisada à chamada (não dá
 para trocar os alvos entre a assinatura e a rota, nem reaproveitar uma assinatura da tarefa ou do `/start`), mas não identifica a
 pessoa. `POST /admin/cancel-workflow/{id}` (credencial `LOG_*`) é um caminho à parte, anterior, e não muda. Não existe `IDs Cancelados` nem SendOn: a auditoria fica só no banco do orquestrador (`cancel_source`, evento
 `CANCEL_REQUESTED`) e nos logs `[CANCEL] Directo (...)`; no OTCS o stop aparece no histórico do processo como o usuário de integração.
@@ -173,7 +173,7 @@ Textos em espanhol, como na página. "Reintentar" diz se o botão faz sentido. O
 | `SENDON_FAILED` | Los acuerdos ya fueron cancelados, pero no se pudo continuar el flujo de cancelación | sim (es seguro) |
 | `REASSIGN_REQUIRED` | Reasigna la tarea y repite una vez | sim |
 | 404 sin `code` | La cancelación de flujos no está habilitada en el servidor (`CANCEL_ENABLED=false`) | não |
-| 404 sin `code` (modo directo) | La cancelación directa no está habilitada en el servidor (`CANCEL_DIRECT_ENABLED` y `CANCEL_DIRECT_AUTH_USER/PASS`). **Só aparece se a resposta chegar ao script** (mesma origem). Com o modo direto desligado o servidor responde 404 **sem cabeçalhos CORS** (o preflight também) e, a partir do OTCS, o navegador mostra um erro de rede/CORS: a página exibe "No se pudo conectar con el servidor de firmas." | não |
+| 404 sin `code` (modo directo) | La cancelación directa no está habilitada en el servidor (`CANCEL_DIRECT_ENABLED` y credencial Basic). **Só aparece se a resposta chegar ao script** (mesma origem). Com o modo direto desligado o servidor responde 404 **sem cabeçalhos CORS** (o preflight também) e, a partir do OTCS, o navegador mostra um erro de rede/CORS: a página exibe "No se pudo conectar con el servidor de firmas." | não |
 | contexto misto (alguns de `WORKID`/`SUBWORKID`/`TASKID` resolvidos) | Datos de la tarea inválidos: abra esta página desde la tarea...; nenhuma chamada ao servidor | — |
 | falha de rede | No se pudo conectar con el servidor de firmas | sim |
 | plano C: `guardar` sem `GUARDADO_OK` | No se pudo guardar la selección (OpenText no confirmó); se muestran los IDs para pegarlos a mano | — |
@@ -221,11 +221,10 @@ e linha `WFTASKACTION:REASSIGN`):
 | usuário de integração | linha `WFTASKACTION:REASSIGN` do ramo `reasignar` | QA: 11742766 (AdminKeralty); PROD: ID do AdminKeralty de PROD |
 | nomes dos atributos | tags `WFATTR` / `SETWFATTR` e constante `ATRIBUTO` | `ID Flujo a Cancelar` / `ID Subflujo a Cancelar` iguais a `CANCEL_FIELD_TARGET_*` do servidor |
 
-Modo direto: não usa `REPORT_ID` nem o usuário de integração da reatribuição, mas exige `CANCEL_DIRECT_ENABLED=true` e
-`CANCEL_DIRECT_AUTH_USER`/`CANCEL_DIRECT_AUTH_PASS` no servidor; no script, `BASIC_USER_DIRECTO`/`BASIC_PASS_DIRECTO` (placeholders, devem ser
-iguais a essas duas variáveis) e `USUARIO_SOLICITANTE` opcional (ver "Modo direto").
+Modo direto: não usa `REPORT_ID` nem o usuário de integração da reatribuição, mas exige `CANCEL_DIRECT_ENABLED=true` e uma credencial Basic no servidor; no script, `BASIC_USER`/`BASIC_PASS` (placeholders: devem ser a
+credencial que o servidor aceita no modo direto, ou seja, `CANCEL_DIRECT_AUTH_*` se definidas, senão a do `/auth`) e `USUARIO_SOLICITANTE` opcional (ver "Modo direto").
 
-Lado do servidor (ConfigMap): `CANCEL_ENABLED`, `CANCEL_DIRECT_ENABLED` (padrão `false`, modo direto), `CANCEL_DIRECT_AUTH_USER` / `CANCEL_DIRECT_AUTH_PASS` (credencial própria do modo direto, sem fallback; Secret), `CANCEL_TASK_NAMES`, `CANCEL_FIELD_TARGET_WORKFLOW`,
+Lado do servidor (ConfigMap): `CANCEL_ENABLED`, `CANCEL_DIRECT_ENABLED` (padrão `false`, modo direto), `CANCEL_DIRECT_AUTH_USER` / `CANCEL_DIRECT_AUTH_PASS` (opcional: credencial própria do modo direto; sem elas, vale a do `/auth`; Secret), `CANCEL_TASK_NAMES`, `CANCEL_FIELD_TARGET_WORKFLOW`,
 `CANCEL_FIELD_TARGET_SUBWORKFLOW`, `CANCEL_FIELD_RESULT` (padrão `IDs Cancelados`), `CANCEL_MAX_TARGETS` (padrão 20),
 `CANCEL_STOP_ORIGINAL` (padrão `false`), `CANCEL_BATCH_BUDGET_MS` (padrão 15000, prazo único do lote), `CANCEL_SETTLE_TIMEOUT_MS`
 (padrão 20000). Ver a tabela no design.
@@ -327,7 +326,7 @@ de um acordo `OUT_FOR_SIGNATURE`, o stop do original e o registro em `IDs Cancel
 - [ ] Abrir o WebReport **sozinho** (sem workflow): conferir como o OTCS renderiza `&WORKID`/`&SUBWORKID`/`&TASKID` (vazio ou literal), que a
       introdução mostra o texto do modo direto, que o `IF` de `&SUBWORKID` evita o bloco `WFATTR` sem erro, e que nenhuma chamada
       `accion=guardar|leer|reasignar` aparece (DevTools, Network). Abrir pela tarefa continua no modo tarefa.
-- [ ] `CANCEL_DIRECT_ENABLED=false` (ou sem `CANCEL_DIRECT_AUTH_USER/PASS`, que também registra o erro no startup): `OPTIONS` e `POST` em
+- [ ] `CANCEL_DIRECT_ENABLED=false` (ou sem nenhuma credencial Basic, que também registra o erro no startup): `OPTIONS` e `POST` em
       `/cancel/direct/auth`, `/cancel/direct` e `/cancel/direct/preview` dão 404 **sem cabeçalhos CORS**. No navegador, a partir do OTCS, "Revisar"
       mostra o erro de rede "No se pudo conectar con el servidor de firmas." (a mensagem "no está habilitada" só aparece em chamadas de mesma origem).
 - [ ] **URL sem `taskid`** (ou só com `workid`/`subworkid`): a página mostra "Datos de la tarea inválidos...", sem botões, e o Network não mostra

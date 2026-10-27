@@ -369,7 +369,7 @@ function createSignatureService({ repo, adobe, otcs, logger, config, now = () =>
           name: `Documento ${fileName}`,
           transientDocumentId,
           emails,
-          externalId: buildExternalId({ workflowId, subworkflowId: subId, nodeId, attachId })
+          externalId: buildExternalId({ workflowId, subworkflowId: subId, nodeId, attachId }, config.signatureSecret)
         });
 
         // Mapeamento persistido ANTES do SendOn: um webhook imediato já encontra o acordo

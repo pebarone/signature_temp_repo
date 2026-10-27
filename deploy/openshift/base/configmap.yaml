@@ -1,5 +1,6 @@
-# Configuração NÃO sensível do orquestrador. Segredos ficam no Secret signature-orchestrator-env (ver secret.example.yaml).
-# Defaults: server/config/index.js. Região Adobe: NA4 (produção); o padrão do código é EU1.
+# Configuração NÃO sensível do orquestrador, comum a QA e PROD. Segredos ficam no Secret signature-orchestrator-env
+# (ver ../secret.example.yaml). O que muda por ambiente (PUBLIC_URL, OTCS_BASE, Adobe e CORS_ORIGINS) fica em
+# ../prod/configmap-env.yaml e ../qa/configmap-env.yaml. Defaults: server/config/index.js.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -7,16 +8,6 @@ metadata:
   labels:
     app: signature-orchestrator
 data:
-  # URL pública (Route) do orquestrador: base do redirect OAuth (<PUBLIC_URL>/admin/callback) e do webhook (<PUBLIC_URL>/webhook).
-  # É o host do orquestrador atual de PROD: o webhook do Adobe e o WebReport de envio já apontam para ele. Se o deploy usar
-  # outro host, troque aqui e em route.yaml e atualize o webhook, o redirect URI e o SERVER_URL dos WebReports (README, seção 3).
-  PUBLIC_URL: "https://co-saphcm-ms-md-co-sign-empcontract-prod.apps.osftd4.colsanitas.com"
-  # Base da API do Content Server (OTCS); o código acrescenta /v1 e /v2
-  OTCS_BASE: "https://otcs.g115.opentext.cloud/cs/cs/api"
-  # Região Adobe Sign de produção (NA4): API
-  ADOBE_API_BASE: "https://api.na4.adobesign.com"
-  # Região Adobe Sign de produção (NA4): OAuth
-  ADOBE_AUTH_BASE: "https://secure.na4.adobesign.com"
   # Timeout (ms) de cada chamada ao Adobe, inclusive refresh e troca de token
   ADOBE_TIMEOUT_MS: "60000"
   # Tentativas de baixar o PDF assinado (o Adobe responde 403 por alguns segundos logo depois da assinatura)
@@ -81,13 +72,11 @@ data:
   START_FIELD_ATTACHID: "AttachID"
   START_FIELD_DOCNAME: "Nombre del Documento"
   START_FIELD_EMAILS: "Email Firmante 1,Email Firmante 2"
-  # Origens com CORS em /auth e /start (lista). Vazio => a origem de OTCS_BASE. Em PROD, a do OTCS de produção
-  CORS_ORIGINS: "https://otcs.g115.opentext.cloud"
-  # Transição dos WebReports (passo 1 da ordem de rollout em webreports/README.md, índice dos WebReports por fluxo): LIGADAS
-  # no primeiro deploy, porque o WebReport de PROD ainda pode chamar o GET /start antigo. Aceitam GET /auth + assinatura v1 e o
-  # GET /start antigo, sempre validados contra o OTCS; cada uso gera warn no log. Depois de publicar e testar os WebReports
-  # novos, troque para "false" e rode `oc apply -k deploy/openshift && oc rollout restart deploy/signature-orchestrator`.
-  START_LEGACY_SIGNATURE: "true"
-  START_LEGACY_GET_ENABLED: "true"
+  # Transição dos WebReports (ordem de rollout em webreports/README.md): DESLIGADAS, passo 4 concluído (os WebReports de PROD
+  # já falam o protocolo v2). Com "false", GET /auth, a assinatura v1 e o GET /start antigo respondem 404/403. Só religue
+  # ("true") como rollback, se um WebReport antigo voltar a ser publicado; depois rode
+  # `oc apply -k deploy/openshift/prod && oc rollout restart deploy/signature-orchestrator`.
+  START_LEGACY_SIGNATURE: "false"
+  START_LEGACY_GET_ENABLED: "false"
   # false: aceita POST /webhook sem ClientId conhecido; true: exige CLIENT_ID ou um dos WEBHOOK_CLIENT_IDS
   WEBHOOK_REQUIRE_CLIENT_ID: "false"

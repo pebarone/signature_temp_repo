@@ -15,169 +15,295 @@ REASIGNADO_OK
   <meta name="color-scheme" content="light">
   <title>Solicitud de firma</title>
   <style>
+    /* Hallmark · built: 2026-10-27 · genre: modern-minimal · theme: Dose (dealt 3/3, seed herramienta-interna-para-operadores-5654·40ec72d4·2026-10-27·r0) · posture: restrained · shape: app screen · redesign: full · job: send to sign · signature: the step ledger, its connector and the cascading checks · v2.0.0 */
+    /* Hallmark · pre-emit critique: P4 H4 E4 S3 R5 V4 · weakest: S, the screen is a plain progress ledger; the steps carry the identity instead of a card or an illustration */
+    /* Hallmark · answered F2 · el texto de estado lo escribe el script del WebReport y se mantiene literal */
+    /* Hallmark · answered F4 · rojo solo en el boton que cancela flujos: el script cambia el primario a peligro en ese paso */
+    /* Hallmark · answered F5 · el circulo es el estado del paso (pendiente, activo, hecho, error), no un icono decorativo */
+    /* Hallmark · answered F1 · comillas rectas en textos en espanhol que nombran campos del OTCS; textos mantenidos */
+    /* Hallmark · answered F23 · pagina interna de un WebReport del OTCS, no se comparte por enlace */
     :root {
-      --fondo: #f3f5f8;
-      --tarjeta: #ffffff;
-      --texto: #1d2939;
-      --texto-suave: #5b6575;
-      --borde: #e4e7ec;
-      --acento: #0f766e;
-      --acento-hover: #115e59;
-      --ok: #067647;
-      --ok-suave: #e7f6ee;
-      --error: #b42318;
-      --error-suave: #fdecea;
-      --aviso: #b54708;
-      --aviso-suave: #fef0c7;
-      --pendiente: #7a8494;
-      --radio: 12px;
+      /* Papel, tinta y una sola senal verde (tema Dose, sin sus fuentes: el OTCS puede bloquear fuentes externas). */
+      --color-paper: oklch(97.6% 0.011 88);
+      --color-paper-2: oklch(95.4% 0.018 150);
+      --color-surface: oklch(99.4% 0.004 88);
+      --color-ink: oklch(21% 0.025 170);
+      --color-ink-2: oklch(31% 0.02 170);
+      --color-muted: oklch(47% 0.024 165);
+      --color-rule: oklch(88% 0.018 140);
+      --color-rule-strong: oklch(78% 0.022 150);
+      --color-accent: oklch(50% 0.13 160);
+      --color-accent-deep: oklch(42% 0.11 162);
+      --color-accent-soft: oklch(92% 0.06 160);
+      --color-accent-ink: oklch(99% 0.006 160);
+      --color-focus: oklch(45% 0.14 160);
+      --color-error: oklch(50% 0.17 27);
+      --color-error-deep: oklch(42% 0.15 27);
+      --color-error-soft: oklch(95.5% 0.025 27);
+      --color-warn: oklch(53% 0.13 60);
+      --color-warn-ink: oklch(38% 0.09 50);
+      --color-warn-soft: oklch(96% 0.04 85);
+      --color-warn-rule: oklch(85% 0.08 80);
+      --color-scrim: oklch(21% 0.025 170 / 0.42);
+      --shadow-dialog: 0 1px 2px oklch(30% 0.03 165 / 0.10), 0 24px 48px -24px oklch(30% 0.06 165 / 0.40);
+      --font-body: "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, Roboto, "Helvetica Neue", Arial, sans-serif;
+      --font-display: "Segoe UI Variable Display", "Segoe UI", system-ui, -apple-system, Roboto, "Helvetica Neue", Arial, sans-serif;
+      --font-mono: ui-monospace, "Cascadia Mono", "Cascadia Code", Consolas, "SF Mono", monospace;
+      --text-xs: 13px;
+      --text-sm: 14px;
+      --text-md: 16px;
+      --text-lg: 18px;
+      --text-xl: 21px;
+      --text-2xl: 25px;
+      --space-1: 4px;
+      --space-2: 8px;
+      --space-3: 12px;
+      --space-4: 16px;
+      --space-5: 20px;
+      --space-6: 24px;
+      --space-8: 32px;
+      --space-10: 40px;
+      --space-12: 48px;
+      --space-16: 64px;
+      --radius-control: 8px;
+      --radius-pill: 999px;
+      --dur-micro: 120ms;
+      --dur-short: 240ms;
+      --ease-out: cubic-bezier(0.2, 0.8, 0.2, 1);
     }
     *, *::before, *::after { box-sizing: border-box; }
     [hidden] { display: none !important; }
+    html, body { overflow-x: clip; }
+    html { scrollbar-color: var(--color-rule-strong) var(--color-paper); }
+    ::selection { background: var(--color-accent-soft); color: var(--color-ink); }
     body {
       margin: 0;
-      min-height: 100vh;
+      min-height: 100dvh;
+      background: var(--color-paper);
+      color: var(--color-ink);
+      caret-color: var(--color-accent);
+      font-family: var(--font-body);
+      font-size: var(--text-md);
+      line-height: 1.5;
+      -webkit-font-smoothing: antialiased;
+    }
+    a { color: var(--color-accent-deep); text-underline-offset: 3px; text-decoration-thickness: 1px; }
+    a:hover { color: var(--color-ink); text-decoration-thickness: 2px; }
+    :focus-visible { outline: 2px solid var(--color-focus); outline-offset: 2px; transition: none; }
+    .titulo {
+      margin: 0;
+      font-family: var(--font-display);
+      font-size: var(--text-2xl);
+      font-weight: 650;
+      line-height: 1.2;
+      letter-spacing: -0.01em;
+      overflow-wrap: break-word;
+      min-width: 0;
+      text-wrap: balance;
+    }
+    .seccion {
+      margin: 0 0 var(--space-2);
+      font-size: var(--text-sm);
+      font-weight: 600;
+      line-height: 1.4;
+      color: var(--color-muted);
+    }
+    .id { font-family: var(--font-mono); font-size: 0.92em; font-variant-numeric: tabular-nums; }
+
+    /* ---------- Pasos: el registro del proceso ---------- */
+    .pasos { position: relative; margin: 0; padding: 0; list-style: none; display: grid; gap: var(--space-4); }
+    .paso {
+      position: relative;
       display: flex;
       align-items: center;
-      justify-content: center;
-      padding: 16px;
-      background: var(--fondo);
-      color: var(--texto);
-      font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-      font-size: 16px;
-      line-height: 1.5;
+      gap: var(--space-3);
+      min-height: 24px;
+      color: var(--color-muted);
+      transition: color var(--dur-short) var(--ease-out);
     }
-    .tarjeta {
-      width: 100%;
-      max-width: 520px;
-      padding: 32px;
-      background: var(--tarjeta);
-      border: 1px solid var(--borde);
-      border-radius: var(--radio);
-      box-shadow: 0 1px 2px rgba(16, 24, 40, 0.06);
+    /* Linea que une cada icono con el siguiente; se pinta cuando el paso termina. */
+    .paso:not(:last-child)::before {
+      content: "";
+      position: absolute;
+      left: 11px;
+      top: calc(50% + 13px);
+      width: 2px;
+      height: 14px;
+      border-radius: 1px;
+      background: var(--color-rule-strong);
+      transform-origin: top;
+      transition: background-color var(--dur-short) var(--ease-out);
     }
-    .titulo { margin: 0 0 16px; font-size: 22px; font-weight: 600; line-height: 1.3; }
-    .seccion {
-      margin: 20px 0 8px;
-      font-size: 13px;
-      font-weight: 600;
-      letter-spacing: 0.04em;
-      text-transform: uppercase;
-      color: var(--texto-suave);
-    }
-    .documento {
-      display: flex;
-      flex-wrap: wrap;
-      align-items: baseline;
-      gap: 4px 12px;
-      padding: 12px 14px;
-      background: #f8fafc;
-      border: 1px solid var(--borde);
-      border-radius: 10px;
-    }
-    .documento-nombre { flex: 1 1 200px; min-width: 0; font-weight: 600; overflow-wrap: anywhere; }
-    .documento-enlace { color: var(--acento); font-weight: 600; white-space: nowrap; }
-    .documento-enlace:hover { color: var(--acento-hover); }
-    .firmantes { margin: 0; padding: 0; list-style: none; }
-    .firmantes li {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 4px 12px;
-      padding: 8px 0;
-      border-top: 1px solid var(--borde);
-      font-size: 15px;
-    }
-    .firmantes li:first-child { border-top: 0; }
-    .firmante-etiqueta { min-width: 80px; color: var(--texto-suave); }
-    .firmante-correo { flex: 1 1 180px; min-width: 0; overflow-wrap: anywhere; }
-    .pasos { margin: 24px 0 0; padding: 0; list-style: none; display: grid; gap: 14px; }
-    .paso { display: flex; align-items: center; gap: 12px; color: var(--texto-suave); }
-    .paso[data-estado="activo"], .paso[data-estado="hecho"] { color: var(--texto); }
+    .paso[data-estado="hecho"]:not(:last-child)::before { background: var(--color-accent); }
+    .paso[data-estado="activo"], .paso[data-estado="hecho"] { color: var(--color-ink); }
     .paso[data-estado="activo"] { font-weight: 600; }
-    .paso[data-estado="error"] { color: var(--error); font-weight: 600; }
-    .paso[data-estado="aviso"] { color: var(--aviso); font-weight: 600; }
+    .paso[data-estado="error"] { color: var(--color-error); font-weight: 600; }
+    .paso[data-estado="aviso"] { color: var(--color-warn-ink); font-weight: 600; }
     .paso-icono {
       display: inline-flex;
-      flex: 0 0 22px;
+      flex: 0 0 24px;
       align-items: center;
       justify-content: center;
-      width: 22px;
-      height: 22px;
-      border: 2px solid var(--pendiente);
+      width: 24px;
+      height: 24px;
+      border: 2px solid var(--color-rule-strong);
       border-radius: 50%;
+      background: var(--color-paper);
     }
     .paso[data-estado="activo"] .paso-icono {
-      border-color: #d0d5dd;
-      border-top-color: var(--acento);
+      border-color: var(--color-accent-soft);
+      border-top-color: var(--color-accent);
       animation: girar 0.8s linear infinite;
     }
-    .paso[data-estado="hecho"] .paso-icono { background: var(--acento); border-color: var(--acento); }
+    /* Check animado. Cuando varios pasos terminan juntos, el retraso por posicion los marca en cascada. */
+    .paso[data-estado="hecho"] .paso-icono {
+      background: var(--color-accent);
+      border-color: var(--color-accent);
+      color: var(--color-accent-ink);
+      animation: llenar 0.3s var(--retraso, 0s) var(--ease-out) both;
+    }
     .paso[data-estado="hecho"] .paso-icono::after {
       content: "";
       width: 5px;
-      height: 9px;
+      height: 10px;
       margin-top: -2px;
-      border: solid #fff;
+      border: solid currentColor;
       border-width: 0 2px 2px 0;
       transform: rotate(45deg);
+      animation: trazo 0.3s calc(var(--retraso, 0s) + 0.12s) var(--ease-out) both;
     }
-    .paso[data-estado="error"] .paso-icono { background: var(--error); border-color: var(--error); color: #fff; }
-    .paso[data-estado="error"] .paso-icono::before { content: "!"; font-size: 14px; font-weight: 700; line-height: 1; }
-    .paso[data-estado="aviso"] .paso-icono { background: var(--aviso); border-color: var(--aviso); color: #fff; }
-    .paso[data-estado="aviso"] .paso-icono::before { content: "!"; font-size: 14px; font-weight: 700; line-height: 1; }
+    .paso:nth-child(2) { --retraso: 0.15s; }
+    .paso:nth-child(3) { --retraso: 0.3s; }
+    .paso:nth-child(4) { --retraso: 0.45s; }
+    .paso[data-estado="error"] .paso-icono { background: var(--color-error); border-color: var(--color-error); color: var(--color-accent-ink); }
+    .paso[data-estado="aviso"] .paso-icono { background: var(--color-warn); border-color: var(--color-warn); color: var(--color-accent-ink); }
+    .paso[data-estado="error"] .paso-icono::before,
+    .paso[data-estado="aviso"] .paso-icono::before { content: "!"; font-size: var(--text-sm); font-weight: 700; line-height: 1; }
     @keyframes girar { to { transform: rotate(360deg); } }
-    .resultado { display: flex; justify-content: center; margin-top: 24px; }
+    @keyframes llenar {
+      from { background-color: transparent; border-color: var(--color-rule-strong); transform: scale(0.8); }
+      to { transform: scale(1); }
+    }
+    @keyframes trazo {
+      from { transform: rotate(45deg) scale(0); }
+      to { transform: rotate(45deg) scale(1); }
+    }
+
+    /* ---------- Resultado ---------- */
+    .resultado { display: flex; margin-top: var(--space-8); }
     .insignia {
-      width: 56px;
-      height: 56px;
-      border-radius: 50%;
       display: flex;
       align-items: center;
       justify-content: center;
+      width: 48px;
+      height: 48px;
+      border-radius: 50%;
+      font-size: var(--text-xl);
+      font-weight: 700;
+      line-height: 1;
+      animation: asomar 0.35s var(--ease-out) both;
     }
-    .insignia.ok { background: var(--ok-suave); }
+    .insignia.ok { background: var(--color-accent-soft); }
     .insignia.ok::after {
       content: "";
-      width: 14px;
-      height: 26px;
-      margin-top: -5px;
-      border: solid var(--ok);
-      border-width: 0 4px 4px 0;
+      width: 12px;
+      height: 22px;
+      margin-top: calc(var(--space-1) * -1);
+      border: solid var(--color-accent-deep);
+      border-width: 0 3px 3px 0;
       transform: rotate(45deg) scale(0);
-      animation: marcar 0.45s 0.1s cubic-bezier(0.2, 0.8, 0.2, 1) forwards;
+      animation: marcar 0.45s 0.1s var(--ease-out) forwards;
     }
+    .insignia.error { background: var(--color-error-soft); color: var(--color-error); }
+    .insignia.aviso { background: var(--color-warn-soft); color: var(--color-warn-ink); }
+    .insignia.error::before, .insignia.aviso::before { content: "!"; }
     @keyframes marcar { to { transform: rotate(45deg) scale(1); } }
-    .insignia.error { background: var(--error-suave); color: var(--error); font-size: 30px; font-weight: 700; line-height: 1; }
-    .insignia.error::before { content: "!"; }
-    .insignia.aviso { background: var(--aviso-suave); color: var(--aviso); font-size: 30px; font-weight: 700; line-height: 1; }
-    .insignia.aviso::before { content: "!"; }
-    .estado { min-height: 1.5em; margin: 16px 0 0; text-align: center; font-weight: 600; overflow-wrap: anywhere; }
-    .estado.ok { color: var(--ok); }
-    .estado.error { color: var(--error); }
-    .estado.aviso { color: var(--aviso); }
-    .acuerdo { margin: 6px 0 0; text-align: center; font-size: 13px; color: var(--texto-suave); overflow-wrap: anywhere; }
-    .acciones { display: grid; margin-top: 24px; }
+    @keyframes asomar { from { opacity: 0; transform: scale(0.85); } }
+    .estado { min-height: 1.5em; margin: var(--space-4) 0 0; font-weight: 600; overflow-wrap: break-word; }
+    .estado:empty { min-height: 0; margin: 0; }
+    .estado.ok { color: var(--color-accent-deep); }
+    .estado.error { color: var(--color-error); }
+    .estado.aviso { color: var(--color-warn-ink); }
+    .acuerdo { margin: var(--space-1) 0 0; font-size: var(--text-sm); color: var(--color-muted); overflow-wrap: break-word; }
+
+    /* ---------- Botones: ocho estados ---------- */
+    .acciones { display: flex; flex-wrap: wrap; gap: var(--space-3); margin-top: var(--space-6); }
+    .acciones:not(:has(.btn:not([hidden]))) { display: none; }
     .btn {
-      min-height: 44px;
-      padding: 12px 20px;
-      border: 0;
-      border-radius: 10px;
-      background: var(--acento);
-      color: #fff;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 40px;
+      padding: var(--space-2) var(--space-5);
+      border: 1px solid var(--color-accent-deep);
+      border-radius: var(--radius-control);
+      background: var(--color-accent);
+      color: var(--color-accent-ink);
+      box-shadow: 0 2px 0 var(--color-accent-deep);
       font: inherit;
-      font-size: 16px;
+      font-size: var(--text-sm);
       font-weight: 600;
+      white-space: nowrap;
       cursor: pointer;
+      transition: background-color var(--dur-micro) var(--ease-out), border-color var(--dur-micro) var(--ease-out), box-shadow var(--dur-micro) var(--ease-out), transform var(--dur-micro) var(--ease-out);
     }
-    .btn:hover { background: var(--acento-hover); }
-    .btn:focus-visible, a:focus-visible { outline: 3px solid var(--acento); outline-offset: 2px; }
-    .btn:disabled { opacity: 0.6; cursor: progress; }
-    @media (max-width: 400px) {
-      .tarjeta { padding: 24px 20px; }
+    .btn:hover { background: var(--color-accent-deep); }
+    .btn:active:not(:disabled) { transform: translateY(2px); box-shadow: 0 0 0 var(--color-accent-deep); }
+    .btn.peligro { background: var(--color-error); border-color: var(--color-error-deep); box-shadow: 0 2px 0 var(--color-error-deep); }
+    .btn.peligro:hover { background: var(--color-error-deep); }
+    .btn.secundario { background: transparent; color: var(--color-ink); border-color: var(--color-rule-strong); box-shadow: 0 2px 0 var(--color-rule); }
+    .btn.secundario:hover { background: var(--color-paper-2); border-color: var(--color-muted); }
+    .btn:disabled, .btn.peligro:disabled, .btn.secundario:disabled {
+      opacity: 0.55;
+      background: var(--color-paper-2);
+      border-color: var(--color-rule);
+      color: var(--color-muted);
+      box-shadow: none;
+      cursor: not-allowed;
+    }
+    .btn[aria-busy="true"]:disabled { cursor: progress; }
+
+    /* ---------- Pagina: dos columnas sobre el papel, sin tarjeta ---------- */
+    .hoja {
+      width: 100%;
+      max-width: 880px;
+      margin: 0 auto;
+      padding: var(--space-16) var(--space-6) var(--space-12);
+    }
+    .cabecera { padding-bottom: var(--space-6); border-bottom: 1px solid var(--color-rule); }
+    .cuerpo {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      column-gap: var(--space-12);
+      padding-top: var(--space-8);
+    }
+    .datos { display: grid; align-content: start; gap: var(--space-8); }
+    .progreso { padding-left: var(--space-12); border-left: 1px solid var(--color-rule); }
+    .documento { display: grid; gap: var(--space-1); min-width: 0; }
+    .documento-nombre { font-size: var(--text-lg); font-weight: 600; line-height: 1.35; overflow-wrap: break-word; }
+    .documento-enlace { justify-self: start; font-size: var(--text-sm); font-weight: 600; }
+    .firmantes { margin: 0; padding: 0; list-style: none; }
+    .firmantes li {
+      display: grid;
+      grid-template-columns: 88px minmax(0, 1fr);
+      gap: var(--space-3);
+      padding: var(--space-2) 0;
+      border-top: 1px solid var(--color-rule);
+      font-size: var(--text-sm);
+    }
+    .firmantes li:last-child { border-bottom: 1px solid var(--color-rule); }
+    .firmante-etiqueta { color: var(--color-muted); }
+    .firmante-correo { overflow-wrap: break-word; }
+    @media (max-width: 720px) {
+      .hoja { padding: var(--space-8) var(--space-4) var(--space-10); }
+      .cuerpo { grid-template-columns: minmax(0, 1fr); row-gap: var(--space-8); }
+      .progreso { padding: var(--space-8) 0 0; border-left: 0; border-top: 1px solid var(--color-rule); }
+      .acciones { display: grid; }
     }
     @media (prefers-reduced-motion: reduce) {
       *, *::before, *::after {
         animation-duration: 0.01ms !important;
+        animation-delay: 0s !important;
         animation-iteration-count: 1 !important;
         transition-duration: 0.01ms !important;
       }
@@ -185,31 +311,41 @@ REASIGNADO_OK
   </style>
 </head>
 <body>
-  <main class="tarjeta">
-    <h1 class="titulo">Solicitud de firma</h1>
+  <main class="hoja">
+    <header class="cabecera">
+      <h1 class="titulo">Solicitud de firma</h1>
+    </header>
 
-    <div class="documento">
-      <span class="documento-nombre" id="doc-nombre"></span>
-      <a class="documento-enlace" id="doc-enlace" target="_blank" rel="noopener noreferrer">Ver documento</a>
-    </div>
+    <div class="cuerpo">
+      <div class="datos">
+        <div class="documento">
+          <span class="documento-nombre" id="doc-nombre"></span>
+          <a class="documento-enlace" id="doc-enlace" target="_blank" rel="noopener noreferrer">Ver documento</a>
+        </div>
 
-    <h2 class="seccion">Firmantes</h2>
-    <ul class="firmantes" id="firmantes"></ul>
+        <section>
+          <h2 class="seccion">Firmantes</h2>
+          <ul class="firmantes" id="firmantes"></ul>
+        </section>
+      </div>
 
-    <ol class="pasos">
-      <li class="paso" id="paso-envio" data-estado="pendiente"><span class="paso-icono" aria-hidden="true"></span><span>Enviando a Adobe Sign</span></li>
-      <li class="paso" id="paso-asignar" data-estado="pendiente"><span class="paso-icono" aria-hidden="true"></span><span>Asignando la tarea</span></li>
-      <li class="paso" id="paso-listo" data-estado="pendiente"><span class="paso-icono" aria-hidden="true"></span><span>Listo</span></li>
-    </ol>
+      <div class="progreso">
+        <ol class="pasos">
+          <li class="paso" id="paso-envio" data-estado="pendiente"><span class="paso-icono" aria-hidden="true"></span><span>Enviando a Adobe Sign</span></li>
+          <li class="paso" id="paso-asignar" data-estado="pendiente"><span class="paso-icono" aria-hidden="true"></span><span>Asignando la tarea</span></li>
+          <li class="paso" id="paso-listo" data-estado="pendiente"><span class="paso-icono" aria-hidden="true"></span><span>Listo</span></li>
+        </ol>
 
-    <div class="resultado" id="resultado" hidden><span class="insignia" id="insignia" aria-hidden="true"></span></div>
+        <div class="resultado" id="resultado" hidden><span class="insignia" id="insignia" aria-hidden="true"></span></div>
 
-    <p class="estado" id="estado" role="status" aria-live="polite">Preparando el envío...</p>
-    <p class="acuerdo" id="acuerdo" hidden></p>
+        <p class="estado" id="estado" role="status" aria-live="polite">Preparando el envío...</p>
+        <p class="acuerdo" id="acuerdo" hidden></p>
 
-    <div class="acciones">
-      <button class="btn" type="button" id="btn-reintentar" hidden>Reintentar</button>
-      <button class="btn" type="button" id="btn-volver" hidden>Volver a SuccessFactors</button>
+        <div class="acciones">
+          <button class="btn" type="button" id="btn-reintentar" hidden>Reintentar</button>
+          <button class="btn" type="button" id="btn-volver" hidden>Volver a SuccessFactors</button>
+        </div>
+      </div>
     </div>
   </main>
 
@@ -238,7 +374,7 @@ REASIGNADO_OK
      BASIC_USER / BASIC_PASS son placeholders: el valor real entra
      solo en el WebReport publicado, nunca en este archivo.
      ============================================================ */
-  const SERVER_URL = 'https://signature-orchestrator-api-2gim.onrender.com';
+  const SERVER_URL = 'https://legible-chipmunk-only.ngrok-free.com';
   const BASIC_USER = 'ADOBE-LOGS';
   const BASIC_PASS = 'ADOBE-LOGS-PASS';
   const RETURN_URL = 'https://hcm41preview.sapsf.com/sf/customExternalModule?bplte_company=keraltysasT1';
@@ -508,7 +644,7 @@ REASIGNADO_OK
     let r = await iniciar();
     if (reasignaRequerido(r) && r.data.handoff) {
       state.handoff = r.data.handoff;
-      setEstado('Asignando la tarea...', '');
+      pasoActivo('asignar');
       await reasignar();
       r = await iniciar();
       if (reasignaRequerido(r)) throw new Error(MSG_ASIGNAR);

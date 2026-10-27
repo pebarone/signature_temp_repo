@@ -38,23 +38,17 @@ function createApp({
 
   // POST /cancel e POST /cancel/preview (WebReport do workflow de cancelamento): só existem com CANCEL_ENABLED=true;
   // desligado caem no 404 padrão (e nem o preflight CORS os responde). POST /cancel/direct e /cancel/direct/preview (modo
-  // direto, WebReport sem workflow) exigem, além disso, CANCEL_DIRECT_ENABLED=true E credencial própria
-  // (CANCEL_DIRECT_AUTH_USER/PASS, sem fallback): sem ela as rotas diretas não são montadas (404) e o startup registra o erro.
+  // direto, WebReport sem workflow) exigem, além disso, CANCEL_DIRECT_ENABLED=true E uma credencial Basic não vazia
+  // (config.cancel.directAuth*: CANCEL_DIRECT_AUTH_USER/PASS ou, sem elas, a mesma do /auth). Sem credencial nenhuma, as
+  // rotas diretas não são montadas (404) e o startup registra o erro.
   const cancelEnabled = !!(config.cancel?.enabled && cancellationService);
   const directCredentials = !!(config.cancel?.directAuthUser && config.cancel?.directAuthPass);
-  // Reusar a credencial do /auth genérico ou dos logs anularia a separação: o modo direto também não é montado
-  const samePair = (user, pass) =>
-    !!user && config.cancel?.directAuthUser === String(user).trim() && config.cancel?.directAuthPass === String(pass ?? '').trim();
-  const directReused = directCredentials &&
-    (samePair(config.startAuth?.user, config.startAuth?.pass) || samePair(config.logUser, config.logPass));
   if (cancelEnabled && config.cancel?.directEnabled && !directCredentials) {
-    logger.error('[CANCEL] CANCEL_DIRECT_ENABLED=true sin CANCEL_DIRECT_AUTH_USER/PASS: cancelación directa deshabilitada');
-  } else if (cancelEnabled && config.cancel?.directEnabled && directReused) {
-    logger.error('[CANCEL] CANCEL_DIRECT_AUTH_USER/PASS iguales a START_AUTH_* o LOG_*: cancelación directa deshabilitada');
+    logger.error('[CANCEL] CANCEL_DIRECT_ENABLED=true sin credencial Basic (CANCEL_DIRECT_AUTH_*, START_AUTH_* o LOG_*): cancelación directa deshabilitada');
   }
-  const cancelDirectEnabled = cancelEnabled && !!config.cancel?.directEnabled && directCredentials && !directReused;
-  // Modo direto: credencial Basic própria e chave de assinatura DERIVADA (escopo 'cancel-direct'); o /auth genérico e o
-  // /cancel/direct/auth não assinam um para o outro
+  const cancelDirectEnabled = cancelEnabled && !!config.cancel?.directEnabled && directCredentials;
+  // Modo direto: Basic (acima) e chave de assinatura DERIVADA (escopo 'cancel-direct'). Mesmo com a mesma credencial Basic do
+  // /auth, o /auth genérico e o /cancel/direct/auth não assinam um para o outro
   const directKey = config.signatureSecret ? deriveKey(config.signatureSecret, DIRECT_SCOPE) : '';
   const directBasicAuth = createBasicAuth({
     user: config.cancel?.directAuthUser, pass: config.cancel?.directAuthPass, realm: 'CancelDirect'

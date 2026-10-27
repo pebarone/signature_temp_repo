@@ -10,6 +10,7 @@ const { createAgreementRepository } = require('../server/infra/agreementReposito
 const { canonicalStart, signStart } = require('../server/http/middleware/hmac');
 const { parseWebhookPayload } = require('../server/domain/eventPolicy');
 const { finalNotice } = require('../server/domain/agreementState');
+const { buildExternalId } = require('../server/domain/externalId');
 const {
   buildWorld, startBody, startBodyV1, seedStartFlow, basicHeader, makeClock, waitFor, httpError, tmpDir, webhookPayload,
   INTEGRATION_USER_ID, HUMAN_USER_ID
@@ -294,7 +295,10 @@ test('/start verificado: os valores do OTCS prevalecem e o subprocesso/tarefa re
   assert.equal(rec.taskId, 2, 'tarefa do OTCS, não a do payload');
   assert.deepEqual(rec.emails, ['Uno@Example.com', 'dos@example.com', 'tres@example.com']);
   assert.deepEqual(world.adobe.created[0].emails, rec.emails);
-  assert.equal(world.adobe.created[0].externalId, 'otcs|wf=3003|sub=3004|node=1001|attach=2002');
+  assert.equal(
+    world.adobe.created[0].externalId,
+    buildExternalId({ workflowId: '3003', subworkflowId: '3004', nodeId: '1001', attachId: '2002' }, world.config.signatureSecret)
+  );
   assert.deepEqual(world.otcs.downloads, ['1001']);
   assert.ok(world.otcs.modelCalls.some((c) => c[0] === 'getTaskForm' && c[1] === 3003 && c[2] === 3004 && c[3] === 2));
 

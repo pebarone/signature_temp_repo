@@ -4,6 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const { createLogger } = require('../server/infra/logger');
 const { sign, signStart } = require('../server/http/middleware/hmac');
+const { buildExternalId } = require('../server/domain/externalId');
 const {
   buildWorld, seedAgreement, webhookPayload, waitFor, startBody, startBodyV1, seedStartFlow, basicHeader, makeClock, tmpDir,
   httpError
@@ -282,7 +283,9 @@ test('/auth + /start: fluxo compatível com o template.html', async () => {
   assert.deepEqual(world.adobe.created[0].emails, ['one@example.com', 'two@example.com']);
   assert.deepEqual(world.otcs.downloads, ['1001']);
   assert.equal(
-    world.adobe.created[0].externalId, 'otcs|wf=3003|sub=3004|node=1001|attach=2002', 'rastreável pelo externalId'
+    world.adobe.created[0].externalId,
+    buildExternalId({ workflowId: '3003', subworkflowId: '3004', nodeId: '1001', attachId: '2002' }, world.config.signatureSecret),
+    'rastreável pelo externalId, assinado'
   );
 
   // SendOn automático da tarefa de início (localizada pelo nome; sem disposição) em background

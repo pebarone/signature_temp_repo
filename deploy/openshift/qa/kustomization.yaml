@@ -1,0 +1,32 @@
+# QA: cluster local (kind "openshift-local", ver Desktop/openshift/README.md) apontando para o OTCS de QA, publicado pelo ngrok.
+# O ngrok termina o HTTPS e entrega HTTP na porta 80 do ingress, por isso a Route não tem TLS.
+#
+#   deploy/openshift/qa/deploy-local.ps1   (build, kind load, Secret a partir do .env e apply)
+#   start.ps1                              (sobe o cluster e o ngrok)
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: orquestrador-firmas
+resources:
+  - ../base
+  - route-local.yaml
+patches:
+  - path: configmap-env.yaml
+  # Imagem carregada no nó pelo kind: nunca buscar em registry
+  - target:
+      kind: Deployment
+      name: signature-orchestrator
+    patch: |-
+      - op: add
+        path: /spec/template/spec/containers/0/imagePullPolicy
+        value: IfNotPresent
+  # Host do ngrok na Route: o ngrok repassa o Host original, e o ingress roteia por ele
+  - target:
+      kind: Route
+      name: signature-orchestrator
+    patch: |-
+      - op: add
+        path: /spec/host
+        value: legible-chipmunk-only.ngrok-free.app
+images:
+  - name: signature-orchestrator
+    newTag: local

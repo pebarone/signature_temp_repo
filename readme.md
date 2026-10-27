@@ -117,9 +117,9 @@ WF_ATTR_INTEGRATION_STATE=Estado Integración Firma
 
 # Flow cancellation (see "Flow cancellation"). The names below are PROVISIONAL: the cancellation workflow map does not exist yet
 CANCEL_ENABLED=false                  # true => POST /cancel (WebReport of the cancellation workflow) exists; false => 404. /admin/cancel* do not depend on it
-CANCEL_DIRECT_ENABLED=false           # true (and CANCEL_ENABLED=true, and both credentials below) => POST /cancel/direct/auth, /cancel/direct and /cancel/direct/preview exist (WebReport run on its own, no workflow; always stops the original flow); otherwise 404
-CANCEL_DIRECT_AUTH_USER=              # Basic Auth user of POST /cancel/direct/auth. NO fallback to START_AUTH_* or LOG_*; empty => direct mode is not mounted (error logged at startup)
-CANCEL_DIRECT_AUTH_PASS=              # Basic Auth password of POST /cancel/direct/auth (keep it in a Secret)
+CANCEL_DIRECT_ENABLED=false           # true (and CANCEL_ENABLED=true, and a Basic credential: the two below or, if unset, the /auth one) => POST /cancel/direct/auth, /cancel/direct and /cancel/direct/preview exist (WebReport run on its own, no workflow; always stops the original flow); otherwise 404
+CANCEL_DIRECT_AUTH_USER=              # Basic Auth user of POST /cancel/direct/auth. Optional (set BOTH user and pass); if unset, the /auth credential (START_AUTH_*, else LOG_*) is used. No credential at all => direct mode is not mounted (error logged at startup)
+CANCEL_DIRECT_AUTH_PASS=              # Basic Auth password of POST /cancel/direct/auth (optional, see above; keep it in a Secret)
 CANCEL_TASK_NAMES=Cancelar Flujo de Firma         # task of the cancellation workflow that runs the WebReport (prefix match, comma list)
 CANCEL_FIELD_TARGET_WORKFLOW=ID Flujo a Cancelar  # label of the task form attribute with the ID of the flow to cancel (mandatory, numeric)
 CANCEL_FIELD_TARGET_SUBWORKFLOW=ID Subflujo a Cancelar  # label of the optional attribute with its sub-process (numeric)
@@ -308,8 +308,8 @@ wrong step; `422` missing/invalid target attribute; `503` Adobe or OTCS unavaila
 (agreement cancelled, task not sent on: repeating is safe). Error bodies are `{ error, code, ... }`.
 
 **Direct mode** (`POST /cancel/direct/auth`, `POST /cancel/direct/preview` and `POST /cancel/direct`; only with `CANCEL_ENABLED=true`, `CANCEL_DIRECT_ENABLED=true`
-**and** `CANCEL_DIRECT_AUTH_USER`/`CANCEL_DIRECT_AUTH_PASS`, otherwise `404`). The same WebReport run on its own, without a workflow: there is no task, form or SendOn.
-`POST /cancel/direct/auth` (its own Basic credentials, no fallback to `START_AUTH_*`/`LOG_*`) is called with
+**and** a Basic credential (`CANCEL_DIRECT_AUTH_USER`/`CANCEL_DIRECT_AUTH_PASS` or, if unset, the `/auth` one), otherwise `404`). The same WebReport run on its own, without a workflow: there is no task, form or SendOn. Accepted risk: with one Basic credential for everything, anyone who can read the source of a WebReport that embeds it can also call `/admin` and cancel or stop flows through direct mode.
+`POST /cancel/direct/auth` (the Basic credential above) is called with
 `{targetWorkflowIds: [...], targetSubworkflowId?, requestedBy?}` and returns `{ v: 2, timestamp, nonce, signature }` signed with a **derived key**
 (`HMAC-SHA256(SIGNATURE_SECRET, 'cancel-direct')`); the routes verify with that key, so signatures from the generic `/auth` never work on the direct
 routes and direct signatures never work on `/start` or `/cancel`. The route is then called with the same fields plus `timestamp`, `nonce`, `signature`.

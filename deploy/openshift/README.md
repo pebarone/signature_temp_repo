@@ -2,9 +2,18 @@
 
 Este diretório traz os artefatos para rodar o orquestrador no OpenShift:
 
-- `pvc.yaml`, `configmap.yaml`, `deployment.yaml`, `service.yaml` e `route.yaml`, aplicados juntos com `oc apply -k` (via `kustomization.yaml`);
-- `secret.example.yaml`: modelo do Secret. **Não** é aplicado pelo `kustomization.yaml`;
+- `base/`: `pvc.yaml`, `configmap.yaml`, `deployment.yaml`, `service.yaml` e `route.yaml`, comuns a QA e PROD. Não se aplica sozinho;
+- `prod/`: valores de PROD (`configmap-env.yaml`, `route-env.yaml` e a imagem em `kustomization.yaml`). Aplicar com `oc apply -k deploy/openshift/prod`;
+- `qa/`: valores de QA, para o cluster local (kind) publicado pelo ngrok. `qa/deploy-local.ps1` faz build, carga no kind, Secret e apply;
+  `start.ps1`, na raiz, sobe o cluster e o ngrok;
+- `secret.example.yaml`: modelo do Secret. **Não** é aplicado por nenhum `kustomization.yaml`;
 - `Containerfile`: imagem do orquestrador.
+
+O que muda entre os ambientes fica só nas pastas `prod/` e `qa/`: `PUBLIC_URL`, `OTCS_BASE`, Adobe (`ADOBE_API_BASE`,
+`ADOBE_AUTH_BASE`), `CORS_ORIGINS`, o host e o TLS da Route e a imagem. O restante do ConfigMap está em `base/configmap.yaml`
+e vale para os dois.
+
+O restante deste README trata do deploy de PROD.
 
 ## Já preenchido e o que falta
 
@@ -12,18 +21,18 @@ Já vem preenchido para PROD (confira, mas não precisa trocar):
 
 | Item | Valor | Onde |
 |---|---|---|
-| Host público | `co-saphcm-ms-md-co-sign-empcontract-prod.apps.osftd4.colsanitas.com`, o host do orquestrador atual, para onde já apontam o webhook do Adobe e o WebReport de envio | `PUBLIC_URL` (`configmap.yaml`) e `host` (`route.yaml`) |
-| Content Server | `https://otcs.g115.opentext.cloud/cs/cs/api`; CORS para `https://otcs.g115.opentext.cloud` | `configmap.yaml` |
-| Adobe Sign | região NA4 (`api.na4` / `secure.na4`); o padrão do código é EU1 | `configmap.yaml` |
-| Transição dos WebReports | `START_LEGACY_SIGNATURE` e `START_LEGACY_GET_ENABLED` **ligadas** (passo 1 da ordem de rollout de `webreports/README.md`) | `configmap.yaml` |
-| Storage, réplicas e probes | PVC RWO de 2Gi, 1 réplica, `Recreate`, `/health` | `pvc.yaml`, `deployment.yaml` |
+| Host público | `co-saphcm-ms-md-co-sign-empcontract-prod.apps.osftd4.colsanitas.com`, o host do orquestrador atual, para onde já apontam o webhook do Adobe e o WebReport de envio | `PUBLIC_URL` (`prod/configmap-env.yaml`) e `host` (`prod/route-env.yaml`) |
+| Content Server | `https://otcs.g115.opentext.cloud/cs/cs/api`; CORS para `https://otcs.g115.opentext.cloud` | `prod/configmap-env.yaml` |
+| Adobe Sign | região NA4 (`api.na4` / `secure.na4`); o padrão do código é EU1 | `prod/configmap-env.yaml` |
+| Transição dos WebReports | `START_LEGACY_SIGNATURE` e `START_LEGACY_GET_ENABLED` **desligadas** (passo 4 da ordem de rollout de `webreports/README.md` concluído: os WebReports de PROD já estão na v2) | `base/configmap.yaml` |
+| Storage, réplicas e probes | PVC RWO de 2Gi, 1 réplica, `Recreate`, `/health` | `base/pvc.yaml`, `base/deployment.yaml` |
 
-Falta preencher (os valores `<...>` não são válidos como host ou imagem):
+Falta llenar (os valores `<...>` não são válidos como host ou imagem):
 
 - [ ] **Secret** `signature-orchestrator-env`: credenciais do Adobe, do OTCS, do Basic Auth e o segredo HMAC (passo 2.2).
-- [ ] **Imagem**: `<registry>/<namespace>` e `<tag>` em `kustomization.yaml` (`images:`), o único lugar da imagem (passo 2.5).
+- [ ] **Imagem**: `<registry>/<namespace>` e `<tag>` em `prod/kustomization.yaml` (`images:`), o único lugar da imagem (passo 2.5).
 - [ ] **Namespace**: `oc project <namespace>` antes de aplicar (passo 2.1).
-- [ ] **`storageClassName`** em `pvc.yaml`: opcional. Comentado, vale a classe `(default)` do cluster, que também precisa ser de bloco (seção 1.4).
+- [ ] **`storageClassName`** em `base/pvc.yaml`: opcional. Comentado, vale a classe `(default)` do cluster, que também precisa ser de bloco (seção 1.4).
 - [ ] **Troca do orquestrador antigo**: Route que hoje tem o host e acordos em andamento no serviço antigo (passo 2.7).
 
 ## Resumo do storage (leia antes do restante)
@@ -128,8 +137,9 @@ gravável pelo UID do contêiner: acione o time de plataforma. Não altere a SCC
 
 Sem PVC (ou em storage efêmero, como no QA do Render, ver `docs/QA_RENDER.md`), todo restart, redeploy ou troca de pod apaga:
 
-- o **mapa acordo->workflow**. Novos webhooks tentam adotar acordos pelo `externalId` com `ADOPT_UNKNOWN_AGREEMENTS=true`;
-  sem novo evento, use `POST /admin/adopt/:id`. O poller não enumera acordos desconhecidos e `POST /admin/reconcile/:id`
+- o **mapa acordo->workflow**. Novos webhooks tentam adotar acordos pelo `externalId` com `ADOPT_UNKNOWN_AGREEMENTS=true`, mas só se ele estiver assinado (`sig`, HMAC
+  com `SIGNATURE_SECRET`); acordos sem `sig` ou criados antes de trocar o `SIGNATURE_SECRET` exigem
+  `POST /admin/adopt/:id`, assim como os casos sem novo evento. O poller não enumera acordos desconhecidos e `POST /admin/reconcile/:id`
   responde 404 até a adoção. A adoção não restaura o histórico nem os retries perdidos;
 - a **fila de retries** e o estado das tentativas;
 - os **tokens OAuth** do Adobe (é preciso autorizar de novo, ou usar `ADOBE_REFRESH_TOKEN`);
@@ -227,13 +237,13 @@ Os valores reais são informados pelo responsável da integração e não ficam 
 
 ```bash
 oc create secret generic signature-orchestrator-env \
-  --from-literal=CLIENT_ID='<preencher>' \
-  --from-literal=CLIENT_SECRET='<preencher>' \
-  --from-literal=SIGNATURE_SECRET='<preencher>' \
-  --from-literal=LOG_USER='<preencher>' \
-  --from-literal=LOG_PASS='<preencher>' \
-  --from-literal=OTCS_USER='<preencher>' \
-  --from-literal=OTCS_PASS='<preencher>'
+  --from-literal=CLIENT_ID='<llenar>' \
+  --from-literal=CLIENT_SECRET='<llenar>' \
+  --from-literal=SIGNATURE_SECRET='<llenar>' \
+  --from-literal=LOG_USER='<llenar>' \
+  --from-literal=LOG_PASS='<llenar>' \
+  --from-literal=OTCS_USER='<llenar>' \
+  --from-literal=OTCS_PASS='<llenar>'
 ```
 
 - Para não deixar senhas no histórico do shell, prefira `--from-env-file=<arquivo-fora-do-repo>` (linhas `CHAVE=valor`) e apague o arquivo depois.
@@ -244,19 +254,19 @@ oc create secret generic signature-orchestrator-env \
 
 ### 2.3 Ajustar os arquivos antes de aplicar
 
-- `kustomization.yaml`: `images:` com o registry, o namespace e a tag da imagem (ver passo 2.5).
-- `pvc.yaml`: `storageClassName`, conforme as seções 1.2 e 1.4 (opcional).
-- Só se o host público mudar: `PUBLIC_URL` (`configmap.yaml`) e `host` (`route.yaml`) precisam ser o mesmo host
+- `prod/kustomization.yaml`: `images:` com o registry, o namespace e a tag da imagem (ver passo 2.5).
+- `base/pvc.yaml`: `storageClassName`, conforme as seções 1.2 e 1.4 (opcional).
+- Só se o host público mudar: `PUBLIC_URL` (`prod/configmap-env.yaml`) e `host` (`prod/route-env.yaml`) precisam ser o mesmo host
   (`PUBLIC_URL` = `https://` + host).
 
 ### 2.4 Aplicar
 
 ```bash
-oc apply -k deploy/openshift
+oc apply -k deploy/openshift/prod
 ```
 
 Cria o PVC, o ConfigMap, o Deployment, o Service e a Route. O Secret não entra nessa aplicação.
-**Não use `oc apply -f deploy/openshift/`**: ele também aplicaria `secret.example.yaml` e sobrescreveria o Secret real com os placeholders.
+**Não use `oc apply -f` nas pastas de `deploy/openshift/`**: ele também aplicaria `secret.example.yaml` e sobrescreveria o Secret real com os placeholders.
 
 ### 2.5 Build e envio da imagem
 
@@ -267,10 +277,10 @@ podman build -f deploy/openshift/Containerfile -t <registry>/<namespace>/signatu
 podman push <registry>/<namespace>/signature-orchestrator:<tag>
 ```
 
-Depois, registre a mesma imagem no `kustomization.yaml` (`newName` e `newTag` em `images:`), à mão ou com:
+Depois, registre a mesma imagem no `prod/kustomization.yaml` (`newName` e `newTag` em `images:`), à mão ou com:
 
 ```bash
-cd deploy/openshift && kustomize edit set image signature-orchestrator=<registry>/<namespace>/signature-orchestrator:<tag>
+cd deploy/openshift/prod && kustomize edit set image signature-orchestrator=<registry>/<namespace>/signature-orchestrator:<tag>
 ```
 
 Com o registry interno do OpenShift, o push usa a rota externa do registry, e o `newName` do kustomization usa
@@ -317,17 +327,17 @@ oc get route -A | grep co-saphcm-ms-md-co-sign-empcontract-prod
 ```
 
 Na janela de troca, remova a Route antiga (guarde antes o YAML dela com `oc get route <rota-antiga> -o yaml`) e aplique esta
-(`oc apply -k deploy/openshift`), ou aponte a Route antiga para o Service `signature-orchestrator` na porta `http`. Depois,
+(`oc apply -k deploy/openshift/prod`), ou aponte a Route antiga para o Service `signature-orchestrator` na porta `http`. Depois,
 pare o deployment antigo, para que só um orquestrador responda pelo webhook e pelo `/start`. Rollback: recriar a Route antiga
 a partir do YAML guardado.
 
 **2. Adobe e WebReports.** Com o mesmo host, o webhook (`<PUBLIC_URL>/webhook`) e o `SERVER_URL` dos WebReports continuam
-valendo. O WebReport de PROD ainda pode chamar o `GET /start` antigo: por isso as flags `START_LEGACY_*` vêm ligadas. Desligue-as
-só depois do passo 4 da ordem de rollout de `webreports/README.md`. Cadastre `<PUBLIC_URL>/admin/callback` como redirect URI da
+valendo. Os WebReports de PROD já falam o protocolo v2, por isso as flags `START_LEGACY_*` vêm desligadas. Religue-as só como
+rollback, se um WebReport antigo (`GET /start` ou `GET /auth`) voltar a ser publicado. Cadastre `<PUBLIC_URL>/admin/callback` como redirect URI da
 aplicação do Adobe antes de autorizar em `/admin/login` (seção 3).
 
 **3. Acordos em andamento no orquestrador antigo.** O banco novo começa vazio, e os acordos criados pelo serviço antigo não têm
-o `externalId` que permite a adoção automática pelo webhook. Sem ação, ninguém conclui esses acordos. Há duas saídas:
+o `externalId` assinado que permite a adoção automática pelo webhook. Sem ação, ninguém conclui esses acordos. Há duas saídas:
 
 - **Importar o mapa antigo.** No código de referência, o mapa fica em `/tmp/agreements.json` do contêiner antigo; confirme
   no binário de produção. Copiado para `/data/state/agreements.json`, ele é importado no próximo start: o arquivo vira
@@ -371,11 +381,11 @@ o `externalId` que permite a adoção automática pelo webhook. Sem ação, ning
 - **Janela de indisponibilidade:** `Recreate` derruba o pod atual antes de subir o novo. São poucos segundos (start do Node e readiness).
   Nesse intervalo o orquestrador não responde 2xx ao Adobe. O Adobe reenvia as notificações não confirmadas, e o poller revisa os acordos sem
   resultado final quando o serviço volta. Essa indisponibilidade é aceitável para o fluxo.
-- **Atualizar:** gere uma nova tag, envie a imagem e troque o `newTag` em `kustomization.yaml` (mantendo o repositório
-  sincronizado com o cluster), depois rode `oc apply -k deploy/openshift`. Alternativa sem editar o arquivo:
+- **Atualizar:** gere uma nova tag, envie a imagem e troque o `newTag` em `prod/kustomization.yaml` (mantendo o repositório
+  sincronizado com o cluster), depois rode `oc apply -k deploy/openshift/prod`. Alternativa sem editar o arquivo:
   `oc set image deploy/signature-orchestrator signature-orchestrator=<registry>/<namespace>/signature-orchestrator:<nova-tag>`.
 - **Mudou só ConfigMap ou Secret** (por exemplo, ao desligar as flags `START_LEGACY_*`): o pod não relê variáveis sozinho.
-  Rode `oc apply -k deploy/openshift` (ou atualize o Secret) e depois `oc rollout restart deploy/signature-orchestrator`.
+  Rode `oc apply -k deploy/openshift/prod` (ou atualize o Secret) e depois `oc rollout restart deploy/signature-orchestrator`.
 - **Antes de atualizar**, faça o backup da seção 1.8 se a versão nova acrescentar uma migração de schema. O log de start mostra `schema vN`: compare o número com o da versão anterior.
 - **Rollback:** `oc rollout undo deploy/signature-orchestrator` volta para a réplica anterior (imagem e configuração do pod). Os dados do PVC permanecem.
   O rollback **não desfaz migração de banco**. As migrações só são acrescentadas ao final (`PRAGMA user_version`), mas uma imagem antiga sobre

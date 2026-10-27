@@ -1,7 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { normalizeName, matchesTask, locate } = require('../server/domain/workflowSteps');
-const { buildExternalId, parseExternalId } = require('../server/domain/externalId');
+const { buildExternalId, parseExternalId, verifyExternalId } = require('../server/domain/externalId');
 
 const step = (subprocessId, taskId, name, status = '') => ({ processId: 100, subprocessId, taskId, name, status });
 
@@ -106,7 +106,7 @@ test('locate: latest => na ambiguidade, o maior subprocessId da lista de maior p
 test('externalId: monta e interpreta; rejeita o que não é nosso ou está incompleto', () => {
   const id = buildExternalId({ workflowId: 3003, subworkflowId: '3004', nodeId: 1001, attachId: '2002' });
   assert.equal(id, 'otcs|wf=3003|sub=3004|node=1001|attach=2002');
-  assert.deepEqual(parseExternalId(id), { workflowId: '3003', subworkflowId: '3004', nodeId: '1001', attachId: '2002' });
+  assert.deepEqual(parseExternalId(id), { workflowId: '3003', subworkflowId: '3004', nodeId: '1001', attachId: '2002', sig: null });
 
   // sub ausente/inválido vale o wf
   assert.equal(parseExternalId('otcs|wf=1|node=2|attach=3').subworkflowId, '1');
@@ -121,4 +121,42 @@ test('externalId: monta e interpreta; rejeita o que não é nosso ou está incom
     buildExternalId({ workflowId: '1|node=9', subworkflowId: '2', nodeId: '3', attachId: '4' }),
     'otcs|wf=1node9|sub=2|node=3|attach=4'
   );
+});
+
+test('externalId assinado: sig de 128 bits, ida e volta, e rejeita adulteração', () => {
+  const S = 'test-signature-secret';
+  const ids = { workflowId: '3003', subworkflowId: '3004', nodeId: '1001', attachId: '2002' };
+  const id = buildExternalId(ids, S);
+  assert.match(id, /^otcs\|wf=3003\|sub=3004\|node=1001\|attach=2002\|sig=[0-9a-f]{32}$/);
+  assert.ok(id.length < 100);
+  assert.equal(id.split('|sig=')[0], buildExternalId(ids), 'sem segredo, igual ao formato antigo');
+  assert.equal(buildExternalId(ids, ''), buildExternalId(ids));
+
+  const parsed = parseExternalId(id);
+  assert.equal(parsed.sig, id.split('|sig=')[1]);
+  assert.equal(verifyExternalId(parsed, S), true);
+  assert.equal(verifyExternalId(parseExternalId(id.replace(/sig=([0-9a-f]+)/, (m, h) => `sig=${h.toUpperCase()}`)), S), true);
+
+  // ida e volta para qualquer entrada aceita pelo build: sub == wf, sub vazio, sub inválido, separadores
+  for (const sub of ['3003', '', undefined, 'x', '30|04']) {
+    const e = buildExternalId({ ...ids, subworkflowId: sub }, S);
+    assert.equal(verifyExternalId(parseExternalId(e), S), true, String(sub));
+  }
+  assert.equal(verifyExternalId(parseExternalId(buildExternalId({ workflowId: ' 1 2', subworkflowId: '2', nodeId: 3, attachId: 4 }, S)), S), true);
+
+  // adulteração de qualquer campo
+  for (const [from, to] of [['wf=3003', 'wf=3005'], ['sub=3004', 'sub=3005'], ['node=1001', 'node=1002'], ['attach=2002', 'attach=2003']]) {
+    assert.equal(verifyExternalId(parseExternalId(id.replace(from, to)), S), false, from);
+  }
+  // sem sig, segredo errado/ausente, sig malformada: false e sem lançar
+  assert.equal(verifyExternalId(parseExternalId(buildExternalId(ids)), S), false);
+  assert.equal(verifyExternalId(parsed, 'outro'), false);
+  assert.equal(verifyExternalId(parsed, undefined), false);
+  assert.equal(verifyExternalId(null, S), false);
+  for (const sig of ['zz', '', 'a'.repeat(31), 'a'.repeat(33), 'g'.repeat(32), '0'.repeat(32)]) {
+    assert.equal(verifyExternalId(parseExternalId(`${id.split('|sig=')[0]}|sig=${sig}`), S), false, sig);
+  }
+  // sub omitido no texto equivale a sub == wf (fallback do parse)
+  const noSub = buildExternalId({ ...ids, subworkflowId: '3003' }, S).replace('|sub=3003', '');
+  assert.equal(verifyExternalId(parseExternalId(noSub), S), true);
 });

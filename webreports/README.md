@@ -35,8 +35,8 @@ O `/cancel` segue o mesmo modelo (HMAC v2 + nonce; a assinatura v1 é recusada) 
 de cancelamento no OTCS. Detalhes e códigos de resposta: [`cancelacion/README.md`](cancelacion/README.md) e
 [`../docs/DESIGN_TICKET_2026060410003715.md`](../docs/DESIGN_TICKET_2026060410003715.md).
 
-A mesma página de cancelamento tem um **modo direto** (executada sozinha, sem workflow; só com `CANCEL_DIRECT_ENABLED=true` e as credenciais
-`CANCEL_DIRECT_AUTH_USER`/`CANCEL_DIRECT_AUTH_PASS`, sem fallback): chama `POST /cancel/direct/auth` (Basic próprio) com
+A mesma página de cancelamento tem um **modo direto** (executada sozinha, sem workflow; só com `CANCEL_DIRECT_ENABLED=true` e uma credencial Basic
+(`CANCEL_DIRECT_AUTH_USER`/`CANCEL_DIRECT_AUTH_PASS` ou, sem elas, a do `/auth`): chama `POST /cancel/direct/auth` (Basic, a mesma do `/auth`) com
 `{targetWorkflowIds, requestedBy?}` e depois `POST /cancel/direct/preview` ou `POST /cancel/direct` com os mesmos campos. A assinatura é
 feita com uma chave derivada (`HMAC(SIGNATURE_SECRET, 'cancel-direct')`): a do `/auth` genérico não vale nas rotas diretas e a direta não vale
 em `/start` nem `/cancel`. A lista dos fluxos fica vinculada ao HMAC (com `targetWorkflowIds` o canônico ganha as linhas

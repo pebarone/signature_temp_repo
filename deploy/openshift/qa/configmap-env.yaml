@@ -1,0 +1,19 @@
+# Valores de QA do ConfigMap (o restante, comum aos ambientes, está em ../base/configmap.yaml).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: signature-orchestrator-config
+data:
+  # URL pública: o domínio de dev do ngrok (webhook em <PUBLIC_URL>/webhook, redirect OAuth em <PUBLIC_URL>/admin/callback)
+  PUBLIC_URL: "https://legible-chipmunk-only.ngrok-free.app"
+  # Base da API do Content Server de QA; o código acrescenta /v1 e /v2
+  OTCS_BASE: "https://otcs.g115-test.opentext.cloud/cs/cs/api"
+  # Região Adobe Sign da conta usada no QA (NA4, a mesma do .env local)
+  ADOBE_API_BASE: "https://api.na4.adobesign.com"
+  ADOBE_AUTH_BASE: "https://secure.na4.adobesign.com"
+  # Origens com CORS em /auth e /start: a do OTCS de QA
+  CORS_ORIGINS: "https://otcs.g115-test.opentext.cloud"
+  # Cancelamento: /cancel e /cancel/preview (WebReport na tarefa) e o modo direto /cancel/direct* (WebReport sozinho).
+  # O modo direto usa a mesma credencial Basic do /auth (LOG_*/START_AUTH_*, no Secret), a menos que CANCEL_DIRECT_AUTH_USER/PASS estejam definidos.
+  CANCEL_ENABLED: "true"
+  CANCEL_DIRECT_ENABLED: "true"

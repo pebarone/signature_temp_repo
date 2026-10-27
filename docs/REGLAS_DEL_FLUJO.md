@@ -238,10 +238,18 @@ vale dentro do subprocesso escolhido:
 
 ## 7. Rastreabilidade e adoção de acordos
 
-`createAgreement` envia `externalId.id = otcs|wf=<workflowId>|sub=<subworkflowId>|node=<nodeId>|attach=<attachId>`.
+`createAgreement` envia `externalId.id = otcs|wf=<workflowId>|sub=<subworkflowId>|node=<nodeId>|attach=<attachId>|sig=<hex>`.
+O `sig` são 32 hex (128 bits) do HMAC-SHA256, com `SIGNATURE_SECRET`, sobre `otcs-ext-v1\n<wf>\n<sub>\n<node>\n<attach>`.
+O `externalId` é texto livre no Adobe (qualquer usuário da conta pode criar um acordo com ele), por isso a adoção
+automática exige o `sig` válido. Acordos criados antes desta mudança (sem `sig`) ou depois de trocar o `SIGNATURE_SECRET`
+não são adotados pelo webhook (log warn "sin firma válida"): use `POST /admin/adopt/:id`. Um `externalId` assinado
+copiado para outro acordo também não é adotado se o mesmo workflow/subprocesso/documento já tiver qualquer acordo no
+store, aberto ou encerrado (consequência aceita: uma queda do `/start` entre criar o acordo e gravá-lo, num ciclo
+posterior do mesmo workflow, exige `POST /admin/adopt/:id`). Risco residual: com o banco perdido, a cópia de um `externalId` assinado não se distingue do original (só uma
+checagem do remetente/conta no Adobe fecharia isso).
 
 - **Webhook de acordo desconhecido** (banco efêmero perdido, deploy novo) com `ADOPT_UNKNOWN_AGREEMENTS=true`: consulta o
-  Adobe em background, faz o parse do `externalId`; se for nosso cria o registro (`adopted=true`, `start_sendon_done=false`,
+  Adobe em background, faz o parse do `externalId`; se for nosso **e tiver o `sig` válido** cria o registro (`adopted=true`, `start_sendon_done=false`,
   `fileName` = nome do acordo sem o prefixo `Documento `) e reaplica o evento; senão log warn. O webhook responde 200
   sem esperar. A fila confirma a etapa start no OTCS: envia apenas se a tarefa de início ainda estiver ativa; se já
   avançou, só marca como concluída. Isso recupera também um restart entre criar o acordo e enviar o início, mesmo com
@@ -286,7 +294,7 @@ incluídos nos formulários dessas tarefas:
 | `DISPOSITION_SIGNED` / `_REJECTED` | `Firmado` / `Rechazado` | ações da tarefa de firma |
 | `DISPOSITION_EXPIRED` / `_RECALLED` / `_CONVERSION_FAILED` | `Rechazado` | vazio ⇒ `needs_attention` |
 | `ATTENTION_RETRY_HOURS` | `6` | reabertura automática de `retries_exhausted` (0 desliga) |
-| `ADOPT_UNKNOWN_AGREEMENTS` | `true` | adoção de acordo desconhecido pelo `externalId` |
+| `ADOPT_UNKNOWN_AGREEMENTS` | `true` | adoção de acordo desconhecido pelo `externalId` assinado |
 | `WEBHOOK_CLIENT_IDS` | vazio | ClientIds extras aceitos no webhook além do `CLIENT_ID` |
 | `WF_ATTRIBUTES_ENABLED` | `false` | grava dados do Adobe nos atributos do workflow |
 | `WF_ATTR_AGREEMENT_ID`, `WF_ATTR_STATUS`, `WF_ATTR_LAST_EVENT`, `WF_ATTR_UPDATED_AT`, `WF_ATTR_INTEGRATION_STATE` | ver seção 8 | rótulos dos atributos (vazio desliga) |
@@ -322,10 +330,10 @@ no Content. O orquestrador **não** encerra o fluxo original.
   (`409 REASSIGN_REQUIRED` com `handoff` se não); o SendOn (sem disposição) só acontece depois do cancelamento confirmado. Falha no
   SendOn => `503 SENDON_FAILED`; repetir é idempotente.
 - **Modo direto** (`POST /cancel/direct/auth`, `POST /cancel/direct` e `POST /cancel/direct/preview`; WebReport executado sozinho, sem
-  workflow; só existem com `CANCEL_ENABLED=true`, `CANCEL_DIRECT_ENABLED=true` **e** `CANCEL_DIRECT_AUTH_USER`/`CANCEL_DIRECT_AUTH_PASS`
-  (sem fallback para `START_AUTH_*`/`LOG_*`; sem elas as rotas não são montadas e o startup registra o erro), senão `404`): a assinatura vem
-  de `/cancel/direct/auth` (Basic próprio), feita com a chave derivada `HMAC(SIGNATURE_SECRET, 'cancel-direct')`; o `/auth` genérico não
-  vale nas rotas diretas e a assinatura direta não vale em `/start` nem `/cancel`. Os alvos (`targetWorkflowIds`, lista; `targetSubworkflowId`
+  workflow; só existem com `CANCEL_ENABLED=true`, `CANCEL_DIRECT_ENABLED=true` **e** uma credencial Basic:
+  `CANCEL_DIRECT_AUTH_USER`/`CANCEL_DIRECT_AUTH_PASS` (as duas, opcionais) ou, sem elas, a do `/auth` (`START_AUTH_*` ou `LOG_*`); sem nenhuma as rotas não são montadas e o startup registra o erro, senão `404`): a assinatura vem
+  de `/cancel/direct/auth` (com essa credencial Basic), feita com a chave derivada `HMAC(SIGNATURE_SECRET, 'cancel-direct')`; o `/auth` genérico não
+  vale nas rotas diretas e a assinatura direta não vale em `/start` nem `/cancel`. **Risco aceito:** com uma credencial única para tudo (`LOG_*`, `/auth` e modo direto), quem puder ler a fonte de qualquer WebReport que a embuta pode usar o mesmo Basic para chamar `/admin` e para cancelar ou parar fluxos pelo modo direto. Os alvos (`targetWorkflowIds`, lista; `targetSubworkflowId`
   opcional, só com um alvo) vêm no corpo e ficam vinculados ao HMAC v2 (a forma canônica ganha as linhas
   `targetWorkflowIds` e `targetSubworkflowId` só quando `targetWorkflowIds` é enviado; sem ele nada muda). Não lê tarefa nem
   formulário, não grava `IDs Cancelados` e não faz SendOn (`sentOn: false`). Cancela no Adobe e **sempre** para o fluxo original

@@ -10,7 +10,7 @@ const {
 } = require('../domain/eventPolicy');
 const state = require('../domain/agreementState');
 const { locate, normalizeName } = require('../domain/workflowSteps');
-const { parseExternalId, isId } = require('../domain/externalId');
+const { parseExternalId, verifyExternalId, isId } = require('../domain/externalId');
 const { describeError } = require('../infra/util');
 
 const { ATTENTION_KINDS } = state;
@@ -735,6 +735,20 @@ function createReconciliationService({
         if (!ext) {
           rememberNotOurs(id);
           logger.warn(`[${id}] acuerdo desconocido sin externalId propio: no se adopta`);
+          return false;
+        }
+        // O externalId é texto livre no Adobe: só adota sozinho o que o /start assinou (HMAC). O resto, via /admin/adopt.
+        if (!verifyExternalId(ext, config.signatureSecret)) {
+          rememberNotOurs(id);
+          logger.warn(`[${id}] acuerdo desconocido con externalId sin firma válida: no se adopta automáticamente. Use POST /admin/adopt/:id`);
+          return false;
+        }
+        // Repetição: um externalId assinado copiado de um acordo real para outro. Se o fluxo já tem qualquer acordo no store
+        // (aberto ou encerrado: o PDF entraria como versão do DocID real mesmo depois do fim), não adota sozinho.
+        const known = repo.findLatestByWorkflow(ext.workflowId, ext.subworkflowId, ext.nodeId);
+        if (known && known.id !== id) {
+          rememberNotOurs(id);
+          logger.warn(`[${id}] acuerdo desconocido con externalId de un flujo ya registrado (${known.id}): no se adopta automáticamente. Use POST /admin/adopt/:id`);
           return false;
         }
         if (!repo.has(id)) {

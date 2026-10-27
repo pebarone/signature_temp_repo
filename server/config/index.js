@@ -62,6 +62,21 @@ function computeConfig(env = process.env, { projectRoot = PROJECT_ROOT } = {}) {
   const stateDir = path.join(dataDir, 'state');
   const publicUrl = str(env.PUBLIC_URL);
 
+  /*
+    Basic Auth do /auth (POST /auth e POST /start, WebReport): START_AUTH_USER+START_AUTH_PASS (as duas) ou, se ausentes,
+    LOG_USER/LOG_PASS. O /start valida o pedido contra o workflow do OTCS (fonte da verdade).
+  */
+  const startAuth = (str(env.START_AUTH_USER) && str(env.START_AUTH_PASS))
+    ? { user: str(env.START_AUTH_USER), pass: str(env.START_AUTH_PASS), own: true }
+    : { user: env.LOG_USER, pass: env.LOG_PASS, own: false };
+  /*
+    Basic Auth de POST /cancel/direct/auth (modo direto do cancelamento). OPCIONAL: CANCEL_DIRECT_AUTH_USER+PASS (as duas) ou,
+    se ausentes, a MESMA credencial do /auth (startAuth). Sem credencial nenhuma, o modo direto não é montado.
+  */
+  const directAuth = (str(env.CANCEL_DIRECT_AUTH_USER) && str(env.CANCEL_DIRECT_AUTH_PASS))
+    ? { user: str(env.CANCEL_DIRECT_AUTH_USER), pass: str(env.CANCEL_DIRECT_AUTH_PASS) }
+    : { user: startAuth.user ?? '', pass: startAuth.pass ?? '' };
+
   return {
     platform: { isRender, isProduction, isKubernetes },
     storage: {
@@ -102,14 +117,8 @@ function computeConfig(env = process.env, { projectRoot = PROJECT_ROOT } = {}) {
     signatureSecret: env.SIGNATURE_SECRET,
     logUser: env.LOG_USER,
     logPass: env.LOG_PASS,
-
-    /*
-      POST /auth e POST /start (WebReport). Basic Auth do /auth: START_AUTH_USER+START_AUTH_PASS (as duas) ou,
-      se ausentes, LOG_USER/LOG_PASS. O /start valida o pedido contra o workflow do OTCS (fonte da verdade).
-    */
-    startAuth: (str(env.START_AUTH_USER) && str(env.START_AUTH_PASS))
-      ? { user: str(env.START_AUTH_USER), pass: str(env.START_AUTH_PASS), own: true }
-      : { user: env.LOG_USER, pass: env.LOG_PASS, own: false },
+    // Basic Auth do /auth (POST /auth e POST /start): ver startAuth acima
+    startAuth,
     startVerifyWorkflow: bool(env.START_VERIFY_WORKFLOW, true),
     // Rótulos dos atributos do formulário da tarefa de início (GET /v1/forms/processes/tasks/update)
     startFields: {
@@ -203,16 +212,16 @@ function computeConfig(env = process.env, { projectRoot = PROJECT_ROOT } = {}) {
       POST /cancel processa vários fluxos (lote) e POST /cancel/preview só os consulta (nada é cancelado nem gravado).
       Os nomes abaixo são os do mapa do workflow de cancelamento publicado no QA (23/10); confirme-os em PROD.
       directEnabled=false (padrão): o modo DIRETO (WebReport executado sozinho, sem workflow) fica desligado; POST
-      /cancel/direct/auth, /cancel/direct e /cancel/direct/preview só existem com enabled E directEnabled E as credenciais
-      CANCEL_DIRECT_AUTH_USER/PASS, senão caem no 404 padrão.
+      /cancel/direct/auth, /cancel/direct e /cancel/direct/preview só existem com enabled E directEnabled E uma credencial
+      Basic (CANCEL_DIRECT_AUTH_USER/PASS ou, sem elas, a do /auth), senão caem no 404 padrão.
     */
     cancel: {
       enabled: bool(env.CANCEL_ENABLED, false),
       directEnabled: bool(env.CANCEL_DIRECT_ENABLED, false),
-      // Credencial Basic PRÓPRIA de POST /cancel/direct/auth (modo direto). SEM fallback para START_AUTH_* nem LOG_*: o /auth
-      // genérico fica embutido em WebReports de firma que muitos usuários leem. Sem as duas, o modo direto não é montado.
-      directAuthUser: str(env.CANCEL_DIRECT_AUTH_USER),
-      directAuthPass: str(env.CANCEL_DIRECT_AUTH_PASS),
+      // Credencial Basic de POST /cancel/direct/auth: CANCEL_DIRECT_AUTH_USER/PASS (opcional, as duas) ou, sem elas, a MESMA
+      // do /auth (ver directAuth acima). Sem credencial nenhuma, o modo direto não é montado.
+      directAuthUser: directAuth.user,
+      directAuthPass: directAuth.pass,
       // Tarefa do workflow de cancelamento que roda o WebReport (nome normalizado COMEÇA com um destes, como SIGN_TASK_NAMES)
       taskNames: list(env.CANCEL_TASK_NAMES, ['Cancelar Flujo de Firma']),
       // Rótulos dos atributos do formulário dessa tarefa (GET /v1/forms/processes/tasks/update): o fluxo a cancelar

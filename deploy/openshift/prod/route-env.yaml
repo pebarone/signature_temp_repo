@@ -1,0 +1,12 @@
+# Host e TLS da Route de PROD. O host deve ser o mesmo de PUBLIC_URL (configmap-env.yaml). É o host do orquestrador atual
+# de PROD: enquanto a Route antiga existir, esta fica sem admissão (HostAlreadyClaimed). Ver README, seção 2.7.
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: signature-orchestrator
+spec:
+  host: co-saphcm-ms-md-co-sign-empcontract-prod.apps.osftd4.colsanitas.com
+  tls:
+    termination: edge
+    # HTTP é redirecionado para HTTPS
+    insecureEdgeTerminationPolicy: Redirect

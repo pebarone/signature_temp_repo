@@ -156,6 +156,23 @@ test('config: cancelamento desligado por padrão, nomes provisórios e variávei
   assert.equal(computeConfig({ CANCEL_FIELD_RESULT: '' }).cancel.fields.result, '', 'vazio desliga a gravação');
 });
 
+test('config: credencial do modo direto são CANCEL_DIRECT_AUTH_* (as duas) ou, senão, a do /auth (START_AUTH_* ou LOG_*)', () => {
+  const creds = (env) => {
+    const c = computeConfig(env).cancel;
+    return [c.directAuthUser, c.directAuthPass];
+  };
+  assert.deepEqual(creds({}), ['', ''], 'sem nenhuma credencial: vazio (o modo direto não é montado)');
+  assert.deepEqual(creds({ LOG_USER: 'admin', LOG_PASS: 'pa:ss' }), ['admin', 'pa:ss'], 'sem as próprias, vale a do /auth (LOG_*)');
+  assert.deepEqual(creds({ LOG_USER: 'admin', LOG_PASS: 'pa:ss', START_AUTH_USER: 'su', START_AUTH_PASS: 'sp:x' }), ['su', 'sp:x'],
+    'a do /auth é START_AUTH_* quando as duas estão definidas');
+  assert.deepEqual(creds({ LOG_USER: 'admin', LOG_PASS: 'pa:ss', START_AUTH_USER: 'su' }), ['admin', 'pa:ss'],
+    'START_AUTH_* incompleto cai no LOG_*, como o próprio /auth');
+  assert.deepEqual(creds({ LOG_USER: 'admin', LOG_PASS: 'pa:ss', CANCEL_DIRECT_AUTH_USER: ' d ', CANCEL_DIRECT_AUTH_PASS: 'dp' }), ['d', 'dp'],
+    'as próprias, quando as duas estão definidas (usuário sem espaços)');
+  assert.deepEqual(creds({ LOG_USER: 'admin', LOG_PASS: 'pa:ss', CANCEL_DIRECT_AUTH_USER: 'd' }), ['admin', 'pa:ss'], 'só uma delas não basta');
+  assert.deepEqual(creds({ LOG_USER: 'admin', LOG_PASS: 'pa:ss', CANCEL_DIRECT_AUTH_PASS: 'dp' }), ['admin', 'pa:ss'], 'só a senha também não');
+});
+
 test('parseTargets: lista, escalar, texto separado, duplicados, inválidos e limite', () => {
   assert.deepEqual(parseTargets(['3101', '3102']), { ids: ['3101', '3102'], invalid: [], overLimit: false });
   assert.deepEqual(parseTargets(3101), { ids: ['3101'], invalid: [], overLimit: false });
@@ -2057,7 +2074,7 @@ test('POST /admin/cancel-workflow/:workflowId: Basic Auth, subworkflowId opciona
 
 /* ---------- MODO DIRETO: WebReport executado sozinho (sem workflow): POST /cancel/direct e /cancel/direct/preview ---------- */
 
-// Credencial PRÓPRIA do modo direto (sem fallback para START_AUTH_* nem LOG_*)
+// Credencial PRÓPRIA do modo direto (CANCEL_DIRECT_AUTH_*; sem elas, vale a do /auth: ver NO_DIRECT_OWN)
 const DIRECT_ENV = { CANCEL_DIRECT_ENABLED: 'true', CANCEL_DIRECT_AUTH_USER: 'cancel-direct', CANCEL_DIRECT_AUTH_PASS: 'dir:pa:ss' };
 const DIRECT_ADMIN = { authorization: basicHeader('cancel-direct', 'dir:pa:ss') };
 
@@ -2068,10 +2085,10 @@ async function directWorld(wfIds, env = {}) {
   return world;
 }
 
-// Protocolo do WebReport no modo direto: POST /cancel/direct/auth (Basic próprio) e a rota recebem os MESMOS campos (os alvos entram no HMAC)
-const direct = (world, targets, { path = '/cancel/direct', fields = {}, tamper = {}, extra = {} } = {}) =>
+// Protocolo do WebReport no modo direto: POST /cancel/direct/auth (Basic do modo direto) e a rota recebem os MESMOS campos (os alvos entram no HMAC)
+const direct = (world, targets, { path = '/cancel/direct', fields = {}, tamper = {}, extra = {}, authHeaders = DIRECT_ADMIN } = {}) =>
   authThenCancel(world, { targetWorkflowIds: targets, ...fields }, {
-    path, tamper, extra, authPath: '/cancel/direct/auth', authHeaders: DIRECT_ADMIN
+    path, tamper, extra, authPath: '/cancel/direct/auth', authHeaders
   });
 
 const TASK_APIS = ['getProcessSteps', 'getCurrentUser', 'getTaskForm', 'updateTaskForm'];
@@ -2109,46 +2126,106 @@ test('hmac: canonicalStart sem targetWorkflowIds fica idêntico; com alvos vincu
   assert.notEqual(sig('3101;3102', '7'), ref);
 });
 
-test('modo direto com a credencial do /auth genérico ou dos logs reaproveitada: não monta as rotas diretas e registra o erro', async () => {
-  const worlds = [
-    await directWorld(['3101'], { CANCEL_DIRECT_AUTH_USER: 'admin', CANCEL_DIRECT_AUTH_PASS: 'pa:ss' }),
-    await directWorld(['3101'], {
-      START_AUTH_USER: 'start-user', START_AUTH_PASS: 'start:pass',
-      CANCEL_DIRECT_AUTH_USER: 'start-user', CANCEL_DIRECT_AUTH_PASS: 'start:pass'
-    })
-  ];
-  for (const [i, world] of worlds.entries()) {
-    assert.ok(world.logger.has('error', /CANCEL_DIRECT_AUTH_USER\/PASS iguales a START_AUTH_\* o LOG_\*: cancelación directa deshabilitada/), String(i));
-    for (const p of ['/cancel/direct/auth', '/cancel/direct', '/cancel/direct/preview']) {
-      const r = await post(world, p, { targetWorkflowIds: ['3101'] }, ADMIN);
-      assert.equal(r.status, 404, `${i} ${p}`);
-    }
-  }
-  assert.equal(worlds[0].adobe.cancelled.length, 0);
+// Sem as CANCEL_DIRECT_AUTH_* próprias (strings vazias anulam o DIRECT_ENV): o modo direto usa a credencial do /auth
+const NO_DIRECT_OWN = { CANCEL_DIRECT_AUTH_USER: '', CANCEL_DIRECT_AUTH_PASS: '' };
 
-  // só o usuário igual (senha diferente) não é reaproveitamento: o modo direto monta
-  const ok = await directWorld(['3101'], { CANCEL_DIRECT_AUTH_USER: 'admin', CANCEL_DIRECT_AUTH_PASS: 'outra' });
-  assert.equal(ok.logger.has('error', /iguales a START_AUTH_/), false);
-  assert.notEqual((await post(ok, '/cancel/direct/auth', { targetWorkflowIds: ['3101'] }, { authorization: basicHeader('admin', 'outra') })).status, 404);
-  for (const w of [...worlds, ok]) await w.close();
+test('modo direto sem CANCEL_DIRECT_AUTH_*: a credencial do /auth serve de ponta a ponta (LOG_*; com START_AUTH_* definidas, a delas)', async (t) => {
+  // só LOG_* (padrão dos testes): o admin aceito pelo /auth também é aceito pelo modo direto, e cancela
+  const logs = await directWorld(['3101'], NO_DIRECT_OWN);
+  t.after(() => logs.close());
+  assert.equal(logs.logger.has('error', /sin credencial/), false);
+  assert.deepEqual([logs.config.cancel.directAuthUser, logs.config.cancel.directAuthPass], ['admin', 'pa:ss']);
+  const ok = await direct(logs, ['3101'], { authHeaders: ADMIN });
+  assert.equal(ok.status, 200, await ok.clone().text());
+  assert.deepEqual([(await ok.json()).complete, logs.otcs.stopped, logs.adobe.cancelled.map((c) => c.id)], [true, [3101], ['AG-3101']]);
+
+  // com START_AUTH_* definidas, o modo direto usa a MESMA do /auth (START_AUTH_*), não a de LOG_*
+  const start = await directWorld(['3101'], { ...NO_DIRECT_OWN, START_AUTH_USER: 'start-user', START_AUTH_PASS: 'start:pass' });
+  t.after(() => start.close());
+  const START = { authorization: basicHeader('start-user', 'start:pass') };
+  assert.equal((await post(start, '/cancel/direct/auth', { targetWorkflowIds: ['3101'] }, ADMIN)).status, 401, 'LOG_* não entra quando há START_AUTH_*');
+  const ok2 = await direct(start, ['3101'], { authHeaders: START });
+  assert.equal(ok2.status, 200, await ok2.clone().text());
+  assert.deepEqual([(await ok2.json()).complete, start.otcs.stopped], [true, [3101]]);
 });
 
-test('modo direto desligado, sem CANCEL_ENABLED ou sem credencial própria: 404 em /cancel/direct* (auth, preview, cancel), sem CORS e sem tocar Adobe/OTCS', async () => {
+test('modo direto com CANCEL_DIRECT_AUTH_USER/PASS (as duas): são as únicas aceitas em /cancel/direct/auth; só uma delas não basta e cai na do /auth', async (t) => {
+  const world = await directWorld(['3101'], { START_AUTH_USER: 'start-user', START_AUTH_PASS: 'start:pass' });
+  t.after(() => world.close());
+  const START = { authorization: basicHeader('start-user', 'start:pass') };
+  // LOG_*, START_AUTH_* e a própria com senha errada não entram
+  for (const headers of [ADMIN, START, { authorization: basicHeader('cancel-direct', 'errada') }]) {
+    assert.equal((await post(world, '/cancel/direct/auth', { targetWorkflowIds: ['3101'] }, headers)).status, 401, JSON.stringify(headers));
+  }
+  const ok = await direct(world, ['3101']);
+  assert.equal(ok.status, 200, await ok.clone().text());
+  assert.deepEqual([(await ok.json()).complete, world.otcs.stopped], [true, [3101]]);
+
+  // só o usuário definido (senha vazia): a própria não fica completa, então vale a do /auth (LOG_*)
+  const partial = await directWorld(['3101'], { CANCEL_DIRECT_AUTH_PASS: '' });
+  t.after(() => partial.close());
+  assert.deepEqual([partial.config.cancel.directAuthUser, partial.config.cancel.directAuthPass], ['admin', 'pa:ss']);
+  assert.equal((await post(partial, '/cancel/direct/auth', { targetWorkflowIds: ['3101'] }, DIRECT_ADMIN)).status, 401, 'a própria incompleta não vale');
+  assert.equal((await post(partial, '/cancel/direct/auth', { targetWorkflowIds: ['3101'] }, ADMIN)).status, 200, 'a do /auth vale');
+});
+
+test('sem credencial própria, /auth e modo direto compartilham o Basic mas as assinaturas não se cruzam (genérica nas rotas diretas; direta no /cancel, no /start)', async (t) => {
+  const world = await directWorld(['3101'], NO_DIRECT_OWN);
+  t.after(() => world.close());
+  // 1) a assinatura do /auth (mesmo Basic) não vale nas rotas diretas
+  for (const p of ['/cancel/direct', '/cancel/direct/preview']) {
+    const r = await authThenCancel(world, { targetWorkflowIds: ['3101'] }, { path: p, authPath: '/auth', authHeaders: ADMIN });
+    assert.equal(r.status, 403, p);
+    assert.deepEqual(await r.json(), { error: 'Invalid signature.' });
+  }
+  // 2) a assinatura direta (mesmo Basic) não vale no /cancel da tarefa, no /cancel/preview nem no /start
+  const taskFields = { workflowId: '9001', subworkflowId: '9001' };
+  for (const p of ['/cancel', '/cancel/preview']) {
+    const r = await authThenCancel(world, taskFields, { path: p, authPath: '/cancel/direct/auth', authHeaders: ADMIN });
+    assert.equal(r.status, 403, p);
+    assert.deepEqual(await r.json(), { error: 'Invalid signature.' });
+  }
+  const startFields = { userEmail1: 'a@example.com', nodeId: 1001, attachId: 2002, docName: 'c.pdf', workflowId: 3003, subworkflowId: 3004, taskId: 2 };
+  const startCreds = await (await post(world, '/cancel/direct/auth', startFields, ADMIN)).json();
+  const startRes = await post(world, '/start', { ...startFields, ...startCreds });
+  assert.equal(startRes.status, 403);
+  assert.deepEqual(await startRes.json(), { error: 'Invalid signature.' });
+  assert.equal(world.otcs.sendons.length, 0);
+  assert.equal(world.adobe.cancelled.length, 0, 'nenhuma assinatura cruzada cancelou nada');
+  // 3) o mesmo Basic segue valendo no modo direto, com a assinatura emitida por ele
+  const ok = await direct(world, ['3101'], { authHeaders: ADMIN });
+  assert.equal(ok.status, 200, await ok.clone().text());
+  assert.deepEqual(world.adobe.cancelled.map((c) => c.id), ['AG-3101']);
+});
+
+test('modo direto ligado sem credencial nenhuma (CANCEL_DIRECT_AUTH_* e LOG_* vazios): não monta as rotas diretas e registra o erro no startup', async (t) => {
+  const world = await directWorld(['3101'], { ...NO_DIRECT_OWN, LOG_USER: '', LOG_PASS: '' });
+  t.after(() => world.close());
+  assert.deepEqual([world.config.cancel.enabled, world.config.cancel.directEnabled, world.config.cancel.directAuthUser, world.config.cancel.directAuthPass], [true, true, '', '']);
+  assert.ok(world.logger.has('error', /CANCEL_DIRECT_ENABLED=true sin credencial Basic .*: cancelación directa deshabilitada/));
+  for (const p of ['/cancel/direct/auth', '/cancel/direct', '/cancel/direct/preview']) {
+    const r = await post(world, p, { targetWorkflowIds: ['3101'] }, ADMIN);
+    assert.equal(r.status, 404, p);
+    assert.deepEqual(await r.json(), { error: 'Endpoint not found' });
+    const pre = await preflight(world, p);
+    assert.equal(pre.status, 404, `preflight ${p}`);
+    assert.equal(pre.headers.get('access-control-allow-origin'), null);
+  }
+  assert.equal(world.adobe.cancelled.length, 0);
+  assert.equal(world.otcs.modelCalls.length, 0, 'nem o OTCS foi consultado');
+});
+
+test('modo direto desligado (CANCEL_DIRECT_ENABLED=false) ou sem CANCEL_ENABLED: 404 em /cancel/direct* (auth, preview, cancel), sem CORS e sem tocar Adobe/OTCS', async (t) => {
   const worlds = [
     // CANCEL_ENABLED ligado, CANCEL_DIRECT_ENABLED desligado (padrão)
     await directWorld(['3101'], { CANCEL_DIRECT_ENABLED: 'false' }),
     // CANCEL_DIRECT_ENABLED ligado, mas CANCEL_ENABLED desligado
-    await directWorld(['3101'], { CANCEL_ENABLED: 'false' }),
-    // ligado sem a senha própria (ou sem o usuário): não monta as rotas e registra o erro
-    await directWorld(['3101'], { CANCEL_DIRECT_AUTH_PASS: '' }),
-    await directWorld(['3101'], { CANCEL_DIRECT_AUTH_USER: '' })
+    await directWorld(['3101'], { CANCEL_ENABLED: 'false' })
   ];
-  assert.deepEqual(worlds.map((w) => [w.config.cancel.enabled, w.config.cancel.directEnabled]), [[true, false], [false, true], [true, true], [true, true]]);
-  assert.equal(worlds[0].logger.has('error', /CANCEL_DIRECT_ENABLED=true sin CANCEL_DIRECT_AUTH_USER\/PASS/), false);
+  for (const w of worlds) t.after(() => w.close());
+  assert.deepEqual(worlds.map((w) => [w.config.cancel.enabled, w.config.cancel.directEnabled]), [[true, false], [false, true]]);
+  assert.equal(worlds[0].logger.has('error', /CANCEL_DIRECT_ENABLED=true sin/), false);
   assert.equal(worlds[1].logger.has('error', /CANCEL_DIRECT_ENABLED=true sin/), false, 'sem CANCEL_ENABLED o modo direto nem é avaliado');
-  for (const w of worlds.slice(2)) {
-    assert.ok(w.logger.has('error', /CANCEL_DIRECT_ENABLED=true sin CANCEL_DIRECT_AUTH_USER\/PASS: cancelación directa deshabilitada/));
-  }
 
   for (const world of worlds) {
     for (const p of ['/cancel/direct/auth', '/cancel/direct', '/cancel/direct/preview']) {
@@ -2173,7 +2250,6 @@ test('modo direto desligado, sem CANCEL_ENABLED ou sem credencial própria: 404 
   const [off] = worlds;
   assert.equal((await preflight(off, '/cancel')).headers.get('access-control-allow-origin'), OTCS_ORIGIN);
   assert.equal((await preflight(off, '/cancel/preview')).headers.get('access-control-allow-origin'), OTCS_ORIGIN);
-  for (const w of worlds) await w.close();
 });
 
 test('POST /cancel/direct: vários alvos, cancela no Adobe e PARA cada original (mesmo com CANCEL_STOP_ORIGINAL=false), sem tarefa, formulário nem SendOn', async () => {
@@ -2488,14 +2564,16 @@ test('modo direto: deriveKey separa por escopo e é estável (HMAC-SHA256 do seg
   assert.notEqual(k, 'segredo');
 });
 
-test('modo direto: credencial e assinatura próprias — o /auth genérico não assina para o direto, nem o direto para /start e /cancel', async () => {
+test('modo direto: credencial e assinatura próprias — o /auth genérico não assina para o direto, nem o direto para /start e /cancel', async (t) => {
   const world = await directWorld(['3101', '3102'], { START_AUTH_USER: 'start-user', START_AUTH_PASS: 'start:pass' });
+  t.after(() => world.close());
   seedCancelFlow(world);
   const START = { authorization: basicHeader('start-user', 'start:pass') };
   const fields = { targetWorkflowIds: ['3101'] };
 
   // 1) /auth genérico (START_AUTH_*; sem elas, LOG_*) assina, mas a assinatura NÃO vale nas rotas diretas
   const logOnly = await directWorld(['3101']); // sem START_AUTH_*: o /auth genérico usa LOG_USER/LOG_PASS
+  t.after(() => logOnly.close());
   for (const [w, headers] of [[world, START], [logOnly, ADMIN]]) {
     for (const p of ['/cancel/direct', '/cancel/direct/preview']) {
       const r = await authThenCancel(w, fields, { path: p, authPath: '/auth', authHeaders: headers });
@@ -2504,9 +2582,8 @@ test('modo direto: credencial e assinatura próprias — o /auth genérico não 
     }
     assert.equal(w.adobe.cancelled.length, 0);
   }
-  await logOnly.close();
 
-  // 2) as credenciais START_AUTH_* / LOG_* não entram no /cancel/direct/auth (sem fallback); nem sem credencial
+  // 2) com credencial própria (DIRECT_ENV), START_AUTH_* / LOG_* não entram no /cancel/direct/auth; nem sem credencial
   for (const headers of [START, ADMIN, {}, { authorization: basicHeader('cancel-direct', 'errada') }, { authorization: basicHeader('outro', 'dir:pa:ss') }]) {
     assert.equal((await post(world, '/cancel/direct/auth', fields, headers)).status, 401, JSON.stringify(headers));
   }
@@ -2541,5 +2618,4 @@ test('modo direto: credencial e assinatura próprias — o /auth genérico não 
   // 5) o inverso: a assinatura do /auth genérico segue valendo no /cancel da tarefa (sem mudança)
   const generic = await authThenCancel(world, taskFields, { path: '/cancel/preview', authHeaders: START });
   assert.equal(generic.status, 200, await generic.clone().text());
-  await world.close();
 });

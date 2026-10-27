@@ -1,0 +1,18 @@
+# Valores de PROD do ConfigMap (o restante, comum aos ambientes, está em ../base/configmap.yaml).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: signature-orchestrator-config
+data:
+  # URL pública (Route) do orquestrador: base do redirect OAuth (<PUBLIC_URL>/admin/callback) e do webhook (<PUBLIC_URL>/webhook).
+  # É o host do orquestrador atual de PROD: o webhook do Adobe e o WebReport de envio já apontam para ele. Se o deploy usar
+  # outro host, troque aqui e em route-env.yaml e atualize o webhook, o redirect URI e o SERVER_URL dos WebReports (README, seção 3).
+  PUBLIC_URL: "https://co-saphcm-ms-md-co-sign-empcontract-prod.apps.osftd4.colsanitas.com"
+  # Base da API do Content Server (OTCS); o código acrescenta /v1 e /v2
+  OTCS_BASE: "https://otcs.g115.opentext.cloud/cs/cs/api"
+  # Região Adobe Sign de produção (NA4): API. O padrão do código é EU1
+  ADOBE_API_BASE: "https://api.na4.adobesign.com"
+  # Região Adobe Sign de produção (NA4): OAuth
+  ADOBE_AUTH_BASE: "https://secure.na4.adobesign.com"
+  # Origens com CORS em /auth e /start (lista). Vazio => a origem de OTCS_BASE. Em PROD, a do OTCS de produção
+  CORS_ORIGINS: "https://otcs.g115.opentext.cloud"

@@ -1,7 +1,3 @@
 @echo off
-cd /d "%~dp0"
-start "Servidor" cmd /k "npm start"
-
-
-start "Ngrok" cmd /k "ngrok http --domain=legible-chipmunk-only.ngrok-free.app 3000"
-
+rem Atalho de duplo clique: tudo roda no start.ps1 (cluster + ngrok), em PowerShell.
+powershell -NoExit -ExecutionPolicy Bypass -File "%~dp0start.ps1"

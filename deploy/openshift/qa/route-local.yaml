@@ -1,0 +1,15 @@
+# Acesso direto pela máquina, sem passar pelo ngrok: http://orquestrador-firmas.apps.localtest.me/health
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: signature-orchestrator-local
+  labels:
+    app: signature-orchestrator
+spec:
+  host: orquestrador-firmas.apps.localtest.me
+  to:
+    kind: Service
+    name: signature-orchestrator
+    weight: 100
+  port:
+    targetPort: http

@@ -6,7 +6,7 @@
 [// Los ramos se anidan: cada uno solo corre con su accion y la pagina es el ultimo ELSE. /]
 [// DOS MODOS (el script los distingue por WORKID, SUBWORKID y TASKID: los tres numericos = TAREA; vacios o sin resolver = DIRECTO): /]
 [// TAREA: ejecutado desde la tarea "Cancelar Flujo de Firma" del workflow de cancelacion. Guarda la seleccion en el atributo, puede reasignar la tarea y llama a /cancel/preview y /cancel; el servidor lee los flujos del formulario, cancela y hace el SendOn. /]
-[// DIRECTO: ejecutado solo, sin workflow. No usa los ramos guardar, leer ni reasignar. Pide la firma a /cancel/direct/auth (Basic PROPIO, BASIC_USER_DIRECTO y BASIC_PASS_DIRECTO = CANCEL_DIRECT_AUTH_USER y CANCEL_DIRECT_AUTH_PASS) y manda los flujos elegidos a /cancel/direct/preview y /cancel/direct (la lista va firmada en el HMAC), cancela en Adobe Sign y SIEMPRE detiene el flujo original en Content Server. Exige CANCEL_DIRECT_ENABLED=true en el servidor y restringir ESTE WebReport por permisos (grupo autorizado): su fuente lleva la credencial directa. /]
+[// DIRECTO: ejecutado solo, sin workflow. No usa los ramos guardar, leer ni reasignar. Pide la firma a /cancel/direct/auth (Basic = BASIC_USER y BASIC_PASS, la misma credencial que /auth) y manda los flujos elegidos a /cancel/direct/preview y /cancel/direct (la lista va firmada en el HMAC), cancela en Adobe Sign y SIEMPRE detiene el flujo original en Content Server. Exige CANCEL_DIRECT_ENABLED=true en el servidor y restringir ESTE WebReport por permisos (grupo autorizado): su fuente lleva la credencial Basic. /]
 [// Si solo algunos de WORKID, SUBWORKID y TASKID llegan resueltos (por ejemplo una URL sin taskid), la pagina no elige ningun modo: muestra un error y no llama al servidor. /]
 [// Seguridad: ids llega por la URL y entra como texto en la tag WFACTION (un ":" o "/]" cambiaria la tag). La pagina valida digitos separados por coma, /]
 [// el WebReport no: restringir el WebReport por permisos. El servidor igual rechaza valores no numericos (INVALID_TARGET). /]
@@ -39,279 +39,473 @@ REASIGNADO_OK
   <meta name="color-scheme" content="light">
   <title>Cancelar flujos de firma</title>
   <style>
+    /* Hallmark · built: 2026-10-27 · genre: modern-minimal · theme: Dose (dealt 3/3, seed herramienta-interna-para-operadores-5654·40ec72d4·2026-10-27·r0) · posture: restrained · shape: app screen · redesign: full · job: cancel in bulk · signature: the work table with the selection tray and the step ledger beside it · v2.0.0 */
+    /* Hallmark · pre-emit critique: P4 H4 E4 S4 R4 V4 · weakest: R, the amber notices stay because each one guards a destructive step; they lost the side stripe and the card */
+    /* Hallmark · answered F4 · rojo solo en el boton que cancela flujos: el script cambia el primario a peligro en ese paso */
+    /* Hallmark · answered F5 · el circulo es el estado del paso (pendiente, activo, hecho, error), no un icono decorativo */
+    /* Hallmark · answered F1 · comillas rectas en textos en espanhol que nombran campos del OTCS; textos mantenidos */
+    /* Hallmark · answered F23 · pagina interna de un WebReport del OTCS, no se comparte por enlace */
     :root {
-      --fondo: #f3f5f8;
-      --tarjeta: #ffffff;
-      --texto: #1d2939;
-      --texto-suave: #5b6575;
-      --borde: #e4e7ec;
-      --acento: #0f766e;
-      --acento-hover: #115e59;
-      --ok: #067647;
-      --ok-suave: #e7f6ee;
-      --error: #b42318;
-      --error-hover: #912018;
-      --error-suave: #fdecea;
-      --aviso: #b54708;
-      --aviso-suave: #fef0c7;
-      --pendiente: #7a8494;
-      --radio: 12px;
+      /* Papel, tinta y una sola senal verde (tema Dose, sin sus fuentes: el OTCS puede bloquear fuentes externas). */
+      --color-paper: oklch(97.6% 0.011 88);
+      --color-paper-2: oklch(95.4% 0.018 150);
+      --color-surface: oklch(99.4% 0.004 88);
+      --color-ink: oklch(21% 0.025 170);
+      --color-ink-2: oklch(31% 0.02 170);
+      --color-muted: oklch(47% 0.024 165);
+      --color-rule: oklch(88% 0.018 140);
+      --color-rule-strong: oklch(78% 0.022 150);
+      --color-accent: oklch(50% 0.13 160);
+      --color-accent-deep: oklch(42% 0.11 162);
+      --color-accent-soft: oklch(92% 0.06 160);
+      --color-accent-ink: oklch(99% 0.006 160);
+      --color-focus: oklch(45% 0.14 160);
+      --color-error: oklch(50% 0.17 27);
+      --color-error-deep: oklch(42% 0.15 27);
+      --color-error-soft: oklch(95.5% 0.025 27);
+      --color-warn: oklch(53% 0.13 60);
+      --color-warn-ink: oklch(38% 0.09 50);
+      --color-warn-soft: oklch(96% 0.04 85);
+      --color-warn-rule: oklch(85% 0.08 80);
+      --color-scrim: oklch(21% 0.025 170 / 0.42);
+      --shadow-dialog: 0 1px 2px oklch(30% 0.03 165 / 0.10), 0 24px 48px -24px oklch(30% 0.06 165 / 0.40);
+      --font-body: "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, Roboto, "Helvetica Neue", Arial, sans-serif;
+      --font-display: "Segoe UI Variable Display", "Segoe UI", system-ui, -apple-system, Roboto, "Helvetica Neue", Arial, sans-serif;
+      --font-mono: ui-monospace, "Cascadia Mono", "Cascadia Code", Consolas, "SF Mono", monospace;
+      --text-xs: 13px;
+      --text-sm: 14px;
+      --text-md: 16px;
+      --text-lg: 18px;
+      --text-xl: 21px;
+      --text-2xl: 25px;
+      --space-1: 4px;
+      --space-2: 8px;
+      --space-3: 12px;
+      --space-4: 16px;
+      --space-5: 20px;
+      --space-6: 24px;
+      --space-8: 32px;
+      --space-10: 40px;
+      --space-12: 48px;
+      --space-16: 64px;
+      --radius-control: 8px;
+      --radius-pill: 999px;
+      --dur-micro: 120ms;
+      --dur-short: 240ms;
+      --ease-out: cubic-bezier(0.2, 0.8, 0.2, 1);
     }
     *, *::before, *::after { box-sizing: border-box; }
     [hidden] { display: none !important; }
+    html, body { overflow-x: clip; }
+    html { scrollbar-color: var(--color-rule-strong) var(--color-paper); }
+    ::selection { background: var(--color-accent-soft); color: var(--color-ink); }
     body {
       margin: 0;
-      min-height: 100vh;
-      display: flex;
-      align-items: flex-start;
-      justify-content: center;
-      padding: 16px;
-      background: var(--fondo);
-      color: var(--texto);
-      font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-      font-size: 16px;
+      min-height: 100dvh;
+      background: var(--color-paper);
+      color: var(--color-ink);
+      caret-color: var(--color-accent);
+      font-family: var(--font-body);
+      font-size: var(--text-md);
       line-height: 1.5;
+      -webkit-font-smoothing: antialiased;
     }
-    .tarjeta {
-      width: 100%;
-      max-width: 760px;
-      padding: 32px;
-      background: var(--tarjeta);
-      border: 1px solid var(--borde);
-      border-radius: var(--radio);
-      box-shadow: 0 1px 2px rgba(16, 24, 40, 0.06);
+    a { color: var(--color-accent-deep); text-underline-offset: 3px; text-decoration-thickness: 1px; }
+    a:hover { color: var(--color-ink); text-decoration-thickness: 2px; }
+    :focus-visible { outline: 2px solid var(--color-focus); outline-offset: 2px; transition: none; }
+    .titulo {
+      margin: 0;
+      font-family: var(--font-display);
+      font-size: var(--text-2xl);
+      font-weight: 650;
+      line-height: 1.2;
+      letter-spacing: -0.01em;
+      overflow-wrap: break-word;
+      min-width: 0;
+      text-wrap: balance;
     }
-    .titulo { margin: 0 0 16px; font-size: 22px; font-weight: 600; line-height: 1.3; }
     .seccion {
-      margin: 20px 0 8px;
-      font-size: 13px;
+      margin: 0 0 var(--space-2);
+      font-size: var(--text-sm);
       font-weight: 600;
-      letter-spacing: 0.04em;
-      text-transform: uppercase;
-      color: var(--texto-suave);
+      line-height: 1.4;
+      color: var(--color-muted);
     }
-    .firmantes { margin: 0; padding: 0; list-style: none; }
-    .firmantes li {
+    .id { font-family: var(--font-mono); font-size: 0.92em; font-variant-numeric: tabular-nums; }
+
+    /* ---------- Pasos: el registro del proceso ---------- */
+    .pasos { position: relative; margin: 0; padding: 0; list-style: none; display: grid; gap: var(--space-4); }
+    .paso {
+      position: relative;
       display: flex;
-      flex-wrap: wrap;
-      gap: 4px 12px;
-      padding: 8px 0;
-      border-top: 1px solid var(--borde);
-      font-size: 15px;
+      align-items: center;
+      gap: var(--space-3);
+      min-height: 24px;
+      color: var(--color-muted);
+      transition: color var(--dur-short) var(--ease-out);
     }
-    .firmantes li:first-child { border-top: 0; }
-    .firmante-etiqueta { min-width: 80px; color: var(--texto-suave); }
-    .firmante-correo { flex: 1 1 180px; min-width: 0; overflow-wrap: anywhere; }
-    .chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 0; padding: 0; list-style: none; }
-    .chip {
-      padding: 2px 10px;
-      background: #f8fafc;
-      border: 1px solid var(--borde);
-      border-radius: 999px;
-      font-size: 14px;
-      font-variant-numeric: tabular-nums;
+    /* Linea que une cada icono con el siguiente; se pinta cuando el paso termina. */
+    .paso:not(:last-child)::before {
+      content: "";
+      position: absolute;
+      left: 11px;
+      top: calc(50% + 13px);
+      width: 2px;
+      height: 14px;
+      border-radius: 1px;
+      background: var(--color-rule-strong);
+      transform-origin: top;
+      transition: background-color var(--dur-short) var(--ease-out);
     }
-    .nota { margin: 10px 0 0; font-size: 13px; color: var(--texto-suave); }
-    .aviso-caja {
-      margin: 20px 0 0;
-      padding: 12px 14px;
-      background: var(--aviso-suave);
-      border: 1px solid #f5d08a;
-      border-radius: 10px;
-      color: #7a2e0e;
-      font-size: 15px;
-    }
-    .aviso-caja strong { display: block; margin-bottom: 2px; }
-    .grupo { margin-top: 20px; }
-    .grupo-titulo { margin: 0 0 8px; font-size: 15px; font-weight: 600; }
-    .grupo-ayuda { margin: 0 0 8px; font-size: 13px; color: var(--texto-suave); }
-    .grupo.destacado {
-      padding: 12px;
-      background: #fffaf0;
-      border: 2px solid var(--aviso);
-      border-radius: var(--radio);
-    }
-    .lista-items { margin: 0; padding: 0; list-style: none; background: var(--tarjeta); border: 1px solid var(--borde); border-radius: 10px; overflow: hidden; }
-    .item { display: grid; gap: 2px; padding: 10px 14px; border-top: 1px solid var(--borde); }
-    .item:first-child { border-top: 0; }
-    .item-cab { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; }
-    .item-id { font-weight: 600; font-variant-numeric: tabular-nums; }
-    .item-texto { font-size: 14px; overflow-wrap: anywhere; }
-    .item-extra { font-size: 12px; color: var(--texto-suave); overflow-wrap: anywhere; }
-    .item-aviso {
-      margin-top: 4px;
-      padding: 6px 10px;
-      background: var(--aviso-suave);
-      border: 1px solid #f5d08a;
-      border-radius: 8px;
-      color: #7a2e0e;
-      font-size: 13px;
-      font-weight: 600;
-    }
-    .badge { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; font-weight: 600; }
-    .badge.ok { background: var(--ok-suave); color: var(--ok); }
-    .badge.error { background: var(--error-suave); color: var(--error); }
-    .badge.aviso { background: var(--aviso-suave); color: var(--aviso); }
-    .badge.neutro { background: #eef2f6; color: var(--texto-suave); }
-    .check { display: flex; align-items: flex-start; gap: 10px; margin: 16px 0 0; font-size: 15px; font-weight: 600; color: #7a2e0e; cursor: pointer; }
-    .check input { flex: 0 0 auto; width: 20px; height: 20px; margin: 2px 0 0; accent-color: var(--aviso); }
-    .pasos { margin: 24px 0 0; padding: 0; list-style: none; display: grid; gap: 14px; }
-    .paso { display: flex; align-items: center; gap: 12px; color: var(--texto-suave); }
-    .paso[data-estado="activo"], .paso[data-estado="hecho"] { color: var(--texto); }
+    .paso[data-estado="hecho"]:not(:last-child)::before { background: var(--color-accent); }
+    .paso[data-estado="activo"], .paso[data-estado="hecho"] { color: var(--color-ink); }
     .paso[data-estado="activo"] { font-weight: 600; }
-    .paso[data-estado="error"] { color: var(--error); font-weight: 600; }
-    .paso[data-estado="aviso"] { color: var(--aviso); font-weight: 600; }
+    .paso[data-estado="error"] { color: var(--color-error); font-weight: 600; }
+    .paso[data-estado="aviso"] { color: var(--color-warn-ink); font-weight: 600; }
     .paso-icono {
       display: inline-flex;
-      flex: 0 0 22px;
+      flex: 0 0 24px;
+      align-items: center;
+      justify-content: center;
+      width: 24px;
+      height: 24px;
+      border: 2px solid var(--color-rule-strong);
+      border-radius: 50%;
+      background: var(--color-paper);
+    }
+    .paso[data-estado="activo"] .paso-icono {
+      border-color: var(--color-accent-soft);
+      border-top-color: var(--color-accent);
+      animation: girar 0.8s linear infinite;
+    }
+    /* Check animado. Cuando varios pasos terminan juntos, el retraso por posicion los marca en cascada. */
+    .paso[data-estado="hecho"] .paso-icono {
+      background: var(--color-accent);
+      border-color: var(--color-accent);
+      color: var(--color-accent-ink);
+      animation: llenar 0.3s var(--retraso, 0s) var(--ease-out) both;
+    }
+    .paso[data-estado="hecho"] .paso-icono::after {
+      content: "";
+      width: 5px;
+      height: 10px;
+      margin-top: -2px;
+      border: solid currentColor;
+      border-width: 0 2px 2px 0;
+      transform: rotate(45deg);
+      animation: trazo 0.3s calc(var(--retraso, 0s) + 0.12s) var(--ease-out) both;
+    }
+    .paso:nth-child(2) { --retraso: 0.15s; }
+    .paso:nth-child(3) { --retraso: 0.3s; }
+    .paso:nth-child(4) { --retraso: 0.45s; }
+    .paso[data-estado="error"] .paso-icono { background: var(--color-error); border-color: var(--color-error); color: var(--color-accent-ink); }
+    .paso[data-estado="aviso"] .paso-icono { background: var(--color-warn); border-color: var(--color-warn); color: var(--color-accent-ink); }
+    .paso[data-estado="error"] .paso-icono::before,
+    .paso[data-estado="aviso"] .paso-icono::before { content: "!"; font-size: var(--text-sm); font-weight: 700; line-height: 1; }
+    @keyframes girar { to { transform: rotate(360deg); } }
+    @keyframes llenar {
+      from { background-color: transparent; border-color: var(--color-rule-strong); transform: scale(0.8); }
+      to { transform: scale(1); }
+    }
+    @keyframes trazo {
+      from { transform: rotate(45deg) scale(0); }
+      to { transform: rotate(45deg) scale(1); }
+    }
+
+    /* ---------- Resultado ---------- */
+    .resultado { display: flex; margin-top: var(--space-8); }
+    .insignia {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 48px;
+      height: 48px;
+      border-radius: 50%;
+      font-size: var(--text-xl);
+      font-weight: 700;
+      line-height: 1;
+      animation: asomar 0.35s var(--ease-out) both;
+    }
+    .insignia.ok { background: var(--color-accent-soft); }
+    .insignia.ok::after {
+      content: "";
+      width: 12px;
+      height: 22px;
+      margin-top: calc(var(--space-1) * -1);
+      border: solid var(--color-accent-deep);
+      border-width: 0 3px 3px 0;
+      transform: rotate(45deg) scale(0);
+      animation: marcar 0.45s 0.1s var(--ease-out) forwards;
+    }
+    .insignia.error { background: var(--color-error-soft); color: var(--color-error); }
+    .insignia.aviso { background: var(--color-warn-soft); color: var(--color-warn-ink); }
+    .insignia.error::before, .insignia.aviso::before { content: "!"; }
+    @keyframes marcar { to { transform: rotate(45deg) scale(1); } }
+    @keyframes asomar { from { opacity: 0; transform: scale(0.85); } }
+    .estado { min-height: 1.5em; margin: var(--space-4) 0 0; font-weight: 600; overflow-wrap: break-word; }
+    .estado:empty { min-height: 0; margin: 0; }
+    .estado.ok { color: var(--color-accent-deep); }
+    .estado.error { color: var(--color-error); }
+    .estado.aviso { color: var(--color-warn-ink); }
+    .acuerdo { margin: var(--space-1) 0 0; font-size: var(--text-sm); color: var(--color-muted); overflow-wrap: break-word; }
+
+    /* ---------- Botones: ocho estados ---------- */
+    .acciones { display: flex; flex-wrap: wrap; gap: var(--space-3); margin-top: var(--space-6); }
+    .acciones:not(:has(.btn:not([hidden]))) { display: none; }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 40px;
+      padding: var(--space-2) var(--space-5);
+      border: 1px solid var(--color-accent-deep);
+      border-radius: var(--radius-control);
+      background: var(--color-accent);
+      color: var(--color-accent-ink);
+      box-shadow: 0 2px 0 var(--color-accent-deep);
+      font: inherit;
+      font-size: var(--text-sm);
+      font-weight: 600;
+      white-space: nowrap;
+      cursor: pointer;
+      transition: background-color var(--dur-micro) var(--ease-out), border-color var(--dur-micro) var(--ease-out), box-shadow var(--dur-micro) var(--ease-out), transform var(--dur-micro) var(--ease-out);
+    }
+    .btn:hover { background: var(--color-accent-deep); }
+    .btn:active:not(:disabled) { transform: translateY(2px); box-shadow: 0 0 0 var(--color-accent-deep); }
+    .btn.peligro { background: var(--color-error); border-color: var(--color-error-deep); box-shadow: 0 2px 0 var(--color-error-deep); }
+    .btn.peligro:hover { background: var(--color-error-deep); }
+    .btn.secundario { background: transparent; color: var(--color-ink); border-color: var(--color-rule-strong); box-shadow: 0 2px 0 var(--color-rule); }
+    .btn.secundario:hover { background: var(--color-paper-2); border-color: var(--color-muted); }
+    .btn:disabled, .btn.peligro:disabled, .btn.secundario:disabled {
+      opacity: 0.55;
+      background: var(--color-paper-2);
+      border-color: var(--color-rule);
+      color: var(--color-muted);
+      box-shadow: none;
+      cursor: not-allowed;
+    }
+    .btn[aria-busy="true"]:disabled { cursor: progress; }
+
+    /* ---------- Pagina: mesa de trabajo, la tabla a la izquierda y la seleccion al lado ---------- */
+    .hoja {
+      width: 100%;
+      max-width: 1360px;
+      margin: 0 auto;
+      padding: var(--space-12) var(--space-8) var(--space-16);
+    }
+    .cabecera { padding-bottom: var(--space-5); border-bottom: 1px solid var(--color-rule); }
+    .intro { max-width: 72ch; margin: var(--space-5) 0 0; color: var(--color-ink-2); }
+    .columna { max-width: 760px; padding-top: var(--space-8); }
+    .mesa {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 320px;
+      column-gap: var(--space-10);
+      align-items: start;
+      padding-top: var(--space-8);
+    }
+    .mesa-lateral {
+      position: sticky;
+      top: var(--space-6);
+      display: grid;
+      gap: var(--space-4);
+      padding-left: var(--space-8);
+      border-left: 1px solid var(--color-rule);
+    }
+    .lateral-cab { display: flex; align-items: baseline; justify-content: space-between; gap: var(--space-3); }
+    .lateral-cab .seccion { margin: 0; }
+    .seccion-tabla { margin-top: var(--space-10); }
+    .seccion-suelta { margin-top: var(--space-8); }
+    .total { font-family: var(--font-mono); font-weight: 500; color: var(--color-muted); }
+    .nota { margin: var(--space-3) 0 0; font-size: var(--text-sm); color: var(--color-muted); }
+
+    /* ---------- Busqueda: una fila de campos, sin caja ---------- */
+    .filtros {
+      display: grid;
+      grid-template-columns: repeat(12, minmax(0, 1fr));
+      gap: var(--space-4);
+      padding-bottom: var(--space-5);
+      border-bottom: 1px solid var(--color-rule);
+    }
+    .filtros > .campo:nth-child(1) { grid-column: span 2; }
+    .filtros > .campo:nth-child(2) { grid-column: span 4; }
+    .filtros > .campo:nth-child(3),
+    .filtros > .campo:nth-child(4),
+    .filtros > .campo:nth-child(5),
+    .filtros > .campo:nth-child(6) { grid-column: span 3; }
+    .filtros > .barra-filtros { grid-column: span 6; align-self: end; justify-content: flex-end; margin: 0; }
+    .campo { display: grid; gap: var(--space-1); min-width: 0; font-size: var(--text-xs); font-weight: 600; color: var(--color-muted); }
+    .campo input {
+      width: 100%;
+      min-width: 0;
+      min-height: 36px;
+      padding: var(--space-1) var(--space-3);
+      background: var(--color-surface);
+      border: 1px solid var(--color-rule-strong);
+      border-radius: var(--radius-control);
+      font: inherit;
+      font-size: var(--text-md);
+      font-weight: 400;
+      color: var(--color-ink);
+      transition: border-color var(--dur-micro) var(--ease-out);
+    }
+    .campo input:hover { border-color: var(--color-muted); }
+    .campo input:focus-visible { outline: 2px solid var(--color-focus); outline-offset: -1px; border-color: var(--color-focus); }
+
+    .barra { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); margin-top: var(--space-3); }
+    .barra-tabla { margin-top: var(--space-2); }
+    .marcar-todos { display: inline-flex; align-items: center; gap: var(--space-2); min-height: 44px; font-size: var(--text-sm); color: var(--color-ink-2); cursor: pointer; }
+    input[type="checkbox"] { width: 18px; height: 18px; margin: 0; accent-color: var(--color-accent); cursor: pointer; }
+
+    /* ---------- Tabla: solo reglas horizontales ---------- */
+    .tabla-caja { max-height: 600px; overflow: auto; border-bottom: 1px solid var(--color-rule); }
+    table { width: 100%; border-collapse: separate; border-spacing: 0; font-size: var(--text-sm); }
+    th, td { padding: var(--space-3) var(--space-3); text-align: left; vertical-align: top; border-bottom: 1px solid var(--color-rule); }
+    tbody tr:last-child td { border-bottom: 0; }
+    thead th {
+      position: sticky;
+      top: 0;
+      z-index: 1;
+      padding-top: var(--space-2);
+      padding-bottom: var(--space-2);
+      background: var(--color-paper-2);
+      border-bottom-color: var(--color-rule-strong);
+      font-size: var(--text-xs);
+      font-weight: 600;
+      color: var(--color-muted);
+      white-space: nowrap;
+    }
+    td.num { font-family: var(--font-mono); font-size: var(--text-xs); white-space: nowrap; padding-top: var(--space-3); }
+    td.num:nth-child(2) { color: var(--color-ink); font-weight: 600; }
+    td.num:nth-child(3) { color: var(--color-muted); }
+    td:nth-child(5) { font-family: var(--font-mono); font-size: var(--text-xs); color: var(--color-muted); white-space: nowrap; }
+    td.largo { min-width: 120px; overflow-wrap: break-word; }
+    td.largo:nth-child(4) { min-width: 220px; max-width: 340px; }
+    tbody tr { transition: background-color var(--dur-micro) var(--ease-out); }
+    tbody tr:hover { background: var(--color-paper-2); }
+    tbody tr.marcada { background: var(--color-accent-soft); }
+    .col-check { width: 44px; }
+    td.col-check, th.col-check { padding-right: 0; }
+    .vacio { margin: 0; padding: var(--space-10) var(--space-4); text-align: center; color: var(--color-muted); border-top: 1px solid var(--color-rule); border-bottom: 1px solid var(--color-rule); }
+    .contador { font-size: var(--text-xs); font-variant-numeric: tabular-nums; color: var(--color-muted); white-space: nowrap; }
+    .contador.lleno { color: var(--color-warn-ink); font-weight: 600; }
+
+    /* ---------- Etiquetas de flujo ---------- */
+    .chips { display: flex; flex-wrap: wrap; gap: var(--space-2); margin: 0; padding: 0; list-style: none; }
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      gap: var(--space-1);
+      min-height: 28px;
+      padding: 0 var(--space-3);
+      background: var(--color-accent-soft);
+      border-radius: var(--radius-pill);
+      color: var(--color-accent-deep);
+      font-size: var(--text-sm);
+      font-weight: 600;
+      font-variant-numeric: tabular-nums;
+    }
+    .chip.con-quitar { padding-right: var(--space-1); }
+    .chip button {
+      display: inline-flex;
       align-items: center;
       justify-content: center;
       width: 22px;
       height: 22px;
-      border: 2px solid var(--pendiente);
-      border-radius: 50%;
-    }
-    .paso[data-estado="activo"] .paso-icono {
-      border-color: #d0d5dd;
-      border-top-color: var(--acento);
-      animation: girar 0.8s linear infinite;
-    }
-    .paso[data-estado="hecho"] .paso-icono { background: var(--acento); border-color: var(--acento); }
-    .paso[data-estado="hecho"] .paso-icono::after {
-      content: "";
-      width: 5px;
-      height: 9px;
-      margin-top: -2px;
-      border: solid #fff;
-      border-width: 0 2px 2px 0;
-      transform: rotate(45deg);
-    }
-    .paso[data-estado="error"] .paso-icono { background: var(--error); border-color: var(--error); color: #fff; }
-    .paso[data-estado="error"] .paso-icono::before { content: "!"; font-size: 14px; font-weight: 700; line-height: 1; }
-    .paso[data-estado="aviso"] .paso-icono { background: var(--aviso); border-color: var(--aviso); color: #fff; }
-    .paso[data-estado="aviso"] .paso-icono::before { content: "!"; font-size: 14px; font-weight: 700; line-height: 1; }
-    @keyframes girar { to { transform: rotate(360deg); } }
-    .resultado { display: flex; justify-content: center; margin-top: 24px; }
-    .insignia {
-      width: 56px;
-      height: 56px;
-      border-radius: 50%;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-    }
-    .insignia.ok { background: var(--ok-suave); }
-    .insignia.ok::after {
-      content: "";
-      width: 14px;
-      height: 26px;
-      margin-top: -5px;
-      border: solid var(--ok);
-      border-width: 0 4px 4px 0;
-      transform: rotate(45deg) scale(0);
-      animation: marcar 0.45s 0.1s cubic-bezier(0.2, 0.8, 0.2, 1) forwards;
-    }
-    @keyframes marcar { to { transform: rotate(45deg) scale(1); } }
-    .insignia.error { background: var(--error-suave); color: var(--error); font-size: 30px; font-weight: 700; line-height: 1; }
-    .insignia.error::before { content: "!"; }
-    .insignia.aviso { background: var(--aviso-suave); color: var(--aviso); font-size: 30px; font-weight: 700; line-height: 1; }
-    .insignia.aviso::before { content: "!"; }
-    .estado { min-height: 1.5em; margin: 16px 0 0; text-align: center; font-weight: 600; overflow-wrap: anywhere; }
-    .estado.ok { color: var(--ok); }
-    .estado.error { color: var(--error); }
-    .estado.aviso { color: var(--aviso); }
-    .acuerdo { margin: 6px 0 0; text-align: center; font-size: 13px; color: var(--texto-suave); overflow-wrap: anywhere; }
-    .lista-acuerdos { margin: 12px 0 0; padding: 0; list-style: none; font-size: 13px; color: var(--texto-suave); }
-    .lista-acuerdos li { padding: 6px 0; border-top: 1px solid var(--borde); overflow-wrap: anywhere; }
-    .lista-acuerdos li:first-child { border-top: 0; }
-    .acciones { display: grid; gap: 8px; margin-top: 24px; }
-    .btn {
-      min-height: 44px;
-      padding: 12px 20px;
+      padding: 0;
       border: 0;
-      border-radius: 10px;
-      background: var(--acento);
-      color: #fff;
-      font: inherit;
-      font-size: 16px;
+      border-radius: 50%;
+      background: transparent;
+      color: var(--color-accent-deep);
+      font-family: var(--font-body);
+      font-size: var(--text-md);
+      line-height: 1;
+      cursor: pointer;
+      transition: background-color var(--dur-micro) var(--ease-out), color var(--dur-micro) var(--ease-out);
+    }
+    .chip button:hover { background: var(--color-error-soft); color: var(--color-error); }
+    .chip button:active { transform: scale(0.9); }
+    .chips > .nota { margin: 0; }
+
+    /* ---------- Avisos: tinta ambar, regla fina alrededor ---------- */
+    .aviso-caja {
+      margin: var(--space-6) 0 0;
+      padding: var(--space-3) var(--space-4);
+      background: var(--color-warn-soft);
+      border: 1px solid var(--color-warn-rule);
+      border-radius: var(--radius-control);
+      color: var(--color-warn-ink);
+      font-size: var(--text-sm);
+    }
+    .mesa-lateral .aviso-caja { margin: 0; }
+    .aviso-caja strong { display: block; margin-bottom: var(--space-1); }
+    .estado-sel { min-height: 1.5em; margin: 0; font-size: var(--text-sm); font-weight: 600; overflow-wrap: break-word; }
+    .estado-sel:empty { min-height: 0; }
+    .estado-sel.aviso { color: var(--color-warn-ink); }
+    .estado-sel.ok { color: var(--color-accent-deep); }
+
+    /* ---------- Revision ---------- */
+    .firmantes { margin: var(--space-3) 0 0; padding: 0; list-style: none; }
+    .firmantes li { display: grid; grid-template-columns: 88px minmax(0, 1fr); gap: var(--space-3); padding: var(--space-2) 0; border-top: 1px solid var(--color-rule); border-bottom: 1px solid var(--color-rule); font-size: var(--text-sm); }
+    .firmante-etiqueta { color: var(--color-muted); }
+    .firmante-correo { font-family: var(--font-mono); overflow-wrap: break-word; }
+    .grupo { margin-top: var(--space-8); }
+    .grupo-titulo { margin: 0 0 var(--space-2); font-size: var(--text-lg); font-weight: 600; line-height: 1.35; }
+    .grupo-ayuda { margin: 0 0 var(--space-3); font-size: var(--text-sm); color: var(--color-muted); }
+    .grupo.destacado { padding: var(--space-4) var(--space-5); background: var(--color-warn-soft); border: 1px solid var(--color-warn-rule); border-radius: var(--radius-control); }
+    .lista-items { margin: 0; padding: 0; list-style: none; border-top: 1px solid var(--color-rule-strong); }
+    .item { display: grid; gap: var(--space-1); padding: var(--space-3) 0; border-bottom: 1px solid var(--color-rule); animation: asomar var(--dur-short) var(--ease-out) both; }
+    .item-cab { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); }
+    .item-id { font-family: var(--font-mono); font-size: var(--text-sm); font-weight: 600; }
+    .item-texto { font-size: var(--text-sm); overflow-wrap: break-word; }
+    .item-extra { font-size: var(--text-xs); color: var(--color-muted); overflow-wrap: break-word; }
+    .item-aviso { margin-top: var(--space-1); font-size: var(--text-xs); font-weight: 600; color: var(--color-warn-ink); }
+    .badge { display: inline-flex; align-items: center; min-height: 22px; padding: 0 var(--space-2); border-radius: var(--radius-pill); font-size: var(--text-xs); font-weight: 600; }
+    .badge.ok { background: var(--color-accent-soft); color: var(--color-accent-deep); }
+    .badge.error { background: var(--color-error-soft); color: var(--color-error); }
+    .badge.aviso { background: var(--color-warn-soft); color: var(--color-warn-ink); }
+    .badge.neutro { background: var(--color-paper-2); color: var(--color-muted); }
+    .check {
+      display: flex;
+      align-items: flex-start;
+      gap: var(--space-3);
+      margin: var(--space-5) 0 0;
+      font-size: var(--text-sm);
       font-weight: 600;
+      color: var(--color-warn-ink);
       cursor: pointer;
     }
-    .btn:hover { background: var(--acento-hover); }
-    .btn.peligro { background: var(--error); }
-    .btn.peligro:hover { background: var(--error-hover); }
-    .btn.secundario { background: #fff; color: var(--texto); border: 1px solid #d0d5dd; }
-    .btn.secundario:hover { background: #f8fafc; }
-    .btn:focus-visible, a:focus-visible, .check input:focus-visible { outline: 3px solid var(--acento); outline-offset: 2px; }
-    .btn:disabled { opacity: 0.6; cursor: not-allowed; }
-    .btn[aria-busy="true"]:disabled { cursor: progress; }
-    @media (max-width: 400px) {
-      .tarjeta { padding: 24px 20px; }
-    }
-    @media (prefers-reduced-motion: reduce) {
-      *, *::before, *::after {
-        animation-duration: 0.01ms !important;
-        animation-iteration-count: 1 !important;
-        transition-duration: 0.01ms !important;
-      }
-    }
-  
-    .intro { margin: 0 0 16px; font-size: 15px; color: var(--texto-suave); }
-    .filtros { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; }
-    .campo { display: grid; gap: 4px; font-size: 13px; font-weight: 600; color: var(--texto-suave); }
-    .campo input {
-      min-height: 40px;
-      padding: 8px 10px;
-      border: 1px solid #d0d5dd;
-      border-radius: 8px;
-      font: inherit;
-      font-size: 15px;
-      font-weight: 400;
-      color: var(--texto);
-    }
-    .barra { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 12px; }
-    .barra .espacio { flex: 1 1 auto; }
-    .barra .btn { min-height: 40px; padding: 8px 16px; font-size: 15px; }
-    .tabla-caja { overflow-x: auto; border: 1px solid var(--borde); border-radius: 10px; }
-    table { width: 100%; border-collapse: collapse; font-size: 14px; }
-    th, td { padding: 8px 10px; text-align: left; border-top: 1px solid var(--borde); vertical-align: top; }
-    thead th { border-top: 0; background: #f8fafc; font-size: 12px; letter-spacing: 0.03em; text-transform: uppercase; color: var(--texto-suave); white-space: nowrap; }
-    td.num, th.num { font-variant-numeric: tabular-nums; }
-    td.largo { min-width: 160px; overflow-wrap: anywhere; }
-    tbody tr:hover { background: #f8fafc; }
-    tbody tr.marcada { background: var(--ok-suave); }
-    .col-check { width: 40px; }
-    .col-check input, .chk-fila { width: 18px; height: 18px; accent-color: var(--acento); }
-    .vacio { margin: 12px 0 0; padding: 16px; text-align: center; color: var(--texto-suave); border: 1px dashed #d0d5dd; border-radius: 10px; }
-    .contador { font-size: 15px; font-weight: 600; }
-    .contador.lleno { color: var(--aviso); }
-    .chip { display: inline-flex; align-items: center; gap: 6px; }
-    .chip.con-quitar { padding-right: 4px; }
-    .chip button { width: 22px; height: 22px; padding: 0; border: 0; border-radius: 50%; background: transparent; color: var(--texto-suave); font-size: 16px; line-height: 1; cursor: pointer; }
-    .chip button:hover { background: var(--error-suave); color: var(--error); }
-    .estado-sel { min-height: 1.5em; margin: 12px 0 0; font-size: 14px; font-weight: 600; overflow-wrap: anywhere; }
-    .estado-sel.aviso { color: var(--aviso); }
-    .estado-sel.ok { color: var(--ok); }
-    .pasos-c { margin: 8px 0 0; padding-left: 20px; font-size: 15px; }
+    .check input { flex: 0 0 auto; margin-top: var(--space-1); accent-color: var(--color-warn); }
+    .mesa-lateral .resultado { margin-top: var(--space-2); }
+    .mesa-lateral .estado { margin: 0; }
+    .mesa-lateral .acciones { display: grid; margin-top: var(--space-2); }
+    .lista-acuerdos { margin: 0; padding: 0; list-style: none; font-size: var(--text-xs); color: var(--color-muted); }
+    .lista-acuerdos li { padding: var(--space-2) 0; border-top: 1px solid var(--color-rule); overflow-wrap: break-word; }
+
+    /* ---------- Plan C ---------- */
+    .pasos-c { margin: 0; padding-left: var(--space-5); }
+    .pasos-c li + li { margin-top: var(--space-2); }
     .ids-copia {
       display: block;
       width: 100%;
-      min-height: 64px;
-      margin: 8px 0 0;
-      padding: 8px 10px;
-      border: 1px solid #d0d5dd;
-      border-radius: 8px;
-      font: inherit;
-      font-size: 15px;
-      font-variant-numeric: tabular-nums;
-      color: var(--texto);
-      background: #f8fafc;
+      min-height: 72px;
+      margin: var(--space-4) 0 0;
+      padding: var(--space-2) var(--space-3);
+      background: var(--color-surface);
+      border: 1px solid var(--color-rule-strong);
+      border-radius: var(--radius-control);
+      font-family: var(--font-mono);
+      font-size: var(--text-sm);
+      color: var(--color-ink);
       resize: vertical;
     }
-    .diag { margin: 16px 0 0; font-size: 13px; color: var(--texto-suave); }
-    .diag pre { margin: 6px 0 0; padding: 8px 10px; background: #f8fafc; border: 1px solid var(--borde); border-radius: 8px; font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
-    .btn.chico { min-height: 40px; padding: 8px 16px; font-size: 15px; }
-    input:focus-visible, textarea:focus-visible, .chip button:focus-visible { outline: 3px solid var(--acento); outline-offset: 2px; }
+    .diag { margin: var(--space-4) 0 0; font-size: var(--text-xs); color: var(--color-muted); }
+    .diag summary { cursor: pointer; }
+    .diag pre { margin: var(--space-2) 0 0; padding: var(--space-2) var(--space-3); background: var(--color-paper-2); border-radius: var(--radius-control); font-family: var(--font-mono); white-space: pre-wrap; overflow-wrap: break-word; }
+
+    /* ---------- Botones de la barra ---------- */
+    .btn.chico { min-height: 36px; padding: var(--space-1) var(--space-4); }
+
+    /* ---------- Dialogo ---------- */
     .modal-fondo {
       position: fixed;
       inset: 0;
@@ -319,94 +513,131 @@ REASIGNADO_OK
       display: flex;
       align-items: center;
       justify-content: center;
-      padding: 16px;
-      background: rgba(16, 24, 40, 0.5);
+      padding: var(--space-4);
+      background: var(--color-scrim);
+      animation: aparecer-fondo var(--dur-short) var(--ease-out) both;
     }
     .modal {
       width: 100%;
       max-width: 520px;
-      max-height: 90vh;
+      max-height: 90dvh;
       overflow-y: auto;
-      padding: 24px;
-      background: var(--tarjeta);
-      border-radius: var(--radio);
-      box-shadow: 0 8px 24px rgba(16, 24, 40, 0.25);
+      padding: var(--space-6);
+      background: var(--color-surface);
+      border-radius: var(--radius-control);
+      box-shadow: var(--shadow-dialog);
+      animation: aparecer var(--dur-short) var(--ease-out) both;
     }
-    .modal h2 { margin: 0 0 8px; font-size: 18px; }
-    .modal ul { margin: 12px 0; padding: 0; list-style: none; border: 1px solid var(--borde); border-radius: 10px; }
-    .modal li { display: flex; flex-wrap: wrap; gap: 2px 10px; padding: 6px 12px; border-top: 1px solid var(--borde); font-size: 14px; }
-    .modal li:first-child { border-top: 0; }
-    .modal .id { font-weight: 600; font-variant-numeric: tabular-nums; }
-    .modal .acciones-modal { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; margin-top: 16px; }
-    .tarjeta { max-width: 1000px; }
+    @keyframes aparecer { from { opacity: 0; transform: translateY(8px); } }
+    @keyframes aparecer-fondo { from { opacity: 0; } }
+    .modal h2 { text-wrap: balance; margin: 0 0 var(--space-2); font-size: var(--text-lg); font-weight: 600; }
+    .modal > p { margin: 0; color: var(--color-ink-2); font-size: var(--text-sm); }
+    .modal ul { margin: var(--space-4) 0; padding: 0; list-style: none; max-height: 280px; overflow-y: auto; border-top: 1px solid var(--color-rule-strong); }
+    .modal li { display: flex; flex-wrap: wrap; gap: var(--space-1) var(--space-3); padding: var(--space-2) 0; border-bottom: 1px solid var(--color-rule); font-size: var(--text-sm); }
+    .modal .id { font-weight: 600; }
+    .modal .modal-nota { color: var(--color-muted); }
+    .modal .acciones-modal { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: var(--space-2); margin-top: var(--space-5); }
+
+    /* ---------- Responsivo ---------- */
+    @media (max-width: 1100px) {
+      .mesa { grid-template-columns: minmax(0, 1fr); row-gap: var(--space-8); }
+      .mesa-lateral { position: static; padding: var(--space-6) 0 0; border-left: 0; border-top: 1px solid var(--color-rule); }
+      .mesa-lateral .acciones { display: flex; }
+      .filtros > .campo:nth-child(n), .filtros > .barra-filtros { grid-column: span 4; }
+      .filtros > .barra-filtros { grid-column: span 12; }
+    }
+    @media (max-width: 640px) {
+      .hoja { padding: var(--space-8) var(--space-4) var(--space-12); }
+      .filtros > .campo:nth-child(n), .filtros > .barra-filtros { grid-column: 1 / -1; }
+      .barra-filtros .btn { flex: 1 1 0; }
+      .mesa-lateral .acciones { display: grid; }
+      .campo input { min-height: 44px; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after {
+        animation-duration: 0.01ms !important;
+        animation-delay: 0s !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+      }
+    }
   </style>
 </head>
 <body>
-  <main class="tarjeta">
-    <h1 class="titulo">Cancelar flujos de firma</h1>
+  <main class="hoja">
+    <header class="cabecera">
+      <h1 class="titulo">Cancelar flujos de firma</h1>
+    </header>
 
     <!-- ===== Etapa A: buscar y marcar ===== -->
     <section id="vista-seleccion" hidden>
       <p class="intro">Busque los flujos que están en "Aguardar Firma" y márquelos (máximo <span id="max-flujos"></span>). <span data-modo="tarea">Al pulsar "Revisar" se guarda la selección en esta tarea y se consulta el estado de cada acuerdo en Adobe Sign; todavía no se cancela nada.</span><span data-modo="directo" hidden>Al pulsar "Revisar" se consulta el estado de cada acuerdo en Adobe Sign; todavía no se cancela nada. Al confirmar, los acuerdos se cancelan en Adobe Sign y los flujos originales se detienen en Content Server.</span></p>
 
-      <h2 class="seccion">Buscar</h2>
-      <form id="form-busqueda" action="" novalidate>
-        <!-- Filtros en la pagina: el LiveReport trae todos los flujos en "Aguardar Firma" y aqui solo se ocultan filas (sin recargar). -->
-        <div class="filtros">
-          <label class="campo">Flujo<input type="text" id="q-flujo" autocomplete="off" inputmode="numeric"></label>
-          <label class="campo">Empleado (usuario o correo)<input type="text" id="q-empleado" autocomplete="off"></label>
-          <label class="campo">Nombre<input type="text" id="q-nombre" autocomplete="off"></label>
-          <label class="campo">Documento<input type="text" id="q-documento" autocomplete="off"></label>
-          <label class="campo">Desde<input type="date" id="q-desde"></label>
-          <label class="campo">Hasta<input type="date" id="q-hasta"></label>
-        </div>
-        <div class="barra">
-          <button class="btn chico" type="submit">Filtrar</button>
-          <button class="btn secundario chico" type="button" id="btn-limpiar-filtros">Limpiar filtros</button>
-        </div>
-      </form>
+      <div class="mesa">
+        <div class="mesa-principal">
+          <h2 class="seccion">Buscar</h2>
+          <form id="form-busqueda" class="busqueda" action="" novalidate>
+            <!-- Filtros en la pagina: el LiveReport trae todos los flujos en "Aguardar Firma" y aqui solo se ocultan filas (sin recargar). -->
+            <div class="filtros">
+              <label class="campo">Flujo<input type="text" id="q-flujo" autocomplete="off" inputmode="numeric"></label>
+              <label class="campo">Empleado (usuario o correo)<input type="text" id="q-empleado" autocomplete="off"></label>
+              <label class="campo">Nombre<input type="text" id="q-nombre" autocomplete="off"></label>
+              <label class="campo">Documento<input type="text" id="q-documento" autocomplete="off"></label>
+              <label class="campo">Desde<input type="date" id="q-desde"></label>
+              <label class="campo">Hasta<input type="date" id="q-hasta"></label>
+              <div class="barra barra-filtros">
+                <button class="btn secundario chico" type="button" id="btn-limpiar-filtros">Limpiar filtros</button>
+                <button class="btn chico" type="submit">Filtrar</button>
+              </div>
+            </div>
+          </form>
 
-      <h2 class="seccion">Flujos en "Aguardar Firma" <span id="total-resultados"></span></h2>
-      <div class="tabla-caja" id="tabla-caja" hidden>
-        <table>
-          <thead>
-            <tr>
-              <th class="col-check"><input type="checkbox" id="chk-todos" aria-label="Seleccionar todos"></th>
-              <th class="num">Flujo</th>
-              <th class="num">Subflujo</th>
-              <th>Título</th>
-              <th>Fecha</th>
-              <th>Empleado</th>
-              <th>Nombre</th>
-              <th>Documento</th>
-            </tr>
-          </thead>
-          <tbody id="tbody"></tbody>
-        </table>
-      </div>
-      <p class="vacio" id="vacio" hidden>No hay flujos en "Aguardar Firma" que coincidan con la búsqueda.</p>
-      <div class="barra">
-        <label><input type="checkbox" id="chk-todos-2"> Seleccionar todos</label>
-        <span class="espacio"></span>
-        <span class="contador" id="contador" role="status" aria-live="polite"></span>
-      </div>
+          <h2 class="seccion seccion-tabla">Flujos en "Aguardar Firma" <span class="total" id="total-resultados"></span></h2>
+          <div class="tabla-caja" id="tabla-caja" hidden>
+            <table>
+              <thead>
+                <tr>
+                  <th class="col-check"><input type="checkbox" id="chk-todos" aria-label="Seleccionar todos"></th>
+                  <th class="num">Flujo</th>
+                  <th class="num">Subflujo</th>
+                  <th>Título</th>
+                  <th>Fecha</th>
+                  <th>Empleado</th>
+                  <th>Nombre</th>
+                  <th>Documento</th>
+                </tr>
+              </thead>
+              <tbody id="tbody"></tbody>
+            </table>
+          </div>
+          <p class="vacio" id="vacio" hidden>No hay flujos en "Aguardar Firma" que coincidan con la búsqueda.</p>
+          <div class="barra barra-tabla">
+            <label class="marcar-todos"><input type="checkbox" id="chk-todos-2"> Seleccionar todos</label>
+          </div>
+        </div>
 
-      <h2 class="seccion">Selección actual</h2>
-      <ul class="chips" id="seleccion"></ul>
-      <p class="estado-sel" id="sel-estado" role="status" aria-live="polite"></p>
-      <div class="aviso-caja" role="note" data-modo="tarea">
-        <strong>La revisión puede transferir la tarea</strong>
-        Si la tarea no está asignada al usuario de integración, "Revisar" la transfiere a él. Después no la verá en su bandeja: no cierre esta página hasta terminar. Cambiar la selección más tarde puede no ser posible (en ese caso se pegan los IDs a mano).
-      </div>
-      <div class="acciones">
-        <button class="btn" type="button" id="btn-revisar-sel" disabled>Revisar flujos</button>
-        <button class="btn secundario" type="button" id="btn-limpiar-seleccion" disabled>Quitar selección</button>
-        <button class="btn secundario" type="button" id="btn-volver-guardados" hidden>Volver a los flujos guardados</button>
+        <aside class="mesa-lateral" aria-label="Selección actual">
+          <div class="lateral-cab">
+            <h2 class="seccion">Selección actual</h2>
+            <span class="contador" id="contador" role="status" aria-live="polite"></span>
+          </div>
+          <ul class="chips" id="seleccion"></ul>
+          <p class="estado-sel" id="sel-estado" role="status" aria-live="polite"></p>
+          <div class="aviso-caja" role="note" data-modo="tarea">
+            <strong>La revisión puede transferir la tarea</strong>
+            Si la tarea no está asignada al usuario de integración, "Revisar" la transfiere a él. Después no la verá en su bandeja: no cierre esta página hasta terminar. Cambiar la selección más tarde puede no ser posible (en ese caso se pegan los IDs a mano).
+          </div>
+          <div class="acciones">
+            <button class="btn" type="button" id="btn-revisar-sel" disabled>Revisar flujos</button>
+            <button class="btn secundario" type="button" id="btn-limpiar-seleccion" disabled>Quitar selección</button>
+            <button class="btn secundario" type="button" id="btn-volver-guardados" hidden>Volver a los flujos guardados</button>
+          </div>
+        </aside>
       </div>
     </section>
 
     <!-- ===== Plan C: la grabacion fallo o no se pudo verificar ===== -->
-    <section id="vista-plan-c" hidden>
+    <section id="vista-plan-c" class="columna" hidden>
       <div class="aviso-caja" role="alert">
         <strong id="pc-titulo"></strong>
         <span id="pc-texto"></span>
@@ -415,7 +646,7 @@ REASIGNADO_OK
         <summary>Detalle técnico (para soporte)</summary>
         <pre id="pc-diag"></pre>
       </details>
-      <h2 class="seccion">Pegar los IDs manualmente</h2>
+      <h2 class="seccion seccion-suelta">Pegar los IDs manualmente</h2>
       <ol class="pasos-c">
         <li>Copie los IDs con el botón.</li>
         <li>En el formulario de esta tarea, pegue en el campo "ID Flujo a Cancelar" (separados por coma; también sirve un ID por valor) y guarde el formulario.</li>
@@ -431,88 +662,94 @@ REASIGNADO_OK
 
     <!-- ===== Etapas B, C y D: revisar, confirmar y cancelar ===== -->
     <section id="vista-revision" hidden>
-      <div id="bloque-destino">
-        <h2 class="seccion">Flujos a cancelar <span id="destino-total"></span></h2>
-        <ul class="chips" id="destino-ids"></ul>
-        <ul class="firmantes" id="destino">
-          <li><span class="firmante-etiqueta">Subflujo</span><span class="firmante-correo" id="destino-subflujo"></span></li>
-        </ul>
-        <p class="nota" id="nota-destino">
-          <span data-modo="tarea">
-            El servidor vuelve a leer la lista del atributo "ID Flujo a Cancelar" al cancelar y procesa <strong>todos</strong> los flujos de esa lista.
-            La revisión es informativa y no cancela nada.
-          </span>
-          <span data-modo="directo" hidden>
-            Estos son los flujos que se envían al servidor; la lista queda firmada con la solicitud (si cambia la selección, hay que revisar de nuevo).
-            La revisión es informativa y no cancela nada.
-          </span>
-        </p>
-      </div>
+      <div class="mesa">
+        <div class="mesa-principal">
+          <div id="bloque-destino">
+            <h2 class="seccion">Flujos a cancelar <span class="total" id="destino-total"></span></h2>
+            <ul class="chips" id="destino-ids"></ul>
+            <ul class="firmantes" id="destino">
+              <li><span class="firmante-etiqueta">Subflujo</span><span class="firmante-correo" id="destino-subflujo"></span></li>
+            </ul>
+            <p class="nota" id="nota-destino">
+              <span data-modo="tarea">
+                El servidor vuelve a leer la lista del atributo "ID Flujo a Cancelar" al cancelar y procesa <strong>todos</strong> los flujos de esa lista.
+                La revisión es informativa y no cancela nada.
+              </span>
+              <span data-modo="directo" hidden>
+                Estos son los flujos que se envían al servidor; la lista queda firmada con la solicitud (si cambia la selección, hay que revisar de nuevo).
+                La revisión es informativa y no cancela nada.
+              </span>
+            </p>
+          </div>
 
-      <div id="vista-inicio" hidden>
-        <div class="aviso-caja" role="note">
-          <strong>Atención</strong>
-          Al cancelar un flujo se pierde cualquier firma parcial: si algún firmante ya firmó, su firma se descarta y el documento no se podrá recuperar con esa firma.
-          <span id="inicio-reabierto">Esta tarea ya tiene flujos guardados: revíselos o cambie la selección.</span>
-          La revisión puede transferir la tarea al usuario de integración; no cierre esta página hasta terminar.
+          <div id="vista-inicio" hidden>
+            <div class="aviso-caja" role="note">
+              <strong>Atención</strong>
+              Al cancelar un flujo se pierde cualquier firma parcial: si algún firmante ya firmó, su firma se descarta y el documento no se podrá recuperar con esa firma.
+              <span id="inicio-reabierto">Esta tarea ya tiene flujos guardados: revíselos o cambie la selección.</span>
+              La revisión puede transferir la tarea al usuario de integración; no cierre esta página hasta terminar.
+            </div>
+          </div>
+
+          <!-- Resultado de la revision (/cancel/preview). Todo el contenido llega por createElement/textContent. -->
+          <div id="vista-prevista" hidden>
+            <div class="aviso-caja" id="aviso-reasignado" role="note" hidden>
+              <strong>Tarea asignada al usuario de integración</strong>
+              No cierre esta página hasta terminar: la tarea ya no está en su bandeja.
+            </div>
+            <div class="grupo" id="grupo-cancelar" hidden>
+              <h3 class="grupo-titulo" id="titulo-cancelar">Se cancelarán</h3>
+              <ul class="lista-items" id="lista-cancelar"></ul>
+            </div>
+            <div class="grupo destacado" id="grupo-firmados" hidden>
+              <h3 class="grupo-titulo" id="titulo-firmados">Firmados: regularizar, no cancelar</h3>
+              <p class="grupo-ayuda">Estos acuerdos ya fueron firmados por todos en Adobe Sign. No se cancelan: hay que regularizar el flujo de contratación.</p>
+              <ul class="lista-items" id="lista-firmados"></ul>
+            </div>
+            <div class="grupo" id="grupo-resto" hidden>
+              <h3 class="grupo-titulo" id="titulo-resto">No se cancelarán</h3>
+              <ul class="lista-items" id="lista-resto"></ul>
+            </div>
+            <div class="grupo" id="grupo-transitorios" hidden>
+              <h3 class="grupo-titulo" id="titulo-transitorios">No se pudieron revisar</h3>
+              <p class="grupo-ayuda">Falla temporal o tiempo agotado. Use "Revisar de nuevo" para consultarlos otra vez.</p>
+              <ul class="lista-items" id="lista-transitorios"></ul>
+            </div>
+            <p class="nota" id="nota-subflujo-ignorado" hidden>El atributo "ID Subflujo a Cancelar" se ignora porque la lista tiene varios flujos.</p>
+            <p class="nota" id="nota-confirmar"></p>
+            <label class="check" id="caja-parcial" hidden>
+              <input type="checkbox" id="chk-parcial">
+              <span>Entiendo que se perderán las firmas parciales de los flujos marcados como "Firma parcial".</span>
+            </label>
+          </div>
+
+          <!-- Resultado de la cancelacion (/cancel), item a item. -->
+          <div id="vista-resultado" hidden>
+            <ul class="lista-items" id="lista-resultado"></ul>
+          </div>
         </div>
-      </div>
 
-      <ol class="pasos" id="pasos" hidden>
-        <li class="paso" id="paso-guardar" data-estado="pendiente" hidden><span class="paso-icono" aria-hidden="true"></span><span>Guardando y verificando la selección</span></li>
-        <li class="paso" id="paso-asignar" data-estado="pendiente" hidden><span class="paso-icono" aria-hidden="true"></span><span>Asignando la tarea</span></li>
-        <li class="paso" id="paso-trabajo" data-estado="pendiente"><span class="paso-icono" aria-hidden="true"></span><span id="paso-trabajo-texto">Consultando en Adobe Sign</span></li>
-        <li class="paso" id="paso-listo" data-estado="pendiente"><span class="paso-icono" aria-hidden="true"></span><span>Listo</span></li>
-      </ol>
+        <aside class="mesa-lateral" aria-label="Progreso">
+          <ol class="pasos" id="pasos" hidden>
+            <li class="paso" id="paso-guardar" data-estado="pendiente" hidden><span class="paso-icono" aria-hidden="true"></span><span>Guardando y verificando la selección</span></li>
+            <li class="paso" id="paso-asignar" data-estado="pendiente" hidden><span class="paso-icono" aria-hidden="true"></span><span>Asignando la tarea</span></li>
+            <li class="paso" id="paso-trabajo" data-estado="pendiente"><span class="paso-icono" aria-hidden="true"></span><span id="paso-trabajo-texto">Consultando en Adobe Sign</span></li>
+            <li class="paso" id="paso-listo" data-estado="pendiente"><span class="paso-icono" aria-hidden="true"></span><span>Listo</span></li>
+          </ol>
 
-      <!-- Resultado de la revision (/cancel/preview). Todo el contenido llega por createElement/textContent. -->
-      <div id="vista-prevista" hidden>
-        <div class="aviso-caja" id="aviso-reasignado" role="note" hidden>
-          <strong>Tarea asignada al usuario de integración</strong>
-          No cierre esta página hasta terminar: la tarea ya no está en su bandeja.
-        </div>
-        <div class="grupo" id="grupo-cancelar" hidden>
-          <h3 class="grupo-titulo" id="titulo-cancelar">Se cancelarán</h3>
-          <ul class="lista-items" id="lista-cancelar"></ul>
-        </div>
-        <div class="grupo destacado" id="grupo-firmados" hidden>
-          <h3 class="grupo-titulo" id="titulo-firmados">Firmados — regularizar, no cancelar</h3>
-          <p class="grupo-ayuda">Estos acuerdos ya fueron firmados por todos en Adobe Sign. No se cancelan: hay que regularizar el flujo de contratación.</p>
-          <ul class="lista-items" id="lista-firmados"></ul>
-        </div>
-        <div class="grupo" id="grupo-resto" hidden>
-          <h3 class="grupo-titulo" id="titulo-resto">No se cancelarán</h3>
-          <ul class="lista-items" id="lista-resto"></ul>
-        </div>
-        <div class="grupo" id="grupo-transitorios" hidden>
-          <h3 class="grupo-titulo" id="titulo-transitorios">No se pudieron revisar</h3>
-          <p class="grupo-ayuda">Falla temporal o tiempo agotado. Use "Revisar de nuevo" para consultarlos otra vez.</p>
-          <ul class="lista-items" id="lista-transitorios"></ul>
-        </div>
-        <p class="nota" id="nota-subflujo-ignorado" hidden>El atributo "ID Subflujo a Cancelar" se ignora porque la lista tiene varios flujos.</p>
-        <p class="nota" id="nota-confirmar"></p>
-        <label class="check" id="caja-parcial" hidden>
-          <input type="checkbox" id="chk-parcial">
-          <span>Entiendo que se perderán las firmas parciales de los flujos marcados como "Firma parcial".</span>
-        </label>
-      </div>
+          <div class="resultado" id="resultado" hidden><span class="insignia" id="insignia" aria-hidden="true"></span></div>
 
-      <!-- Resultado de la cancelacion (/cancel), item a item. -->
-      <div id="vista-resultado" hidden>
-        <ul class="lista-items" id="lista-resultado"></ul>
-      </div>
+          <p class="estado" id="estado" role="status" aria-live="polite"></p>
+          <p class="acuerdo" id="acuerdo" hidden></p>
+          <ul class="lista-acuerdos" id="lista-acuerdos" hidden></ul>
 
-      <div class="resultado" id="resultado" hidden><span class="insignia" id="insignia" aria-hidden="true"></span></div>
-
-      <p class="estado" id="estado" role="status" aria-live="polite"></p>
-      <p class="acuerdo" id="acuerdo" hidden></p>
-      <ul class="lista-acuerdos" id="lista-acuerdos" hidden></ul>
-
-      <div class="acciones">
-        <button class="btn" type="button" id="btn-revisar" hidden>Revisar flujos</button>
-        <button class="btn peligro" type="button" id="btn-confirmar" hidden>Cancelar estos flujos</button>
-        <button class="btn" type="button" id="btn-reintentar" hidden>Reintentar</button>
-        <button class="btn secundario" type="button" id="btn-cambiar" hidden>Cambiar selección</button>
+          <div class="acciones">
+            <button class="btn" type="button" id="btn-revisar" hidden>Revisar flujos</button>
+            <button class="btn peligro" type="button" id="btn-confirmar" hidden>Cancelar estos flujos</button>
+            <button class="btn" type="button" id="btn-reintentar" hidden>Reintentar</button>
+            <button class="btn secundario" type="button" id="btn-cambiar" hidden>Cambiar selección</button>
+          </div>
+        </aside>
       </div>
     </section>
   </main>
@@ -523,7 +760,7 @@ REASIGNADO_OK
       <h2 id="modal-titulo">Revisar los flujos seleccionados</h2>
       <p id="modal-texto"></p>
       <ul id="modal-lista"></ul>
-      <p class="intro" style="margin:0">Aún no se cancela nada: la cancelación se confirma después de ver el estado de cada acuerdo.<span data-modo="tarea"> Si la tarea no está con el usuario de integración, se transferirá a él.</span></p>
+      <p class="modal-nota">Aún no se cancela nada: la cancelación se confirma después de ver el estado de cada acuerdo.<span data-modo="tarea"> Si la tarea no está con el usuario de integración, se transferirá a él.</span></p>
       <div class="acciones-modal">
         <button class="btn secundario chico" type="button" id="modal-volver">Volver</button>
         <button class="btn chico" type="button" id="modal-aceptar">Guardar y revisar</button>
@@ -586,18 +823,14 @@ REASIGNADO_OK
      BASIC_USER / BASIC_PASS son placeholders: el valor real entra
      solo en el WebReport publicado, nunca en este archivo.
      MODO DIRECTO (WebReport ejecutado sin workflow): no usa REPORT_ID ni el usuario de integracion, pero SI exige
-     CANCEL_DIRECT_ENABLED=true y CANCEL_DIRECT_AUTH_USER/PASS en el servidor (BASIC_USER_DIRECTO / BASIC_PASS_DIRECTO aqui). USUARIO_SOLICITANTE es opcional: login del usuario que abre la pagina,
+     CANCEL_DIRECT_ENABLED=true en el servidor. Usa BASIC_USER / BASIC_PASS, que deben ser la credencial que el servidor acepta
+     en /cancel/direct/auth (CANCEL_DIRECT_AUTH_* si se definen; si no, la de /auth: START_AUTH_* o LOG_*). USUARIO_SOLICITANTE es opcional: login del usuario que abre la pagina,
      solo para la auditoria del servidor (no autoriza nada). Vacio = no se envia. Rellenarlo solo con una tag de OTCS
      que se haya validado en QA para entregar el login.
      ============================================================ */
-  const SERVER_URL = 'https://signature-orchestrator-api-2gim.onrender.com';
+  const SERVER_URL = 'https://legible-chipmunk-only.ngrok-free.app';
   const BASIC_USER = 'ADOBE-LOGS';
   const BASIC_PASS = 'ADOBE-LOGS-PASS';
-  /* Modo directo: credencial PROPIA de POST /cancel/direct/auth. Deben ser IGUALES a CANCEL_DIRECT_AUTH_USER y CANCEL_DIRECT_AUTH_PASS
-     del servidor (sin relacion con BASIC_USER/BASIC_PASS ni con LOG_*). Placeholders: el valor real entra solo en el WebReport publicado.
-     Este WebReport DEBE estar restringido por permisos a un grupo autorizado: quien pueda leer su fuente puede cancelar flujos. */
-  const BASIC_USER_DIRECTO = 'CANCEL-DIRECT';
-  const BASIC_PASS_DIRECTO = 'CANCEL-DIRECT-PASS';
   const REPORT_ID = '12335607';
   const MAX_FLUJOS = 20;
   const ATRIBUTO = 'ID Flujo a Cancelar';
@@ -1241,13 +1474,11 @@ REASIGNADO_OK
 
   async function obtenerFirma(campos) {
     if (CONTEXTO_INVALIDO) throw new Error(MSG_CONTEXTO);
-    /* Modo directo: /cancel/direct/auth con la credencial propia; modo tarea: el /auth de siempre */
-    const usuario = MODO_DIRECTO ? BASIC_USER_DIRECTO : BASIC_USER;
-    const clave = MODO_DIRECTO ? BASIC_PASS_DIRECTO : BASIC_PASS;
-    const cabeceras = { ...CABECERAS, Authorization: 'Basic ' + btoa(usuario + ':' + clave) };
+    /* Modo directo (/cancel/direct/auth) y modo tarea (/auth): la misma credencial Basic (BASIC_USER / BASIC_PASS); cambia la ruta */
+    const cabeceras = { ...CABECERAS, Authorization: 'Basic ' + btoa(BASIC_USER + ':' + BASIC_PASS) };
     const r = await postJson(SERVER_URL + (MODO_DIRECTO ? '/cancel/direct/auth' : '/auth'), campos, cabeceras);
     if (MODO_DIRECTO && r.status === 404) {
-      const err = new Error('La cancelación directa no está habilitada en el servidor (CANCEL_DIRECT_ENABLED y CANCEL_DIRECT_AUTH_USER/PASS).');
+      const err = new Error('La cancelación directa no está habilitada en el servidor (CANCEL_DIRECT_ENABLED y credencial Basic).');
       err.sinReintento = true;
       throw err;
     }

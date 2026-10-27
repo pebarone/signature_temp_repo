@@ -7,10 +7,10 @@
 // no OTCS.
 //   /cancel/preview: só consulta (nada é cancelado nem gravado) e devolve o estado de cada alvo.
 //   /cancel: cancela o lote, grava o resultado no formulário e faz o SendOn; o corpo é o do serviço (complete/sentOn/items).
-// MODO DIRETO (WebReport executado sozinho, sem workflow): /cancel/direct/auth (Basic próprio, CANCEL_DIRECT_AUTH_USER/PASS)
-// emite a assinatura; /cancel/direct/preview e /cancel/direct a verificam com a chave DERIVADA e recebem
+// MODO DIRETO (WebReport executado sozinho, sem workflow): /cancel/direct/auth (Basic de CANCEL_DIRECT_AUTH_* ou, sem elas,
+// o do /auth) emite a assinatura; /cancel/direct/preview e /cancel/direct a verificam com a chave DERIVADA e recebem
 // { targetWorkflowIds, targetSubworkflowId?, requestedBy? } no corpo. Só são montados com CANCEL_DIRECT_ENABLED=true (além de
-// CANCEL_ENABLED e das credenciais diretas); senão caem no 404 padrão. Os alvos ficam vinculados ao HMAC (o /cancel/direct/auth os assina, ver middleware/hmac.js);
+// CANCEL_ENABLED e de uma credencial Basic); senão caem no 404 padrão. Os alvos ficam vinculados ao HMAC (o /cancel/direct/auth os assina, ver middleware/hmac.js);
 // cancelam no Adobe e SEMPRE param o fluxo original; sem tarefa, formulário nem SendOn.
 const express = require('express');
 const { signStart, newNonce } = require('../middleware/hmac');
@@ -52,7 +52,7 @@ function cancelRoutes({
   route('/cancel', 'Cancel', (body) => cancellationService.cancelFromTask(body));
   route('/cancel/preview', 'Cancel preview', (body) => cancellationService.previewFromTask(body));
   if (directEnabled) {
-    // /auth do modo direto: Basic PRÓPRIO (CANCEL_DIRECT_AUTH_*) e assinatura com a chave derivada (escopo 'cancel-direct'):
+    // /auth do modo direto: Basic do modo direto (CANCEL_DIRECT_AUTH_* ou, sem elas, o do /auth) e assinatura com a chave derivada (escopo 'cancel-direct'):
     // mesmo formato { v, timestamp, nonce, signature } do /auth genérico, mas só vale em /cancel/direct*
     router.post('/cancel/direct/auth', directBasicAuth, (req, res) => {
       if (!directKey) return res.status(500).json({ error: 'Server misconfigured.' });

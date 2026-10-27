@@ -4,6 +4,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const path = require('path');
 const { parseWebhookPayload } = require('../server/domain/eventPolicy');
+const { buildExternalId } = require('../server/domain/externalId');
 const {
   buildWorld, seedAgreement, seedAdobeForEvent, webhookPayload, httpError, basicHeader, waitFor, tmpDir,
   INTEGRATION_USER_ID, HUMAN_USER_ID
@@ -761,6 +762,9 @@ test('atributos: na criação (tarefa de início) grava o ID do acordo antes do 
 /* ---------- adoção ---------- */
 
 const EXT = 'otcs|wf=3003|sub=3004|node=1001|attach=2002';
+// externalId como o /start o gera: só este é adotado automaticamente pelo webhook
+const EXT_IDS = { workflowId: '3003', subworkflowId: '3004', nodeId: '1001', attachId: '2002' };
+const signedExt = (world) => buildExternalId(EXT_IDS, world.config.signatureSecret);
 
 test('adoção de acordo em andamento recupera o início pendente e não repete o SendOn já aplicado', async (t) => {
   for (const stage of ['start', 'sign']) {
@@ -768,7 +772,7 @@ test('adoção de acordo em andamento recupera o início pendente e não repete 
       const dbFile = path.join(tmpDir(), 'adopt-start.db');
       const w1 = await buildWorld({ dbFile });
       w1.otcs.addWorkflow('3003', { subprocessId: '3004', stage });
-      w1.adobe.agreements['AG-X'] = { status: 'OUT_FOR_SIGNATURE', externalId: { id: EXT } };
+      w1.adobe.agreements['AG-X'] = { status: 'OUT_FOR_SIGNATURE', externalId: { id: signedExt(w1) } };
       await w1.reconciliation.handleEvent(
         parseWebhookPayload(webhookPayload('AGREEMENT_ACTION_REQUESTED', 'AG-X'))
       ).adoption;
@@ -794,7 +798,7 @@ test('webhook de acordo desconhecido com externalId nosso: adota (adopted=true) 
   const world = await buildWorld();
   world.otcs.addWorkflow('3003', { subprocessId: '3004' });
   world.adobe.agreements['AG-X'] = {
-    id: 'AG-X', name: 'Documento contrato final.pdf', status: 'SIGNED', externalId: { id: EXT },
+    id: 'AG-X', name: 'Documento contrato final.pdf', status: 'SIGNED', externalId: { id: signedExt(world) },
     createdDate: '2026-06-20T10:00:00Z',
     participantSetsInfo: [{ memberInfos: [{ email: 'a@example.com' }, { email: 'b@example.com' }] }]
   };
@@ -820,13 +824,71 @@ test('webhook de acordo desconhecido com externalId nosso: adota (adopted=true) 
 
   // eventos concorrentes do mesmo acordo desconhecido adotam uma vez só
   const w2 = await buildWorld();
-  w2.adobe.agreements['AG-Y'] = { id: 'AG-Y', name: 'Documento a.pdf', status: 'OUT_FOR_SIGNATURE', externalId: { id: EXT } };
+  w2.adobe.agreements['AG-Y'] = { id: 'AG-Y', name: 'Documento a.pdf', status: 'OUT_FOR_SIGNATURE', externalId: { id: signedExt(w2) } };
   const [a, b] = ['n1', 'n2'].map((n) => w2.reconciliation.handleEvent(
     parseWebhookPayload(webhookPayload('AGREEMENT_ACTION_REQUESTED', 'AG-Y', { notificationId: n }))
   ));
   await Promise.all([a.adoption, b.adoption]);
   assert.equal(w2.calls.filter((c) => c[0] === 'adobe.getAgreement').length, 1);
   assert.equal(w2.repo.listEvents('AG-Y').length, 2);
+  await world.close();
+  await w2.close();
+});
+
+test('webhook de acordo desconhecido com externalId sem firma válida: não adota nem toca no OTCS', async () => {
+  const world = await buildWorld();
+  world.otcs.addWorkflow('3003', { subprocessId: '3004' });
+  const good = signedExt(world);
+  const other = buildExternalId({ ...EXT_IDS, nodeId: '9999' }, world.config.signatureSecret);
+  const forged = [
+    ['AG-UNSIGNED', EXT],
+    ['AG-FORGED', `${EXT}|sig=${'0'.repeat(32)}`],
+    ['AG-WRONGKEY', buildExternalId(EXT_IDS, 'otro-secreto')],
+    // assinatura válida de OUTROS ids reaproveitada num node diferente
+    ['AG-REUSED', `${EXT.replace('node=1001', 'node=9998')}|sig=${other.split('|sig=')[1]}`],
+    ['AG-GARBAGE', `${EXT}|sig=zz`]
+  ];
+  for (const [id, ext] of forged) {
+    world.adobe.agreements[id] = { id, name: 'Documento a.pdf', status: 'SIGNED', externalId: { id: ext } };
+    const result = world.reconciliation.handleEvent(parseWebhookPayload(webhookPayload('AGREEMENT_WORKFLOW_COMPLETED', id)));
+    await result.adoption;
+    assert.equal(world.repo.has(id), false, id);
+  }
+  assert.equal(world.otcs.versions.length, 0);
+  assert.equal(world.otcs.uploads.length, 0);
+  assert.equal(world.otcs.sendons.length, 0);
+  assert.equal(world.logger.lines.warn.filter((l) => /sin firma válida/.test(l)).length, forged.length);
+  const all = Object.values(world.logger.lines).flat().join('\n');
+  assert.ok(!all.includes('0'.repeat(32)) && !all.includes(good.split('|sig=')[1]), 'não registra assinaturas');
+
+  // lembrado como "não nosso": o mesmo acordo não volta a consultar o Adobe
+  const before = world.calls.filter((c) => c[0] === 'adobe.getAgreement').length;
+  await world.reconciliation.handleEvent(parseWebhookPayload(webhookPayload('AGREEMENT_CREATED', 'AG-UNSIGNED', { notificationId: 'again' }))).adoption;
+  assert.equal(world.calls.filter((c) => c[0] === 'adobe.getAgreement').length, before);
+  await world.close();
+});
+
+test('webhook com externalId assinado copiado de um acordo real: não adota, nem com o acordo real já encerrado', async () => {
+  const world = await buildWorld();
+  seedAgreement(world, 'AG-REAL');
+  world.adobe.agreements['AG-COPY'] = { id: 'AG-COPY', name: 'Documento a.pdf', status: 'SIGNED', externalId: { id: signedExt(world) } };
+  await world.reconciliation.handleEvent(parseWebhookPayload(webhookPayload('AGREEMENT_WORKFLOW_COMPLETED', 'AG-COPY'))).adoption;
+  assert.equal(world.repo.has('AG-COPY'), false);
+  assert.equal(world.otcs.versions.length, 0);
+  assert.equal(world.otcs.uploads.length, 0);
+  assert.equal(world.otcs.sendons.length, 0);
+  assert.ok(world.logger.has('warn', /flujo ya registrado \(AG-REAL\)/));
+
+  // acordo real já encerrado: a cópia continua bloqueada (o PDF não pode virar versão do DocID depois do fim do fluxo)
+  const w2 = await buildWorld();
+  seedAgreement(w2, 'AG-REAL', { finalKind: 'final_ok', sendonDone: true, state: 'completed' });
+  w2.adobe.agreements['AG-COPY'] = { id: 'AG-COPY', name: 'Documento a.pdf', status: 'OUT_FOR_SIGNATURE', externalId: { id: signedExt(w2) } };
+  await w2.reconciliation.handleEvent(parseWebhookPayload(webhookPayload('AGREEMENT_ACTION_REQUESTED', 'AG-COPY'))).adoption;
+  assert.equal(w2.repo.has('AG-COPY'), false);
+  assert.equal(w2.otcs.versions.length, 0);
+  assert.equal(w2.otcs.uploads.length, 0);
+  assert.equal(w2.otcs.sendons.length, 0);
+  assert.ok(w2.logger.has('warn', /flujo ya registrado \(AG-REAL\)/));
   await world.close();
   await w2.close();
 });
