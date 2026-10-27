@@ -92,6 +92,7 @@ START_FIELD_DOCID=DocID               # labels of the start task form attributes
 START_FIELD_ATTACHID=AttachID
 START_FIELD_DOCNAME=Nombre del Documento
 START_FIELD_EMAILS=Email Firmante 1,Email Firmante 2
+START_FIELD_DUE_DATE=DUE_DATE         # hidden attribute: days (1-365) to sign; sent to Adobe as expirationTime on creation. Empty => no expiration
 # WebReport migration window ONLY (both OFF by default; each use logs a warn). Legacy always validates against the OTCS
 START_LEGACY_SIGNATURE=false          # true => accepts GET /auth and the v1 signature (timestamp only) on POST /start
 START_LEGACY_GET_ENABLED=false        # true => accepts the old GET /start?userEmail1=... contract (no HMAC)
@@ -102,6 +103,8 @@ DISPOSITION_REJECTED=Rechazado
 DISPOSITION_EXPIRED=Rechazado         # the maps only have Firmado/Rechazado; Rechazado ends the flow. Empty => needs_attention
 DISPOSITION_RECALLED=Rechazado        # empty => needs_attention
 DISPOSITION_CONVERSION_FAILED=Rechazado  # empty => needs_attention
+EXPIRED_STOP_WORKFLOW=true            # expired agreement: after the disposition (SendOn with the "caducidad" comment) STOPS the flow in the Content Server;
+                                      #   needs the integration user's permission to stop processes. false => only the disposition
 
 # Resilience (defaults shown; see docs/REGLAS_DEL_FLUJO.md)
 ATTENTION_RETRY_HOURS=6               # needs_attention for "retries exhausted" reopens by itself after N hours (0 = never)
@@ -352,7 +355,8 @@ rules (states, stages, retry/attention/reopen, adoption) are in [`docs/REGLAS_DE
 |---|---|
 | `AGREEMENT_WORKFLOW_COMPLETED` (or `AGREEMENT_ACTION_COMPLETED` with `agreement.status = SIGNED`) | write the final PDF (with audit report) as a **new version of the same node** (`nodeId`) that was sent to sign — folder `attachId` only as a fallback if the node no longer exists — then disposition `Firmado` on the signing task |
 | `AGREEMENT_REJECTED` | disposition `Rechazado` (no PDF) |
-| `AGREEMENT_EXPIRED`, `AGREEMENT_RECALLED`, `AGREEMENT_AUTO_CANCELLED_CONVERSION_PROBLEM` | disposition `DISPOSITION_*` (default `Rechazado`, the only other action in the maps); empty => `needs_attention`. Exception: an agreement closed by a cancellation request (see "Flow cancellation") ignores the `RECALLED` echo — history only |
+| `AGREEMENT_EXPIRED` | disposition `DISPOSITION_EXPIRED` (default `Rechazado`) with the comment "Flujo cancelado por caducidad...", then, with `EXPIRED_STOP_WORKFLOW=true` (default), **stops the parent flow** in the Content Server (a stop failure is retried; the `SendOn` is not repeated). The deadline comes from the `DUE_DATE` workflow attribute (days) sent to Adobe as `expirationTime` on `/start`; Adobe owns the deadline. Not yet validated in QA: `expirationTime`, reading a hidden attribute and the stop after the `SendOn` (see `docs/REGLAS_DEL_FLUJO.md` 4.5) |
+| `AGREEMENT_RECALLED`, `AGREEMENT_AUTO_CANCELLED_CONVERSION_PROBLEM` | disposition `DISPOSITION_*` (default `Rechazado`, the only other action in the maps); empty => `needs_attention`. Exception: an agreement closed by a cancellation request (see "Flow cancellation") ignores the `RECALLED` echo — history only |
 | `AGREEMENT_DOCUMENTS_DELETED` | `needs_attention` |
 | informational / unavailable / unknown events | history only |
 

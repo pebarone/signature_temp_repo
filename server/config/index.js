@@ -125,7 +125,9 @@ function computeConfig(env = process.env, { projectRoot = PROJECT_ROOT } = {}) {
       docId: str(env.START_FIELD_DOCID, 'DocID'),
       attachId: str(env.START_FIELD_ATTACHID, 'AttachID'),
       docName: str(env.START_FIELD_DOCNAME, 'Nombre del Documento'),
-      emails: list(env.START_FIELD_EMAILS, ['Email Firmante 1', 'Email Firmante 2'])
+      emails: list(env.START_FIELD_EMAILS, ['Email Firmante 1', 'Email Firmante 2']),
+      // Atributo (oculto) com o prazo da assinatura, em dias; vazio desliga a leitura (o acordo fica sem expiração)
+      dueDate: str(env.START_FIELD_DUE_DATE, 'DUE_DATE')
     },
     // Só para a janela de migração dos WebReports: assinatura v1 (só timestamp) e GET /start sem HMAC
     startLegacySignature: bool(env.START_LEGACY_SIGNATURE, false),
@@ -185,6 +187,10 @@ function computeConfig(env = process.env, { projectRoot = PROJECT_ROOT } = {}) {
       recalled: str(env.DISPOSITION_RECALLED, 'Rechazado'),
       conversionFailed: str(env.DISPOSITION_CONVERSION_FAILED, 'Rechazado')
     },
+    // true => acordo expirado no Adobe (FINAL_EXPIRED): depois da disposição (SendOn com o comentário de caducidad) o
+    // orquestrador PARA o fluxo original no Content (PUT /v2/processes/{id}/status). Exige permissão do usuário de integração
+    // para parar processos; false = comportamento antigo (só a disposição)
+    expiredStopWorkflow: bool(env.EXPIRED_STOP_WORKFLOW, true),
     // Tarefas localizadas pelo nome (GET /v2/workflows/status/processes/{id}); o nome normalizado COMEÇA com um destes
     signTaskNames: list(env.SIGN_TASK_NAMES, ['Aguardar Firma']),
     startTaskNames: list(env.START_TASK_NAMES, ['Enviar solicitud de firma']),

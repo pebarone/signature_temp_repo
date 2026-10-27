@@ -12,6 +12,7 @@ const state = require('../domain/agreementState');
 const { locate, normalizeName } = require('../domain/workflowSteps');
 const { parseExternalId, verifyExternalId, isId } = require('../domain/externalId');
 const { describeError } = require('../infra/util');
+const { createWorkflowStopper } = require('./workflowStop');
 
 const { ATTENTION_KINDS } = state;
 
@@ -27,6 +28,8 @@ const DISPOSITION_COMMENTS = {
   [KINDS.FINAL_RECALLED]: () => 'Acuerdo cancelado en Adobe Sign',
   [KINDS.FINAL_CONVERSION_FAILED]: () => 'Adobe Sign no pudo procesar el documento'
 };
+// Expirado com EXPIRED_STOP_WORKFLOW: o comentário do SendOn explica por que o fluxo é parado em seguida
+const EXPIRED_STOP_COMMENT = (id) => `Flujo cancelado por caducidad: el acuerdo ${id} expiró en Adobe Sign sin ser firmado`;
 
 // Erro de negócio da adoção manual (status HTTP sugerido para o /admin/adopt)
 class AdoptError extends Error {
@@ -64,6 +67,9 @@ function createReconciliationService({
   const held = new Set();       // ids com cancelamento em curso (hold)
 
   const nowIso = () => now().toISOString();
+  const stopWorkflow = createWorkflowStopper({ otcs, logger, tag: '[EXPIRED]' });
+  // Acordo expirado que, depois da disposição, também para o fluxo no Content (EXPIRED_STOP_WORKFLOW)
+  const stopsOnExpiry = (rec) => rec.finalKind === KINDS.FINAL_EXPIRED && !!config.expiredStopWorkflow;
 
   /*
     Cancelamento em curso (services/cancellationService.js): do pedido ao Adobe até o acordo ser marcado como encerrado,
@@ -457,6 +463,34 @@ function createReconciliationService({
   }
 
   /*
+    Expirado: para o fluxo (rec.workflowId, o pai/WORKID, mesmo alvo do cancelamento) depois do SendOn da tarefa de firma, que
+    já levou o comentário de caducidad (a API do OTCS não tem comentário avulso e o stop não aceita comentário, e um processo
+    parado não recebe SendOn: por isso a ordem é SendOn e depois stop). Idempotente: 'already_stopped' (inclusive o fluxo já
+    encerrado pelo ramo Rechazado) vale como sucesso. Falha => registerFailure e a tentativa seguinte refaz só o stop
+    (workflowStopPending). Conclui o acordo com a disposição enviada (action).
+  */
+  async function stopExpiredWorkflow(id, rec, plan, action) {
+    const stop = await stopWorkflow(rec.workflowId);
+    if (typeof stop !== 'string') {
+      const permissions = [400, 401, 403].includes(stop.httpStatus)
+        ? '; verifique los permisos del usuario de integración para detener procesos' : '';
+      return {
+        result: registerFailure(id, 'disposition', new Error(
+          `no se pudo detener el flujo ${rec.workflowId} tras la caducidad del acuerdo${stop.httpStatus ? ` (HTTP ${stop.httpStatus})` : ''}${permissions}`
+        ))
+      };
+    }
+    clearTimeout_(id);
+    rec = repo.upsert(id, {
+      ...state.completedPatch(plan, action, nowIso()),
+      workflowStopPending: false,
+      workflowStoppedAt: nowIso()
+    });
+    logger.info(`[${id}] flujo ${rec.workflowId} cancelado por caducidad del acuerdo (${stop === 'stopped' ? 'detenido' : 'ya estaba detenido/concluido'})`);
+    return { result: { status: 'completed', record: rec } };
+  }
+
+  /*
     disposition: localiza a tarefa de firma pelo nome, SÓ no subprocesso do acordo (pode ser diferente do processo), e a
     conclui. Tarefa já concluída fora da integração => conclui sem enviar nada (não é needs_attention).
     Tarefa em mais de um subprocesso sem dica clara => needs_attention permanente, sem SendOn.
@@ -467,6 +501,13 @@ function createReconciliationService({
       return {
         result: markAttention(id, 'acuerdo sin workflowId: no se puede ejecutar la disposición', ATTENTION_KINDS.PERMANENT)
       };
+    }
+
+    // Expirado com o SendOn já feito (workflowStopPending): falta só o stop. Antes de localizar a tarefa: depois do SendOn o
+    // fluxo pode ter avançado, a tarefa pode nem aparecer mais no step_list, ou a leitura do processo falhar (ex.: 404 de um
+    // fluxo já encerrado); nada disso impede o stop, que é idempotente.
+    if (stopsOnExpiry(rec) && rec.workflowStopPending) {
+      return stopExpiredWorkflow(id, rec, plan, rec.disposition || disposition);
     }
 
     let located;
@@ -502,6 +543,10 @@ function createReconciliationService({
     rec = repo.upsert(id, { signSubprocessId: String(t.subprocessId), signTaskId: t.taskId });
 
     if (located.where === 'completed') {
+      // Expirado: a tarefa foi concluída por nós (SendOn com o comentário) e falta parar o fluxo; não é conclusão externa
+      if (stopsOnExpiry(rec) && rec.workflowStopPending) {
+        return stopExpiredWorkflow(id, rec, plan, rec.disposition || disposition);
+      }
       clearTimeout_(id);
       rec = repo.upsert(id, state.completedPatch(plan, disposition, nowIso(), { externally: true }));
       logger.info(`[${id}] tarea ${t.taskId} "${t.name}" ya concluida fuera de la integración: sin disposición`);
@@ -548,7 +593,9 @@ function createReconciliationService({
         subworkflowId: t.subprocessId,
         taskId: t.taskId,
         disposition: action,
-        comment: (DISPOSITION_COMMENTS[rec.finalKind] || (() => action))(id)
+        comment: stopsOnExpiry(rec)
+          ? EXPIRED_STOP_COMMENT(id)
+          : (DISPOSITION_COMMENTS[rec.finalKind] || (() => action))(id)
       });
     } catch (e) {
       // A tarefa pode ter sido concluída entre a consulta e o PUT, inclusive com a resposta do PUT perdida.
@@ -561,6 +608,9 @@ function createReconciliationService({
             && String(s.subprocessId) === String(t.subprocessId)
             && String(s.taskId) === String(t.taskId));
           if (completed) {
+            if (stopsOnExpiry(rec) && rec.workflowStopPending) {
+              return stopExpiredWorkflow(id, rec, plan, rec.disposition || action);
+            }
             clearTimeout_(id);
             rec = repo.upsert(id, state.completedPatch(plan, action, nowIso(), { externally: true }));
             logger.info(`[${id}] tarea ${t.taskId} ya concluida al confirmar el error del envío: sin nueva disposición`);
@@ -572,6 +622,12 @@ function createReconciliationService({
         }
       }
       return { result: registerFailure(id, 'disposition', e) };
+    }
+    if (stopsOnExpiry(rec)) {
+      // Persiste antes do stop (sem sendonDone): se ele falhar, a retentativa não vê a tarefa já concluída como externa
+      rec = repo.upsert(id, { workflowStopPending: true, disposition: action });
+      logger.info(`[${id}] SendOn task ${t.taskId} (${action}) done for workflow ${t.processId}/${t.subprocessId}; deteniendo el flujo ${rec.workflowId} por caducidad`);
+      return stopExpiredWorkflow(id, rec, plan, action);
     }
     clearTimeout_(id);
     rec = repo.upsert(id, state.completedPatch(plan, action, nowIso()));

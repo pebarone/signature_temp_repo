@@ -27,7 +27,7 @@ Cada etapa só roda se a anterior concluiu, grava seu resultado no SQLite e, se 
 |---|---|---|---|---|---|
 | `AGREEMENT_WORKFLOW_COMPLETED`; `AGREEMENT_ACTION_COMPLETED` com `status=SIGNED`; polling `SIGNED` | final OK (exige `SIGNED` confirmado no Adobe) | sim: nova versão do `nodeId` | `DISPOSITION_SIGNED` = `Firmado` | `completed` | estado Adobe `SIGNED`, integração `pdf_delivered` antes da disposição |
 | `AGREEMENT_REJECTED`; polling `CANCELLED` + evento `REJECTED`/`ACTION_REJECTED` | recusado | não | `DISPOSITION_REJECTED` = `Rechazado` | `rejected` | idem |
-| `AGREEMENT_EXPIRED`; polling `EXPIRED` | expirado | não | `DISPOSITION_EXPIRED` = `Rechazado` | `expired` | idem |
+| `AGREEMENT_EXPIRED`; polling `EXPIRED` | expirado (prazo `DUE_DATE` vencido; seção 4.5) | não | `DISPOSITION_EXPIRED` = `Rechazado`, com o comentário de caducidad, e depois **stop do fluxo** (`EXPIRED_STOP_WORKFLOW`) | `expired` | idem |
 | `AGREEMENT_RECALLED`; polling `CANCELLED` sem recusa | cancelado | não | `DISPOSITION_RECALLED` = `Rechazado` (**exceto** acordo já encerrado por pedido de cancelamento: sem disposição, seção 10) | `cancelled` | idem |
 | `AGREEMENT_AUTO_CANCELLED_CONVERSION_PROBLEM` | falha de conversão | não | `DISPOSITION_CONVERSION_FAILED` = `Rechazado` | `cancelled` | idem |
 | `AGREEMENT_DOCUMENTS_DELETED`; polling `ABORTED` | exige intervenção | não | nenhuma | `needs_attention` (`event`) | integração `needs_attention` |
@@ -41,7 +41,8 @@ Todo resultado final desta tabela é confirmado no Adobe antes do PDF e da dispo
 outro resultado final, vale o dele.
 
 Comentário gravado na tarefa: `Firmado en Adobe Sign (acuerdo <id>)`, `Rechazado por el firmante en Adobe Sign`,
-`Acuerdo expirado en Adobe Sign`, `Acuerdo cancelado en Adobe Sign`, `Adobe Sign no pudo procesar el documento`.
+`Acuerdo expirado en Adobe Sign` (com `EXPIRED_STOP_WORKFLOW=true`, o padrão: `Flujo cancelado por caducidad: el acuerdo <id> expiró en
+Adobe Sign sin ser firmado`), `Acuerdo cancelado en Adobe Sign`, `Adobe Sign no pudo procesar el documento`.
 
 ## 3. Máquina de estados
 
@@ -197,6 +198,45 @@ Uma lista de ações vazia em formulário legível significa disposição indisp
 consulta de novo o processo: a mesma tarefa já concluída é tratada como conclusão externa, sem reenviar; senão o 4xx
 também é retry com backoff (não vai direto para `needs_attention`).
 
+### 4.5 Prazo de 15 dias e caducidad (DUE_DATE)
+**Prazo no `/start`.** O workflow tem um atributo oculto `DUE_DATE` (inteiro, em dias; rótulo em `START_FIELD_DUE_DATE`, vazio
+desliga). O `/start` o lê pelo rótulo no formulário da tarefa; por ser oculto, se não vier no formulário tenta os atributos do
+subprocesso e depois os do processo (`GET /v2/workflows/status/info`). Aceita `15`, `" 15 "` e `15.0`; só vale inteiro de 1 a 365.
+Vazio ou ausente: **silencioso** (sem aviso), o acordo é criado sem expiração. Inválido (texto, 0, negativo, fracionário, > 365) ou
+erro na leitura: **aviso** no log e o acordo é criado sem expiração (o `DUE_DATE` nunca derruba o `/start`). A leitura (inclusive o
+fallback por atributos) só acontece quando o acordo vai mesmo ser criado: a recarga da página, que devolve o acordo existente, não a faz. Com o valor, o acordo é criado no Adobe com `expirationTime` = agora + dias (ISO 8601).
+O prazo é do Adobe: o orquestrador não conta tempo, só reage ao `AGREEMENT_EXPIRED`/`EXPIRED`. A leitura acontece na chamada
+que cria o acordo (o `409 REASSIGN_REQUIRED` não a faz) e só com `START_VERIFY_WORKFLOW=true` (ou caminho legado, que também
+valida): só `START_VERIFY_WORKFLOW=false` não lê nada do OTCS e deixa o acordo sem expiração.
+
+**Caducidad (`EXPIRED_STOP_WORKFLOW=true`, padrão).** A API do OTCS não tem comentário avulso em workflow (só o `comment` do
+SendOn) e um processo parado não recebe SendOn; por isso, no resultado final expirado a ordem é: (1) SendOn da tarefa de firma com
+`DISPOSITION_EXPIRED` e o comentário de caducidad; (2) stop do processo `workflowId` (o pai/WORKID, o mesmo alvo do
+cancelamento, `PUT /v2/processes/{id}/status`). O usuário de integração precisa de permissão para parar processos. Stop recusado
+com o processo já parado/concluído (inclusive quando o ramo `Rechazado` já encerrou o fluxo) conta como sucesso.
+Persistência (migração v5): `workflow_stop_pending` marca o SendOn feito com o stop ainda por fazer; `workflow_stopped_at` registra
+o stop. Se o stop falhar, é falha da etapa `disposition` (retry com backoff, depois `retries_exhausted`); a tentativa seguinte
+**não** repete o SendOn e só refaz o stop (sem a marca, uma tarefa concluída é conclusão externa e **não** para o fluxo). O acordo só fica `sendon_done` com o stop feito. Só o resultado expirado para o fluxo; assinado, recusado e
+cancelado não. Não usa `cancel_requested_at` (isso é "cancelado por pedido"). `EXPIRED_STOP_WORKFLOW=false`: comportamento
+antigo (só a disposição, comentário `Acuerdo expirado en Adobe Sign`).
+
+Com o stop pendente, a retentativa o refaz **antes** de localizar a tarefa de firma: mesmo com a tarefa ausente do `step_list` ou
+com a leitura do processo falhando (ex.: 404), o stop é tentado.
+
+**Riscos aceitos:**
+- Janela de queda entre o SendOn bem-sucedido e a gravação de `workflow_stop_pending`: a retentativa vê a tarefa concluída, trata
+  como conclusão externa e **não** para o fluxo (que fica parado em "Rechazado"/seguinte; parar à mão).
+- Se o Adobe recusar o `expirationTime`, o `/start` falha para os fluxos com `DUE_DATE` (500 genérico; de propósito não há
+  retentativa silenciosa sem o prazo, para nunca criar um acordo sem a caducidad que o fluxo pediu).
+- Prazo além da janela do polling (`dias + 1 >= POLL_MAX_AGE_DAYS`, padrão 90): o `/start` mantém o prazo e só avisa no log; a
+  caducidad passa a depender só do webhook (sem ele, o acordo deixa de ser consultado antes de vencer). Com os 15 dias pedidos
+  isso não ocorre.
+- O Adobe bloqueia a assinatura no prazo, mas pode levar até 12 h para passar o acordo a `EXPIRED`; o comentário e o stop no OTCS
+  vêm depois disso e ainda dependem do processamento (webhook ou polling) e de eventuais retentativas.
+
+**Não validado em QA:** o campo `expirationTime` na criação do acordo (REST v6; se o Adobe o aceita no formato enviado), a leitura
+de um atributo oculto pelo formulário e por `status/info`, e o stop pelo usuário de integração depois do SendOn.
+
 ## 5. Retry, atenção e reabertura
 
 - **Backoff**: `RETRY_BASE_MS` × 2^(n−1), limitado a `RETRY_MAX_MS` (1 min … 1 h).
@@ -293,6 +333,8 @@ incluídos nos formulários dessas tarefas:
 | `SIGN_TASK_ID` | `3` | **obsoleto** |
 | `DISPOSITION_SIGNED` / `_REJECTED` | `Firmado` / `Rechazado` | ações da tarefa de firma |
 | `DISPOSITION_EXPIRED` / `_RECALLED` / `_CONVERSION_FAILED` | `Rechazado` | vazio ⇒ `needs_attention` |
+| `EXPIRED_STOP_WORKFLOW` | `true` | acordo expirado: depois da disposição (com o comentário de caducidad) para o fluxo no Content; exige permissão de stop (seção 4.5) |
+| `START_FIELD_DUE_DATE` | `DUE_DATE` | rótulo do atributo oculto com o prazo em dias (1 a 365) enviado ao Adobe como `expirationTime`; vazio desliga (seção 4.5) |
 | `ATTENTION_RETRY_HOURS` | `6` | reabertura automática de `retries_exhausted` (0 desliga) |
 | `ADOPT_UNKNOWN_AGREEMENTS` | `true` | adoção de acordo desconhecido pelo `externalId` assinado |
 | `WEBHOOK_CLIENT_IDS` | vazio | ClientIds extras aceitos no webhook além do `CLIENT_ID` |

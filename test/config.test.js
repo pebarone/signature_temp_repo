@@ -181,3 +181,12 @@ test('config: ADOBE_TIMEOUT_MS e RETRY_MAX_ATTEMPTS (padrões e limites)', () =>
   assert.equal(cfg({ RETRY_MAX_ATTEMPTS: '3' }).backoff.maxAttempts, 3);
   assert.equal(cfg({ RETRY_MAX_ATTEMPTS: 'x' }).backoff.maxAttempts, 10);
 });
+
+test('caducidad: EXPIRED_STOP_WORKFLOW liga por padrão e START_FIELD_DUE_DATE tem rótulo padrão', () => {
+  const c = cfg({});
+  assert.equal(c.expiredStopWorkflow, true);
+  assert.equal(c.startFields.dueDate, 'DUE_DATE');
+  const o = cfg({ EXPIRED_STOP_WORKFLOW: 'false', START_FIELD_DUE_DATE: '' });
+  assert.equal(o.expiredStopWorkflow, false);
+  assert.equal(o.startFields.dueDate, '', 'vazio desliga a leitura do prazo');
+});

@@ -73,9 +73,9 @@ function makeAdobe(calls = []) {
       calls.push(['adobe.transient', fileName]);
       return 'transient-1';
     },
-    async createAgreement({ name, transientDocumentId, emails, externalId }) {
+    async createAgreement({ name, transientDocumentId, emails, externalId, expirationTime }) {
       const id = `AG-${adobe.created.length + 1}`;
-      adobe.created.push({ id, name, transientDocumentId, emails, externalId });
+      adobe.created.push({ id, name, transientDocumentId, emails, externalId, ...(expirationTime ? { expirationTime } : {}) });
       adobe.agreements[id] = { id, name, status: 'OUT_FOR_SIGNATURE', ...(externalId ? { externalId: { id: externalId } } : {}) };
       calls.push(['adobe.createAgreement', id]);
       return { id };

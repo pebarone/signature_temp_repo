@@ -86,6 +86,13 @@ const MIGRATIONS = [
   ALTER TABLE agreements ADD COLUMN cancel_requested_at TEXT;
   ALTER TABLE agreements ADD COLUMN cancel_source TEXT;
   CREATE INDEX idx_agreements_workflow ON agreements(workflow_id);
+  `,
+  // v5: acordo expirado no Adobe (EXPIRED_STOP_WORKFLOW). workflow_stop_pending marca que o SendOn da tarefa de firma (com o
+  // comentário de caducidad) já foi feito e falta parar o fluxo no Content; assim a retentativa não confunde a tarefa já
+  // concluída por nós com uma concluída por uma pessoa. workflow_stopped_at registra quando o fluxo foi parado.
+  `
+  ALTER TABLE agreements ADD COLUMN workflow_stop_pending INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE agreements ADD COLUMN workflow_stopped_at TEXT;
   `
 ];
 

@@ -6,6 +6,7 @@ const { buildExternalId } = require('../domain/externalId');
 const { locate, normalizeName } = require('../domain/workflowSteps');
 const { isPdf, sniffType, TYPE_LABELS } = require('../domain/documentType');
 const { finalNotice } = require('../domain/agreementState');
+const { parseDueDays, expirationFrom } = require('../domain/dueDate');
 
 class ServiceError extends Error {
   constructor(status, body) {
@@ -59,6 +60,9 @@ function fieldValue(fields, label) {
   const v = entry && typeof entry === 'object' ? entry.value : undefined;
   return v === undefined || v === null || typeof v === 'object' ? '' : String(v).trim();
 }
+
+// Atributos do workflow ({ rótulo: valor }, de getWorkflowAttributes) no formato dos campos do formulário ({ rótulo: { value } })
+const attrsToFields = (attrs) => Object.fromEntries(Object.entries(attrs || {}).map(([label, value]) => [label, { value }]));
 
 /*
   onCreated(id, ctx): chamado depois de gravar o acordo (em background); executa a etapa start da reconciliação
@@ -139,6 +143,34 @@ function createSignatureService({ repo, adobe, otcs, logger, config, now = () =>
   }
 
   /*
+    Prazo da assinatura em dias (atributo oculto DUE_DATE; rótulo em config.startFields.dueDate, vazio desliga). Um atributo
+    oculto pode não vir no formulário da tarefa: nesse caso tenta os atributos do subprocesso e depois os do processo
+    (getWorkflowAttributes). Best effort: NUNCA falha o /start; sem valor ou com valor inválido devolve null (o acordo fica
+    sem expiração, como antes).
+  */
+  async function resolveDueDays(fields, task, fromAttributes) {
+    const label = config.startFields.dueDate;
+    if (!label) return null;
+    let raw = fieldValue(fields, label);
+    if (!raw && !fromAttributes) {
+      const ids = [...new Set([task.subprocessId, task.processId].map(String))];
+      for (const pid of ids) {
+        try {
+          raw = fieldValue(attrsToFields(await otcs.getWorkflowAttributes(pid)), label);
+        } catch (e) {
+          logger.warn(`[START] No se pudo leer el atributo "${label}" del workflow ${pid}; el acuerdo se crea sin vencimiento: ${describeError(e)}`);
+        }
+        if (raw) break;
+      }
+    }
+    const { days, invalid } = parseDueDays(raw);
+    if (invalid) {
+      logger.warn(`[START] Atributo "${label}" inválido ("${raw.slice(0, 40)}"; se espera un número entero de días entre 1 y 365); el acuerdo se crea sin vencimiento`);
+    }
+    return days;
+  }
+
+  /*
     START_VERIFY_WORKFLOW: o OTCS é a fonte da verdade. Localiza a tarefa de início (precisa estar "current") e lê
     DocID/AttachID/nome/e-mails do OTCS; devolve { workflowId, subworkflowId, taskId, nodeId, attachId, docName, emails, handoff }.
     Origem dos atributos:
@@ -206,6 +238,7 @@ function createSignatureService({ repo, adobe, otcs, logger, config, now = () =>
     };
 
     let fields;
+    let fromAttributes = false; // fields já veio de getWorkflowAttributes do processo (fluxo puro)
     if (assigned) {
       let form;
       try {
@@ -230,7 +263,8 @@ function createSignatureService({ repo, adobe, otcs, logger, config, now = () =>
         logger.error(`[START] OTCS getWorkflowAttributes(${task.processId}) falló: ${describeError(e)}`);
         throw otcsUnavailable();
       }
-      fields = Object.fromEntries(Object.entries(attrs || {}).map(([label, value]) => [label, { value }]));
+      fields = attrsToFields(attrs);
+      fromAttributes = true;
     } else {
       // Sub-workflow: status/info só devolve os atributos do pai e o formulário exige a tarefa no usuário de integração.
       // A regra é reatribuir só com acordo gerado: aqui ainda não há, então valida antes o que as dicas do corpo permitem
@@ -281,6 +315,9 @@ function createSignatureService({ repo, adobe, otcs, logger, config, now = () =>
       attachId,
       docName: docName || clean(input.docName),
       emails,
+      // Leitura do prazo adiada: o /start só a chama quando o acordo vai mesmo ser criado (recarga da página, que devolve o
+      // acordo existente, não faz as consultas extras de atributos). O REASSIGN_REQUIRED acima nunca chega aqui.
+      readDueDays: () => resolveDueDays(fields, task, fromAttributes),
       handoff
     };
   }
@@ -326,6 +363,9 @@ function createSignatureService({ repo, adobe, otcs, logger, config, now = () =>
     let { docName } = input;
     let emails;
     let handoff;
+    // Prazo em dias. Só START_VERIFY_WORKFLOW=false não lê nada do OTCS e deixa o acordo sem expiração; o caminho legado
+    // (GET /start e assinatura v1, forceVerify) passa por resolveFromWorkflow e lê o DUE_DATE como o normal.
+    let readDueDays = null;
     const verified = config.startVerifyWorkflow || forceVerify;
     if (verified) {
       const resolved = await resolveFromWorkflow(input);
@@ -334,7 +374,7 @@ function createSignatureService({ repo, adobe, otcs, logger, config, now = () =>
       // OUTROS fluxos). resolved.existing: a tarefa de início já avançou, o mais recente em qualquer estado
       const known = resolved.existing || currentCycleAgreement(resolved.workflowId, resolved.subworkflowId, resolved.nodeId);
       if (known) return existingResult(known, handoff);
-      ({ workflowId, subworkflowId, taskId, nodeId, attachId, docName, emails } = resolved);
+      ({ workflowId, subworkflowId, taskId, nodeId, attachId, docName, emails, readDueDays } = resolved);
     } else {
       emails = parseEmails(input.userEmail1, input.userEmail2);
       if (!emails.length || !nodeId) throw new ServiceError(400, { error: 'Node ID and Email are mandatory.' });
@@ -365,12 +405,25 @@ function createSignatureService({ repo, adobe, otcs, logger, config, now = () =>
 
         const transientDocumentId = await adobe.createTransientDocument(content, fileName);
         const subId = String(subworkflowId || workflowId || '');
+        const dueDays = readDueDays ? await readDueDays() : null;
+        const expirationTime = dueDays ? expirationFrom(now(), dueDays) : undefined;
         const ag = await adobe.createAgreement({
           name: `Documento ${fileName}`,
           transientDocumentId,
           emails,
-          externalId: buildExternalId({ workflowId, subworkflowId: subId, nodeId, attachId }, config.signatureSecret)
+          externalId: buildExternalId({ workflowId, subworkflowId: subId, nodeId, attachId }, config.signatureSecret),
+          ...(expirationTime ? { expirationTime } : {})
         });
+        if (expirationTime) logger.info(`[START] Acuerdo ${ag.id}: vence en ${dueDays} días (${expirationTime})`);
+        // O polling para de consultar acordos mais velhos que POLL_MAX_AGE_DAYS; o EXPIRED pode chegar até 12 h depois do
+        // prazo (margem de 1 dia). O prazo é mantido (o Adobe o impõe), mas a caducidad dependerá só do webhook.
+        const pollMaxAgeDays = Number(config.poll?.maxAgeDays) || 0;
+        if (dueDays && pollMaxAgeDays > 0 && dueDays + 1 >= pollMaxAgeDays) {
+          logger.warn(
+            `[START] Acuerdo ${ag.id}: el plazo de ${dueDays} días supera la ventana de consulta (POLL_MAX_AGE_DAYS=${pollMaxAgeDays}); `
+            + 'la caducidad solo se procesará si llega el webhook'
+          );
+        }
 
         // Mapeamento persistido ANTES do SendOn: um webhook imediato já encontra o acordo
         repo.upsert(ag.id, {

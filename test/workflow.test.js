@@ -49,7 +49,8 @@ test('sub-fluxo: workflowId = subworkflowId = WorkID do pai => a disposição va
 test('comentário da tarefa por resultado (rejeitado, expirado, cancelado, conversão)', async () => {
   const expected = {
     AGREEMENT_REJECTED: 'Rechazado por el firmante en Adobe Sign',
-    AGREEMENT_EXPIRED: 'Acuerdo expirado en Adobe Sign',
+    // EXPIRED_STOP_WORKFLOW (padrão): o comentário explica o cancelamento por caducidad
+    AGREEMENT_EXPIRED: 'Flujo cancelado por caducidad: el acuerdo AG-1 expiró en Adobe Sign sin ser firmado',
     AGREEMENT_RECALLED: 'Acuerdo cancelado en Adobe Sign',
     AGREEMENT_AUTO_CANCELLED_CONVERSION_PROBLEM: 'Adobe Sign no pudo procesar el documento'
   };
@@ -936,5 +937,274 @@ test('POST /admin/adopt/:id: Basic Auth, externalId, corpo para acordos antigos,
   const rec = world.repo.get('AG-OLD');
   assert.deepEqual([rec.adopted, rec.nodeId, rec.fileName, rec.state], [true, '1001', 'antigo.pdf', 'pending']);
   assert.equal(rec.adobeStatus, 'OUT_FOR_SIGNATURE');
+  await world.close();
+});
+
+/* ---------- acordo expirado: comentário de caducidad + stop do fluxo (EXPIRED_STOP_WORKFLOW) ---------- */
+
+const CADUCIDAD = 'Flujo cancelado por caducidad: el acuerdo AG-1 expiró en Adobe Sign sin ser firmado';
+const stopCalls = (world) => world.otcs.modelCalls.filter(([m]) => m === 'stopProcess');
+
+test('expirado (padrão): SendOn Rechazado com o comentário de caducidad e DEPOIS o stop do fluxo pai', async () => {
+  const world = await buildWorld();
+  seedAgreement(world);
+  // quantos SendOn já existiam quando o stop foi chamado (a ordem importa: um processo parado não recebe SendOn)
+  const sendonsAtStop = [];
+  const realStop = world.otcs.stopProcess;
+  world.otcs.stopProcess = async (pid) => { sendonsAtStop.push(world.otcs.sendons.length); return realStop(pid); };
+
+  const result = await fire(world, 'AGREEMENT_EXPIRED');
+  assert.equal(result.known, true);
+
+  assert.equal(world.otcs.dispositionCalls().length, 1);
+  const [sendon] = world.otcs.dispositionCalls();
+  assert.equal(sendon.disposition, 'Rechazado');
+  assert.equal(sendon.comment, CADUCIDAD);
+  assert.equal(sendon.taskId, 3);
+  assert.deepEqual(sendonsAtStop, [1], 'stop depois do SendOn');
+  assert.deepEqual(world.otcs.stopped, [3003], 'para o processo pai (WORKID), não o subprocesso 3004');
+
+  const rec = world.repo.get('AG-1');
+  assert.equal(rec.state, 'expired');
+  assert.equal(rec.sendonDone, true);
+  assert.equal(rec.completedExternally, false);
+  assert.equal(rec.disposition, 'Rechazado');
+  assert.equal(rec.workflowStopPending, false);
+  assert.equal(rec.workflowStoppedAt, world.clock.now().toISOString());
+  assert.equal(rec.cancelRequestedAt, null, 'expirar não é cancelamento por pedido');
+  assert.ok(world.logger.has('info', /flujo 3003 cancelado por caducidad del acuerdo \(detenido\)/));
+  await world.close();
+});
+
+test('expirado: o stop falha => retry agendado sem sendonDone; a retentativa NÃO repete o SendOn e só refaz o stop', async () => {
+  const world = await buildWorld();
+  seedAgreement(world);
+  world.otcs.stopFailures = 1; // 403: sem permissão para parar processos
+
+  await fire(world, 'AGREEMENT_EXPIRED');
+  let rec = world.repo.get('AG-1');
+  assert.equal(rec.sendonDone, false);
+  assert.equal(rec.workflowStopPending, true, 'o SendOn já foi feito; falta só o stop');
+  assert.equal(rec.workflowStoppedAt, null);
+  assert.equal(rec.disposition, 'Rechazado');
+  assert.equal(rec.attempts, 1);
+  assert.equal(rec.lastErrorStage, 'disposition');
+  assert.match(rec.lastError, /no se pudo detener el flujo 3003 tras la caducidad del acuerdo \(HTTP 403\).*permisos/);
+  assert.equal(world.timers.length, 1, 'retry agendado');
+  assert.equal(world.otcs.dispositionCalls().length, 1);
+  assert.equal(world.otcs.stopped.length, 0);
+
+  world.clock.advance(60 * 1000);
+  await world.reconciliation.reconcile('AG-1', { force: false });
+  rec = world.repo.get('AG-1');
+  assert.equal(world.otcs.dispositionCalls().length, 1, 'sem segundo SendOn');
+  assert.equal(stopCalls(world).length, 2);
+  assert.deepEqual(world.otcs.stopped, [3003]);
+  assert.equal(rec.sendonDone, true);
+  assert.equal(rec.state, 'expired');
+  assert.equal(rec.completedExternally, false, 'a tarefa concluída foi a nossa');
+  assert.equal(rec.disposition, 'Rechazado');
+  assert.equal(rec.workflowStopPending, false);
+  assert.ok(rec.workflowStoppedAt);
+  assert.equal(rec.attempts, 0);
+  assert.equal(rec.lastError, null);
+  await world.close();
+});
+
+test('expirado: stop que falha mas o processo já está parado/concluído (ex.: ramo Rechazado encerrou o fluxo) => sucesso', async () => {
+  // a resposta do stop se perde, mas o OTCS aplicou
+  const w1 = await buildWorld();
+  seedAgreement(w1);
+  w1.otcs.stopFailsButStops = 1;
+  await fire(w1, 'AGREEMENT_EXPIRED');
+  let rec = w1.repo.get('AG-1');
+  assert.equal(rec.sendonDone, true);
+  assert.equal(rec.workflowStopPending, false);
+  assert.ok(rec.workflowStoppedAt);
+  assert.equal(stopCalls(w1).length, 1, 'sem retry');
+  assert.ok(w1.logger.has('info', /ya estaba detenido\/concluido/));
+  await w1.close();
+
+  // o SendOn encerrou o fluxo (status "completed"); o stop é recusado
+  const w2 = await buildWorld();
+  seedAgreement(w2);
+  w2.otcs.workflows['3003'].status = 'completed';
+  w2.otcs.stopFailures = 1;
+  await fire(w2, 'AGREEMENT_EXPIRED');
+  rec = w2.repo.get('AG-1');
+  assert.equal(rec.sendonDone, true);
+  assert.equal(rec.state, 'expired');
+  assert.equal(rec.completedExternally, false);
+  assert.ok(rec.workflowStoppedAt);
+  assert.equal(w2.timers.length, 0);
+  await w2.close();
+});
+
+test('expirado: stop falhando sempre esgota as tentativas (retries_exhausted) e o SendOn nunca se repete', async () => {
+  const world = await buildWorld({ env: { RETRY_MAX_ATTEMPTS: '2' } });
+  seedAgreement(world);
+  world.otcs.stopFailures = 99;
+  await fire(world, 'AGREEMENT_EXPIRED');
+  world.clock.advance(60 * 60 * 1000);
+  await world.reconciliation.reconcile('AG-1', { force: false });
+  const rec = world.repo.get('AG-1');
+  assert.equal(rec.state, 'needs_attention');
+  assert.equal(rec.attentionKind, 'retries_exhausted');
+  assert.equal(rec.sendonDone, false);
+  assert.equal(rec.workflowStopPending, true);
+  assert.equal(world.otcs.dispositionCalls().length, 1);
+  await world.close();
+});
+
+test('expirado: tarefa de firma concluída por uma pessoa antes (sem a marca de stop pendente) => completedExternally, sem stop', async () => {
+  const world = await buildWorld();
+  world.otcs.addWorkflow('3003', { subprocessId: '3004', stage: 'done' });
+  seedAgreement(world);
+  const result = await fire(world, 'AGREEMENT_EXPIRED');
+  const rec = world.repo.get('AG-1');
+  assert.equal(rec.completedExternally, true);
+  assert.equal(rec.sendonDone, true);
+  assert.equal(rec.state, 'expired');
+  assert.equal(rec.workflowStoppedAt, null);
+  assert.equal(world.otcs.dispositionCalls().length, 0);
+  assert.equal(stopCalls(world).length, 0);
+  assert.ok(result);
+  await world.close();
+});
+
+test('expirado: 4xx no SendOn com a tarefa já concluída => com stop pendente refaz só o stop; sem a marca, é conclusão externa', async () => {
+  for (const [pending, externally] of [[true, false], [false, true]]) {
+    const world = await buildWorld();
+    seedAgreement(world, 'AG-1', { workflowStopPending: pending });
+    // o SendOn conclui a tarefa, mas a resposta é um 409 (resposta perdida)
+    world.otcs.sendOnWorkflow = async () => {
+      world.otcs.task(3003, 3, 3004).status = 'completed';
+      throw httpError(409, 'task is not current');
+    };
+    await fire(world, 'AGREEMENT_EXPIRED');
+    const rec = world.repo.get('AG-1');
+    assert.equal(rec.sendonDone, true, `pending=${pending}`);
+    assert.equal(rec.completedExternally, externally, `pending=${pending}`);
+    assert.equal(stopCalls(world).length, pending ? 1 : 0, `pending=${pending}`);
+    assert.equal(!!rec.workflowStoppedAt, pending, `pending=${pending}`);
+    await world.close();
+  }
+});
+
+test('EXPIRED_STOP_WORKFLOW=false: comportamento antigo (comentário de sempre, sem stop)', async () => {
+  const world = await buildWorld({ env: { EXPIRED_STOP_WORKFLOW: 'false' } });
+  seedAgreement(world);
+  await fire(world, 'AGREEMENT_EXPIRED');
+  const [sendon] = world.otcs.dispositionCalls();
+  assert.equal(sendon.disposition, 'Rechazado');
+  assert.equal(sendon.comment, 'Acuerdo expirado en Adobe Sign');
+  assert.equal(stopCalls(world).length, 0);
+  assert.equal(world.otcs.modelCalls.filter(([m]) => m === 'getProcessStatus').length, 0);
+  const rec = world.repo.get('AG-1');
+  assert.equal(rec.sendonDone, true);
+  assert.equal(rec.state, 'expired');
+  assert.equal(rec.workflowStopPending, false);
+  assert.equal(rec.workflowStoppedAt, null);
+  await world.close();
+});
+
+test('o stop é só do expirado: rejeitado, cancelado e assinado nunca chamam stopProcess', async () => {
+  for (const event of ['AGREEMENT_REJECTED', 'AGREEMENT_RECALLED', 'AGREEMENT_WORKFLOW_COMPLETED']) {
+    const world = await buildWorld();
+    seedAgreement(world);
+    await fire(world, event);
+    assert.equal(world.repo.get('AG-1').sendonDone, true, event);
+    assert.equal(stopCalls(world).length, 0, event);
+    await world.close();
+  }
+});
+
+test('expirado pelo polling (status EXPIRED): mesmo caminho, comentário + stop', async () => {
+  const world = await buildWorld();
+  seedAgreement(world);
+  world.adobe.agreements['AG-1'] = { id: 'AG-1', status: 'EXPIRED' };
+  await world.poller.tick();
+  const rec = world.repo.get('AG-1');
+  assert.equal(rec.state, 'expired');
+  assert.equal(world.otcs.dispositionCalls()[0].comment, CADUCIDAD);
+  assert.deepEqual(world.otcs.stopped, [3003]);
+  assert.ok(rec.workflowStoppedAt);
+  await world.close();
+});
+
+/* ---------- expirado com o SendOn já feito (workflowStopPending): a retentativa só refaz o stop ---------- */
+
+// Acordo expirado, SendOn já feito (tarefa de firma concluída por nós), stop pendente
+const seedStopPending = (world, extra = {}) => seedAgreement(world, 'AG-1', {
+  finalKind: 'final_expired', adobeStatus: 'EXPIRED', state: 'expired', finalAt: '2026-06-22T12:00:00.000Z',
+  workflowStopPending: true, disposition: 'Rechazado', ...extra
+});
+
+test('stop pendente: com a tarefa de firma ainda current => 0 SendOn, 1 stop, conclui sem completedExternally', async () => {
+  const world = await buildWorld();
+  seedStopPending(world); // o workflow falso fica na tarefa de firma (current)
+  const result = await world.reconciliation.reconcile('AG-1');
+  assert.equal(result.status, 'completed');
+  assert.equal(world.otcs.sendons.length, 0);
+  assert.deepEqual(world.otcs.stopped, [3003]);
+  const rec = world.repo.get('AG-1');
+  assert.equal(rec.sendonDone, true);
+  assert.equal(rec.completedExternally, false);
+  assert.equal(rec.disposition, 'Rechazado');
+  assert.equal(rec.workflowStopPending, false);
+  assert.ok(rec.workflowStoppedAt);
+  await world.close();
+});
+
+test('stop pendente: tarefa de firma ausente do step_list => o stop acontece e conclui', async () => {
+  const world = await buildWorld();
+  seedStopPending(world);
+  world.otcs.workflows['3003'].tasks = world.otcs.workflows['3003'].tasks.filter((t) => t.name !== 'Aguardar Firma');
+  const result = await world.reconciliation.reconcile('AG-1');
+  assert.equal(result.status, 'completed');
+  assert.equal(world.otcs.sendons.length, 0);
+  assert.deepEqual(world.otcs.stopped, [3003]);
+  assert.equal(world.repo.get('AG-1').sendonDone, true);
+  assert.equal(world.repo.get('AG-1').completedExternally, false);
+  await world.close();
+});
+
+test('stop pendente: getProcessSteps 404 (processo inexistente/encerrado) => tenta o stop, sem needs_attention permanente', async () => {
+  const world = await buildWorld();
+  seedStopPending(world);
+  world.otcs.stepsFailures = 5;
+  world.otcs.stepsFailStatus = 404;
+  world.otcs.stopFailures = 1; // o stop é recusado e o processo "não existe" no estado: falha transitória
+  const result = await world.reconciliation.reconcile('AG-1');
+  assert.equal(result.status, 'failed');
+  assert.equal(world.otcs.modelCalls.filter(([m]) => m === 'getProcessSteps').length, 0, 'nem lê os passos');
+  assert.equal(stopCalls(world).length, 1);
+  const rec = world.repo.get('AG-1');
+  assert.notEqual(rec.state, 'needs_attention');
+  assert.equal(rec.sendonDone, false);
+  assert.equal(rec.workflowStopPending, true);
+
+  // com o stop funcionando, conclui (os passos continuam dando 404: não importam)
+  world.clock.advance(60 * 1000);
+  const again = await world.reconciliation.reconcile('AG-1');
+  assert.equal(again.status, 'completed');
+  assert.equal(world.repo.get('AG-1').sendonDone, true);
+  await world.close();
+});
+
+test('stop pendente: o stop falha => retry agendado, continua pendente e sem SendOn', async () => {
+  const world = await buildWorld();
+  seedStopPending(world);
+  world.otcs.stopFailures = 1;
+  const result = await world.reconciliation.reconcile('AG-1');
+  assert.equal(result.status, 'failed');
+  assert.equal(result.stage, 'disposition');
+  const rec = world.repo.get('AG-1');
+  assert.equal(rec.sendonDone, false);
+  assert.equal(rec.workflowStopPending, true);
+  assert.equal(rec.attempts, 1);
+  assert.match(rec.lastError, /no se pudo detener el flujo 3003 tras la caducidad/);
+  assert.equal(world.timers.length, 1);
+  assert.equal(world.otcs.sendons.length, 0);
   await world.close();
 });

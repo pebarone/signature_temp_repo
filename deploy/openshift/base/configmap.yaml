@@ -41,6 +41,8 @@ data:
   DISPOSITION_REJECTED: "Rechazado"
   # Disposição de expiração (os mapas só têm Firmado/Rechazado); vazio => needs_attention
   DISPOSITION_EXPIRED: "Rechazado"
+  # Acordo expirado: depois da disposição (SendOn com o comentário de caducidad) para o fluxo no Content; exige permissão de stop do usuário de integração
+  EXPIRED_STOP_WORKFLOW: "true"
   # Disposição de recall; vazio => needs_attention
   DISPOSITION_RECALLED: "Rechazado"
   # Disposição de falha de conversão; vazio => needs_attention
@@ -72,6 +74,8 @@ data:
   START_FIELD_ATTACHID: "AttachID"
   START_FIELD_DOCNAME: "Nombre del Documento"
   START_FIELD_EMAILS: "Email Firmante 1,Email Firmante 2"
+  # Atributo oculto com o prazo da assinatura (dias, 1 a 365), enviado ao Adobe como expirationTime; vazio desliga
+  START_FIELD_DUE_DATE: "DUE_DATE"
   # Transição dos WebReports (ordem de rollout em webreports/README.md): DESLIGADAS, passo 4 concluído (os WebReports de PROD
   # já falam o protocolo v2). Com "false", GET /auth, a assinatura v1 e o GET /start antigo respondem 404/403. Só religue
   # ("true") como rollback, se um WebReport antigo voltar a ser publicado; depois rode

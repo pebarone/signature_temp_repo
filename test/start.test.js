@@ -260,17 +260,19 @@ test('config: START_VERIFY_WORKFLOW liga por padrão e os rótulos dos atributos
   assert.equal(c.startVerifyWorkflow, true);
   assert.deepEqual(c.startFields, {
     docId: 'DocID', attachId: 'AttachID', docName: 'Nombre del Documento',
-    emails: ['Email Firmante 1', 'Email Firmante 2']
+    emails: ['Email Firmante 1', 'Email Firmante 2'], dueDate: 'DUE_DATE'
   });
   assert.equal(c.startLegacySignature, false);
   assert.equal(c.startLegacyGet, false);
   const o = computeConfig({
     START_VERIFY_WORKFLOW: 'false', START_FIELD_DOCID: 'Doc', START_FIELD_ATTACHID: 'Adj',
     START_FIELD_DOCNAME: 'Nome', START_FIELD_EMAILS: 'Mail A, Mail B, Mail C',
-    START_LEGACY_SIGNATURE: 'true', START_LEGACY_GET_ENABLED: '1'
+    START_FIELD_DUE_DATE: 'Prazo', START_LEGACY_SIGNATURE: 'true', START_LEGACY_GET_ENABLED: '1'
   });
   assert.equal(o.startVerifyWorkflow, false);
-  assert.deepEqual(o.startFields, { docId: 'Doc', attachId: 'Adj', docName: 'Nome', emails: ['Mail A', 'Mail B', 'Mail C'] });
+  assert.deepEqual(o.startFields, {
+    docId: 'Doc', attachId: 'Adj', docName: 'Nome', emails: ['Mail A', 'Mail B', 'Mail C'], dueDate: 'Prazo'
+  });
   assert.equal(o.startLegacySignature, true);
   assert.equal(o.startLegacyGet, true);
 });
@@ -649,7 +651,7 @@ test('/start com a tarefa no usuário humano (fluxo puro): cria o acordo, devolv
 
 test('/start com a tarefa no usuário de integração (fluxo puro): formulário como antes e handoff.assigned=true', async () => {
   const world = await verifyWorld();
-  seedStartFlow(world, { subprocessId: '3003' });
+  seedStartFlow(world, { subprocessId: '3003', fields: { DUE_DATE: '15' } }); // com DUE_DATE no formulário não há leitura de atributos
   const r = await authThenStart(world, STANDALONE);
   assert.equal(r.status, 200);
   assert.deepEqual(await r.json(), {
@@ -665,7 +667,7 @@ test('/start com a tarefa no usuário de integração (fluxo puro): formulário 
 test('/start com responsáveis desconhecidos (assigneeIds null): caminho do formulário, sem consultar o usuário de integração', async () => {
   for (const subprocessId of ['3003', '3004']) { // fluxo puro e sub-workflow
     const world = await verifyWorld();
-    seedStartFlow(world, { subprocessId });
+    seedStartFlow(world, { subprocessId, fields: { DUE_DATE: '15' } });
     world.otcs.unknownAssignees('3003');
     world.otcs.currentUserFailure = httpError(500, 'não deve ser chamado');
     const r = await authThenStart(world, { ...FIELDS, subworkflowId: subprocessId });
@@ -683,7 +685,7 @@ test('/start com responsáveis desconhecidos (assigneeIds null): caminho do form
 
 test('/start em sub-workflow: tarefa no usuário humano => 409 REASSIGN_REQUIRED com handoff, sem Adobe nem leitura de atributos', async () => {
   const world = await verifyWorld();
-  seedStartFlow(world, { assignee: HUMAN_USER_ID }); // processo 3003, subprocesso 3004
+  seedStartFlow(world, { assignee: HUMAN_USER_ID, fields: { DUE_DATE: '15' } }); // processo 3003, subprocesso 3004
   const r = await authThenStart(world);
   assert.equal(r.status, 409);
   assert.deepEqual(await r.json(), {
@@ -1304,7 +1306,7 @@ test('repo.consumeNonce: uso único, purga dos expirados a cada inserção', () 
 });
 
 test('db: banco no schema v2 recebe a migração v3 (start_nonces) preservando os dados', () => {
-  assert.equal(MIGRATIONS.length, 4); // v4: cancelamento de fluxos (test/cancellation.test.js)
+  assert.equal(MIGRATIONS.length, 5); // v4: cancelamento de fluxos (test/cancellation.test.js); v5: caducidad (test/workflow.test.js)
   const file = path.join(tmpDir(), 'v2.db');
   const raw = new Database(file);
   raw.exec(MIGRATIONS[0]);
@@ -1326,4 +1328,159 @@ test('db: banco no schema v2 recebe a migração v3 (start_nonces) preservando o
   const again = openDatabase(file);
   assert.equal(again.pragma('user_version', { simple: true }), MIGRATIONS.length);
   again.close();
+});
+
+/* ---------- prazo da assinatura (DUE_DATE) ---------- */
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+const startOk = async (world, fields = STANDALONE) => {
+  const r = await authThenStart(world, fields);
+  assert.equal(r.status, 200, await r.clone().text());
+  await waitFor(() => world.repo.get('AG-1').startSendonDone);
+  return r;
+};
+const inDays = (world, days) => new Date(world.clock.ms() + days * DAY_MS).toISOString();
+
+test('/start: DUE_DATE no formulário da tarefa => createAgreement recebe expirationTime = agora + dias', async () => {
+  const world = await verifyWorld();
+  seedStartFlow(world, { subprocessId: '3003', fields: { DUE_DATE: ' 15.0 ' } });
+  await startOk(world);
+  assert.equal(world.adobe.created.length, 1);
+  assert.equal(world.adobe.created[0].expirationTime, inDays(world, 15));
+  assert.equal(modelCalled(world, 'getWorkflowAttributes'), 0, 'veio no formulário: sem fallback');
+  assert.ok(world.logger.has('info', /Acuerdo AG-1: vence en 15 días/));
+  assert.equal(world.logger.has('warn', /ventana de consulta/), false, '15 dias cabem nos 90 do polling');
+  await world.close();
+});
+
+test('/start: prazo além da janela do polling (POLL_MAX_AGE_DAYS) => mantém o expirationTime e avisa', async () => {
+  const world = await verifyWorld({ POLL_MAX_AGE_DAYS: '90' });
+  seedStartFlow(world, { subprocessId: '3003', fields: { DUE_DATE: '89' } });
+  await startOk(world);
+  assert.equal(world.adobe.created[0].expirationTime, inDays(world, 89));
+  assert.ok(world.logger.has('warn', /plazo de 89 días supera la ventana de consulta \(POLL_MAX_AGE_DAYS=90\)/));
+  await world.close();
+});
+
+test('/start: DUE_DATE oculto (fora do formulário) vem de getWorkflowAttributes; fluxo puro consulta uma vez', async () => {
+  const world = await verifyWorld();
+  seedStartFlow(world, { subprocessId: '3003' });
+  world.otcs.workflowAttributes['3003'] = { DUE_DATE: '7' };
+  await startOk(world);
+  assert.equal(world.adobe.created[0].expirationTime, inDays(world, 7));
+  assert.equal(modelCalled(world, 'getWorkflowAttributes'), 1, 'subprocesso == processo: uma única consulta');
+  await world.close();
+});
+
+test('/start em sub-workflow: o fallback tenta o subprocesso e, sem prazo (ou com erro), o processo pai', async () => {
+  // o subprocesso responde com o prazo: não consulta o pai
+  const w1 = await verifyWorld();
+  seedStartFlow(w1, { subprocessId: '3004' });
+  w1.otcs.workflowAttributes['3003'] = { DUE_DATE: '12' };
+  const real = w1.otcs.getWorkflowAttributes;
+  w1.otcs.getWorkflowAttributes = async (pid) => (String(pid) === '3004' ? { DUE_DATE: '5' } : real(pid));
+  await startOk(w1, FIELDS);
+  assert.equal(w1.adobe.created[0].expirationTime, inDays(w1, 5));
+  await w1.close();
+
+  // o fake só conhece workflows pelo processo: o subprocesso 3004 responde 404 (avisa) e o pai 3003 traz o prazo
+  const w2 = await verifyWorld();
+  seedStartFlow(w2, { subprocessId: '3004' });
+  w2.otcs.workflowAttributes['3003'] = { DUE_DATE: '10' };
+  await startOk(w2, FIELDS);
+  assert.equal(w2.adobe.created[0].expirationTime, inDays(w2, 10));
+  assert.deepEqual(
+    w2.otcs.modelCalls.filter(([m]) => m === 'getWorkflowAttributes'),
+    [['getWorkflowAttributes', 3004], ['getWorkflowAttributes', 3003]]
+  );
+  assert.ok(w2.logger.has('warn', /No se pudo leer el atributo "DUE_DATE" del workflow 3004/));
+  await w2.close();
+});
+
+test('/start: sem DUE_DATE, inválido ou com o fallback falhando => acordo sem expirationTime e /start 200', async () => {
+  const setForm = (value) => (w) => { w.otcs.formFields.DUE_DATE = { key: 'k_due', value }; };
+  for (const [label, setup, warn] of [
+    ['ausente', () => {}, null],
+    ['vazio', setForm(''), null],
+    ['não numérico', setForm('quinze'), /Atributo "DUE_DATE" inválido \("quinze"/],
+    ['fracionário', setForm('15.5'), /inválido \("15.5"/],
+    ['zero', setForm('0'), /inválido \("0"/],
+    ['negativo', setForm('-3'), /inválido \("-3"/],
+    ['acima de 365', setForm('366'), /inválido \("366"/],
+    ['fallback falha', (w) => { w.otcs.attributesFailure = httpError(500, 'boom'); }, /No se pudo leer el atributo "DUE_DATE"/]
+  ]) {
+    const world = await verifyWorld();
+    seedStartFlow(world, { subprocessId: '3003' });
+    setup(world);
+    await startOk(world);
+    assert.equal(world.adobe.created.length, 1, label);
+    assert.equal('expirationTime' in world.adobe.created[0], false, label);
+    if (warn) assert.ok(world.logger.has('warn', warn), `${label}: aviso`);
+    assert.deepEqual(world.logger.lines.error, [], label);
+    await world.close();
+  }
+});
+
+test('/start: START_FIELD_DUE_DATE vazio desliga a leitura (nem fallback) e o rótulo é configurável', async () => {
+  const off = await verifyWorld({ START_FIELD_DUE_DATE: '' });
+  seedStartFlow(off, { subprocessId: '3003', fields: { DUE_DATE: '15' } });
+  await startOk(off);
+  assert.equal('expirationTime' in off.adobe.created[0], false);
+  assert.equal(modelCalled(off, 'getWorkflowAttributes'), 0);
+  await off.close();
+
+  const custom = await verifyWorld({ START_FIELD_DUE_DATE: 'Prazo (dias)' });
+  seedStartFlow(custom, { subprocessId: '3003', fields: { 'Prazo (dias)': 20, DUE_DATE: '15' } });
+  await startOk(custom);
+  assert.equal(custom.adobe.created[0].expirationTime, inDays(custom, 20));
+  await custom.close();
+});
+
+test('/start em sub-workflow: o REASSIGN_REQUIRED não lê o prazo; ele é lido na chamada que cria o acordo', async () => {
+  const world = await verifyWorld();
+  seedStartFlow(world, { assignee: HUMAN_USER_ID }); // sem DUE_DATE no formulário
+  world.otcs.workflowAttributes['3003'] = { DUE_DATE: '15' };
+  const r = await authThenStart(world);
+  assert.equal(r.status, 409);
+  assert.equal(modelCalled(world, 'getWorkflowAttributes'), 0);
+
+  world.otcs.assign(3003, 2, INTEGRATION_USER_ID);
+  const ok = await authThenStart(world);
+  assert.equal(ok.status, 200);
+  assert.equal(world.adobe.created[0].expirationTime, inDays(world, 15));
+  await waitFor(() => world.repo.get('AG-1').startSendonDone);
+  await world.close();
+});
+
+test('/start sem validar o workflow (START_VERIFY_WORKFLOW=false): nada é lido do OTCS e o acordo fica sem expirationTime', async () => {
+  const world = await buildWorld({ listen: true, env: { OTCS_BASE } });
+  world.otcs.formFields.DUE_DATE = { key: 'k_due', value: '15' };
+  const r = await authThenStart(world, STANDALONE);
+  assert.equal(r.status, 200, await r.clone().text());
+  assert.equal('expirationTime' in world.adobe.created[0], false);
+  assert.equal(modelCalled(world, 'getWorkflowAttributes'), 0);
+  await world.close();
+});
+
+test('/start repetido com a tarefa de início ainda current (SendOn falhando): devolve o acordo e não volta a consultar os atributos do prazo', async () => {
+  const world = await verifyWorld();
+  seedStartFlow(world, { subprocessId: '3003' }); // DUE_DATE fora do formulário: o primeiro /start usa o fallback
+  world.otcs.workflowAttributes['3003'] = { DUE_DATE: '15' };
+  world.otcs.sendOnFailsAlways = true; // o SendOn da tarefa de início falha: a tarefa 2 continua current (não cai no where !== 'current')
+  const first = await authThenStart(world, STANDALONE);
+  assert.equal(first.status, 200, await first.clone().text());
+  await waitFor(() => world.repo.get('AG-1').attempts > 0); // a etapa start em background já falhou
+  assert.equal(world.repo.get('AG-1').startSendonDone, false);
+  assert.equal(world.otcs.task(3003, 2, 3003).status, 'current');
+  assert.equal(modelCalled(world, 'getWorkflowAttributes'), 1);
+
+  const again = await authThenStart(world, STANDALONE);
+  assert.equal(again.status, 200, await again.clone().text());
+  const body = await again.json();
+  assert.equal(body.id, 'AG-1');
+  assert.equal(body.existing, true);
+  assert.equal(world.adobe.created.length, 1, 'não cria outro acordo');
+  assert.equal(world.repo.list().length, 1);
+  assert.equal(modelCalled(world, 'getWorkflowAttributes'), 1, 'sem consulta extra de atributos');
+  await world.close();
 });

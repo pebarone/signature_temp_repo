@@ -39,14 +39,16 @@ function createAdobeClient({
   }
 
   // externalId (opcional): referência ao workflow/documento do OTCS (ver domain/externalId.js)
-  async function createAgreement({ name, transientDocumentId, emails, externalId }) {
+  // expirationTime (opcional, ISO 8601): data limite para assinar; depois dela o Adobe expira o acordo (AGREEMENT_EXPIRED)
+  async function createAgreement({ name, transientDocumentId, emails, externalId, expirationTime }) {
     const rsp = await http.post(`${rest}/agreements`, {
       name,
       fileInfos: [{ transientDocumentId }],
       participantSetsInfo: emails.map((email) => ({ role: 'SIGNER', order: 1, memberInfos: [{ email }] })),
       signatureType: 'ESIGN',
       state: 'IN_PROCESS',
-      ...(externalId ? { externalId: { id: externalId } } : {})
+      ...(externalId ? { externalId: { id: externalId } } : {}),
+      ...(expirationTime ? { expirationTime } : {})
     }, { headers: await authHeaders(), timeout: timeoutMs });
     return rsp.data; // { id }
   }

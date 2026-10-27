@@ -290,3 +290,18 @@ test('otcs: só repete uma vez (401 persistente propaga) e outros erros não rep
   assert.equal(e500.seen.length, 1);
   assert.equal(e500.logins(), 1);
 });
+
+test('adobe: createAgreement só leva expirationTime quando informado (sem ele o payload é o de sempre)', async () => {
+  const posts = [];
+  const http = { post: async (url, body) => { posts.push({ url, body }); return { data: { id: 'AG-X' } }; } };
+  const client = createAdobeClient({ apiBase: 'https://adobe.invalid', ensureToken: async () => 'tok', http, logger: makeLogger() });
+  const base = { name: 'Documento a.pdf', transientDocumentId: 'T1', emails: ['a@example.com'], externalId: 'otcs|wf=1' };
+
+  await client.createAgreement(base);
+  await client.createAgreement({ ...base, expirationTime: '2026-11-11T12:00:00.000Z' });
+  assert.equal(posts[0].url, 'https://adobe.invalid/api/rest/v6/agreements');
+  assert.equal('expirationTime' in posts[0].body, false);
+  assert.deepEqual(Object.keys(posts[0].body), ['name', 'fileInfos', 'participantSetsInfo', 'signatureType', 'state', 'externalId']);
+  assert.equal(posts[1].body.expirationTime, '2026-11-11T12:00:00.000Z');
+  assert.deepEqual({ ...posts[1].body, expirationTime: undefined }, { ...posts[0].body, expirationTime: undefined });
+});
