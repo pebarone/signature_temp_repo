@@ -41,7 +41,7 @@ data:
   DISPOSITION_REJECTED: "Rechazado"
   # Disposição de expiração (os mapas só têm Firmado/Rechazado); vazio => needs_attention
   DISPOSITION_EXPIRED: "Rechazado"
-  # Acordo expirado: depois da disposição (SendOn com o comentário de caducidad) para o fluxo no Content; exige permissão de stop do usuário de integração
+  # Acordo expirado: SendOn da firma com o comentário de caducidad; no fluxo puro (firma = workflow) depois para o fluxo no Content (exige permissão de stop do usuário de integração); no subfluxo só a firma é cancelada
   EXPIRED_STOP_WORKFLOW: "true"
   # Disposição de recall; vazio => needs_attention
   DISPOSITION_RECALLED: "Rechazado"

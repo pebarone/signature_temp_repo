@@ -28,8 +28,9 @@ const DISPOSITION_COMMENTS = {
   [KINDS.FINAL_RECALLED]: () => 'Acuerdo cancelado en Adobe Sign',
   [KINDS.FINAL_CONVERSION_FAILED]: () => 'Adobe Sign no pudo procesar el documento'
 };
-// Expirado com EXPIRED_STOP_WORKFLOW: o comentário do SendOn explica por que o fluxo é parado em seguida
-const EXPIRED_STOP_COMMENT = (id) => `Flujo cancelado por caducidad: el acuerdo ${id} expiró en Adobe Sign sin ser firmado`;
+// Expirado com EXPIRED_STOP_WORKFLOW: comentário do SendOn da tarefa de firma (fluxo puro e subfluxo). No fluxo puro o stop
+// do processo vem em seguida; no subfluxo só a firma é cancelada e o fluxo pai segue pelo próprio ramo Rechazado
+const EXPIRED_COMMENT = (id) => `Firma cancelada por caducidad: el acuerdo ${id} expiró en Adobe Sign sin ser firmado`;
 
 // Erro de negócio da adoção manual (status HTTP sugerido para o /admin/adopt)
 class AdoptError extends Error {
@@ -68,7 +69,8 @@ function createReconciliationService({
 
   const nowIso = () => now().toISOString();
   const stopWorkflow = createWorkflowStopper({ otcs, logger, tag: '[EXPIRED]' });
-  // Acordo expirado que, depois da disposição, também para o fluxo no Content (EXPIRED_STOP_WORKFLOW)
+  // Acordo expirado com EXPIRED_STOP_WORKFLOW: depois da disposição, o fluxo puro (WORKID == SUBWORKID) também é parado.
+  // No subfluxo só a firma é cancelada (ver executeDisposition)
   const stopsOnExpiry = (rec) => rec.finalKind === KINDS.FINAL_EXPIRED && !!config.expiredStopWorkflow;
 
   /*
@@ -463,10 +465,11 @@ function createReconciliationService({
   }
 
   /*
-    Expirado: para o fluxo (rec.workflowId, o pai/WORKID, mesmo alvo do cancelamento) depois do SendOn da tarefa de firma, que
-    já levou o comentário de caducidad (a API do OTCS não tem comentário avulso e o stop não aceita comentário, e um processo
-    parado não recebe SendOn: por isso a ordem é SendOn e depois stop). Idempotente: 'already_stopped' (inclusive o fluxo já
-    encerrado pelo ramo Rechazado) vale como sucesso. Falha => registerFailure e a tentativa seguinte refaz só o stop
+    Expirado no FLUXO PURO (WORKID == SUBWORKID, a firma é o próprio workflow): para o fluxo (rec.workflowId) depois do SendOn
+    da tarefa de firma, que já levou o comentário de caducidad (a API do OTCS não tem comentário avulso e o stop não aceita
+    comentário, e um processo parado não recebe SendOn: por isso a ordem é SendOn e depois stop). No subfluxo esta função não
+    é usada: só a firma é cancelada e o fluxo pai segue pelo próprio ramo Rechazado. Idempotente: 'already_stopped' (inclusive
+    o fluxo já encerrado pelo ramo Rechazado) vale como sucesso. Falha => registerFailure e a tentativa seguinte refaz só o stop
     (workflowStopPending). Conclui o acordo com a disposição enviada (action).
   */
   async function stopExpiredWorkflow(id, rec, plan, action) {
@@ -594,7 +597,7 @@ function createReconciliationService({
         taskId: t.taskId,
         disposition: action,
         comment: stopsOnExpiry(rec)
-          ? EXPIRED_STOP_COMMENT(id)
+          ? EXPIRED_COMMENT(id)
           : (DISPOSITION_COMMENTS[rec.finalKind] || (() => action))(id)
       });
     } catch (e) {
@@ -623,15 +626,20 @@ function createReconciliationService({
       }
       return { result: registerFailure(id, 'disposition', e) };
     }
-    if (stopsOnExpiry(rec)) {
-      // Persiste antes do stop (sem sendonDone): se ele falhar, a retentativa não vê a tarefa já concluída como externa
+    // Expirado no fluxo puro (a tarefa de firma está no próprio processo): para o fluxo depois do SendOn.
+    // Persiste antes do stop (sem sendonDone): se ele falhar, a retentativa não vê a tarefa já concluída como externa
+    if (stopsOnExpiry(rec) && String(t.subprocessId) === String(t.processId)) {
       rec = repo.upsert(id, { workflowStopPending: true, disposition: action });
       logger.info(`[${id}] SendOn task ${t.taskId} (${action}) done for workflow ${t.processId}/${t.subprocessId}; deteniendo el flujo ${rec.workflowId} por caducidad`);
       return stopExpiredWorkflow(id, rec, plan, action);
     }
+    // Subfluxo (ou sem caducidad): conclusão normal. Expirado no subfluxo só cancela a firma; o fluxo pai não é parado
+    const expiredSubflow = stopsOnExpiry(rec);
     clearTimeout_(id);
     rec = repo.upsert(id, state.completedPatch(plan, action, nowIso()));
-    logger.info(`[${id}] SendOn task ${t.taskId} (${action}) done for workflow ${t.processId}/${t.subprocessId}`);
+    logger.info(expiredSubflow
+      ? `[${id}] SendOn task ${t.taskId} (${action}) done for workflow ${t.processId}/${t.subprocessId}; caducidad en subflujo: solo se cancela la firma (el flujo ${t.processId} sigue)`
+      : `[${id}] SendOn task ${t.taskId} (${action}) done for workflow ${t.processId}/${t.subprocessId}`);
     return { result: { status: 'completed', record: rec } };
   }
 
