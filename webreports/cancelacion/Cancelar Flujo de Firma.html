@@ -353,6 +353,7 @@ REASIGNADO_OK
 
     .barra { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); margin-top: var(--space-3); }
     .barra-tabla { margin-top: var(--space-2); }
+    .barra-filtros .marcar-todos { margin-right: auto; }
     .marcar-todos { display: inline-flex; align-items: center; gap: var(--space-2); min-height: 44px; font-size: var(--text-sm); color: var(--color-ink-2); cursor: pointer; }
     input[type="checkbox"] { width: 18px; height: 18px; margin: 0; accent-color: var(--color-accent); cursor: pointer; }
 
@@ -550,6 +551,7 @@ REASIGNADO_OK
       .hoja { padding: var(--space-8) var(--space-4) var(--space-12); }
       .filtros > .campo:nth-child(n), .filtros > .barra-filtros { grid-column: 1 / -1; }
       .barra-filtros .btn { flex: 1 1 0; }
+      .barra-filtros .marcar-todos { flex: 1 1 100%; }
       .mesa-lateral .acciones { display: grid; }
       .campo input { min-height: 44px; }
     }
@@ -586,6 +588,7 @@ REASIGNADO_OK
               <label class="campo">Desde<input type="date" id="q-desde"></label>
               <label class="campo">Hasta<input type="date" id="q-hasta"></label>
               <div class="barra barra-filtros">
+                <label class="marcar-todos"><input type="checkbox" id="q-cerrados"> Incluir flujos ya detenidos o concluidos</label>
                 <button class="btn secundario chico" type="button" id="btn-limpiar-filtros">Limpiar filtros</button>
                 <button class="btn chico" type="submit">Filtrar</button>
               </div>
@@ -593,6 +596,7 @@ REASIGNADO_OK
           </form>
 
           <h2 class="seccion seccion-tabla">Flujos en "Aguardar Firma" <span class="total" id="total-resultados"></span></h2>
+          <p class="nota" id="nota-cerrados" hidden></p>
           <div class="tabla-caja" id="tabla-caja" hidden>
             <table>
               <thead>
@@ -610,7 +614,7 @@ REASIGNADO_OK
               <tbody id="tbody"></tbody>
             </table>
           </div>
-          <p class="vacio" id="vacio" hidden>No hay flujos en "Aguardar Firma" que coincidan con la búsqueda.</p>
+          <p class="vacio" id="vacio" hidden>No hay flujos para mostrar.</p>
           <div class="barra barra-tabla">
             <label class="marcar-todos"><input type="checkbox" id="chk-todos-2"> Seleccionar todos</label>
           </div>
@@ -777,7 +781,7 @@ REASIGNADO_OK
     <textarea id="dato-subflujo" hidden readonly>[LL_REPTAG_&SUBWORKID WFATTR:"ID Subflujo a Cancelar":DISPLAY /]</textarea>
 [LL_WEBREPORT_ENDIF /]
     <!-- Filas devueltas por el LiveReport (columnas en este orden: WorkID, SubWorkID, TituloFlujo, TituloFirma, Mapa, Fecha,
-         EstadoSubflujo, Atributos en JSON). Cada valor va en un textarea y el script lo lee como texto literal.
+         EstadoSubflujo, Atributos en JSON, EstadoFlujo). Cada valor va en un textarea y el script lo lee como texto literal.
          VALIDAR EN QA: marcadores de fila y tags de columna por numero. -->
     <table id="origen"><tbody>
 [LL_WEBREPORT_ENDIF /]
@@ -788,7 +792,7 @@ REASIGNADO_OK
 [LL_WEBREPORT_IF "[LL_REPTAG_&ACCION /]" != "leer" /]
 [LL_WEBREPORT_IF "[LL_REPTAG_&ACCION /]" != "reasignar" /]
 
-      <tr><td><textarea>[LL_REPTAG_1 /]</textarea></td><td><textarea>[LL_REPTAG_2 /]</textarea></td><td><textarea>[LL_REPTAG_3 /]</textarea></td><td><textarea>[LL_REPTAG_4 /]</textarea></td><td><textarea>[LL_REPTAG_5 /]</textarea></td><td><textarea>[LL_REPTAG_6 /]</textarea></td><td><textarea>[LL_REPTAG_7 /]</textarea></td><td><textarea>[LL_REPTAG_8 /]</textarea></td></tr>
+      <tr><td><textarea>[LL_REPTAG_1 /]</textarea></td><td><textarea>[LL_REPTAG_2 /]</textarea></td><td><textarea>[LL_REPTAG_3 /]</textarea></td><td><textarea>[LL_REPTAG_4 /]</textarea></td><td><textarea>[LL_REPTAG_5 /]</textarea></td><td><textarea>[LL_REPTAG_6 /]</textarea></td><td><textarea>[LL_REPTAG_7 /]</textarea></td><td><textarea>[LL_REPTAG_8 /]</textarea></td><td><textarea>[LL_REPTAG_9 /]</textarea></td></tr>
 [LL_WEBREPORT_ENDIF /]
 [LL_WEBREPORT_ENDIF /]
 [LL_WEBREPORT_ENDIF /]
@@ -865,7 +869,7 @@ REASIGNADO_OK
   const MARCA_GUARDADO = 'GUARDADO' + '_OK';
   const MARCA_LEIDO = 'LEIDO' + '_OK';
   const CLAVE_SEL = MODO_DIRECTO ? 'cancelar-sel-directo' : 'cancelar-sel-' + WORKFLOW_ID;
-  const COLUMNAS = ['workId', 'subWorkId', 'tituloFlujo', 'tituloFirma', 'mapa', 'fecha', 'estado', 'atributos'];
+  const COLUMNAS = ['workId', 'subWorkId', 'tituloFlujo', 'tituloFirma', 'mapa', 'fecha', 'estado', 'atributos', 'estadoFlujo'];
   const FILTROS = ['flujo', 'empleado', 'nombre', 'documento', 'desde', 'hasta'];
   const MSG_ASIGNAR = 'No fue posible asignar la tarea. Intente de nuevo.';
   const CABECERAS = { 'Content-Type': 'application/json', 'ngrok-skip-browser-warning': 'true' };
@@ -1698,7 +1702,17 @@ REASIGNADO_OK
     };
   }
 
-  /* Une filas con el mismo WorkID (un flujo con varios subflujos): la seleccion es por WorkID (se cancela y detiene el padre). */
+  /* El flujo ya no necesita cancelarse en Content: estado negativo del proceso (wwork.work_status) o del sub-flujo de firma
+     (wsubwork.subwork_status): -1 concluido, -2 detenido. Al detener el proceso, OTCS deja el sub-flujo en 1 y la tarea
+     "Aguardar Firma" activa (2), por eso el LiveReport la sigue trayendo. Vacio o no numerico (LiveReport sin la columna
+     EstadoFlujo) = abierto: se muestra. */
+  function cerradoEnContent(f) {
+    const negativo = (v) => /^-\d+$/.test(String(v));
+    return negativo(f.estadoFlujo) || negativo(f.estado);
+  }
+
+  /* Une filas con el mismo WorkID (un flujo con varios subflujos): la seleccion es por WorkID (se cancela y detiene el padre).
+     cerrado: todos sus subflujos estan cerrados en Content. Los datos mostrados son los de un subflujo abierto, si hay. */
   function leerFilas() {
     const porId = new Map();
     document.querySelectorAll('#origen tbody tr').forEach((tr) => {
@@ -1709,9 +1723,11 @@ REASIGNADO_OK
       if (!esDigitos(f.workId)) return;
       Object.assign(f, leerAtributos(f.atributos));
       f.titulo = f.tituloFlujo || f.tituloFirma;
+      f.cerrado = cerradoEnContent(f);
       const previa = porId.get(f.workId);
       if (previa) {
         if (f.subWorkId && previa.subs.indexOf(f.subWorkId) < 0) previa.subs.push(f.subWorkId);
+        if (previa.cerrado && !f.cerrado) Object.assign(previa, f, { subs: previa.subs });
         return;
       }
       f.subs = f.subWorkId ? [f.subWorkId] : [];
@@ -1730,11 +1746,16 @@ REASIGNADO_OK
     return String(v || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toUpperCase().trim();
   }
 
+  /* Por defecto solo los flujos que aun hay que cancelar: los ya detenidos o concluidos en Content se ocultan. */
+  function filasBase() {
+    return $('q-cerrados').checked ? state.filas : state.filas.filter((f) => !f.cerrado);
+  }
+
   function filtrar() {
     const q = {};
     FILTROS.forEach((n) => { q[n] = $('q-' + n).value.trim(); });
     const contiene = (valor, buscado) => !buscado || normal(valor).indexOf(normal(buscado)) >= 0;
-    state.visibles = state.filas.filter((f) => {
+    state.visibles = filasBase().filter((f) => {
       const dia = String(f.fecha || '').slice(0, 10);
       return contiene([f.workId].concat(f.subs).join(' '), q.flujo)
         && contiene(f.empleado + ' ' + f.correo, q.empleado)
@@ -1766,9 +1787,15 @@ REASIGNADO_OK
         h('td', { class: 'largo' }, f.documento)));
     });
     const n = state.visibles.length;
+    const base = filasBase().length;
+    const ocultos = state.filas.length - base;
     $('tabla-caja').hidden = n === 0;
     $('vacio').hidden = n !== 0;
-    $('total-resultados').textContent = n === state.filas.length ? (n ? '(' + n + ')' : '') : '(' + n + ' de ' + state.filas.length + ')';
+    $('total-resultados').textContent = n === base ? (n ? '(' + n + ')' : '') : '(' + n + ' de ' + base + ')';
+    $('nota-cerrados').hidden = ocultos === 0;
+    $('nota-cerrados').textContent = ocultos === 1
+      ? 'Se oculta 1 flujo ya detenido o concluido en Content Server: no hay nada que cancelar.'
+      : 'Se ocultan ' + ocultos + ' flujos ya detenidos o concluidos en Content Server: no hay nada que cancelar.';
   }
 
   function pintarSeleccion() {
@@ -2004,7 +2031,7 @@ REASIGNADO_OK
     }
     $('max-flujos').textContent = String(MAX_FLUJOS);
     state.filas = leerFilas();
-    state.visibles = state.filas.slice();
+    state.visibles = filasBase();
     pintarTabla();
 
     /* Lo que ya hay en el atributo (reapertura: pendientes de un lote anterior, o IDs pegados a mano). */
@@ -2026,8 +2053,10 @@ REASIGNADO_OK
     $('btn-limpiar-seleccion').addEventListener('click', () => { state.seleccion.clear(); setEstadoSel('', ''); refrescar(); });
     $('form-busqueda').addEventListener('submit', (e) => { e.preventDefault(); filtrar(); });
     FILTROS.forEach((n) => $('q-' + n).addEventListener('input', filtrar));
+    $('q-cerrados').addEventListener('change', filtrar);
     $('btn-limpiar-filtros').addEventListener('click', () => {
       FILTROS.forEach((n) => { $('q-' + n).value = ''; });
+      $('q-cerrados').checked = false;
       filtrar();
     });
     $('btn-volver-guardados').addEventListener('click', irARevision);

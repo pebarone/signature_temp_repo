@@ -30,7 +30,13 @@ página (ELSE). Fonte de dados = o LiveReport. As etapas ficam na mesma página,
   **"Revisar flujos"** (direto para a etapa C, sem regravar) e **"Cambiar selección"** (etapa A, já com esses IDs marcados).
 
 **A. Buscar e marcar.** O LiveReport traz todas as tarefas "Aguardar Firma" ativas (sub-fluxos de firma) e a página filtra na
-hora, sem recarregar: flujo (WorkID ou SubWorkID), empregado (login), nome, documento (contém, sem distinguir maiúsculas nem
+hora, sem recarregar. **Por padrão só aparecem os fluxos que ainda precisam ser cancelados**: some o WorkID cujo processo
+(`EstadoFlujo`) tem status negativo, ou cujos sub-fluxos de firma listados (`EstadoSubflujo`) têm todos status negativo (-1 concluído, -2 parado). Ao parar o
+processo, o OTCS deixa o sub-fluxo em 1 e a tarefa "Aguardar Firma" em 2, então sem esse corte os fluxos já cancelados (Adobe e
+Content) continuavam na lista. Uma nota diz quantos ficaram ocultos, e a caixa "Incluir flujos ya detenidos o concluidos" (desmarcada
+por padrão; "Limpiar filtros" a desmarca) mostra todos. Cancelado só no Adobe, com o stop pendente (`STOP_FAILED` ou passo "Detener
+flujos originales" ainda não executado), continua aparecendo: falta parar no Content. Status vazio ou não numérico (LiveReport ainda
+sem a coluna 9) conta como aberto. Filtros: flujo (WorkID ou SubWorkID), empregado (login), nome, documento (contém, sem distinguir maiúsculas nem
 acentos), desde e hasta (início do sub-fluxo, inclusivos); vazio = sem filtro. Empregado, nome, documento e DocID saem do JSON
 de atributos com os `wf_attrid` de `ATRIBUTOS_FIRMA` (4, 7, 6, iguais em todos os clones do mapa Firma). Quando o Empleado
 (4) vem vazio, como nos `Firma_Contratación_Inactivo` do QA, a coluna e o filtro de empregado usam o Email Firmante 1 (10). Tabela com
@@ -247,9 +253,14 @@ Assim os IDs que mudam entre instâncias e mapas não ficam no SQL.
   4. `TituloFirma`: título do sub-fluxo de assinatura;
   5. `Mapa`: nome do nó do mapa do sub-fluxo (`wsubwork.subwork_mapid = wmap.map_mapid`, `wmap.map_mapobjid = dtree.dataid`);
   6. `Fecha`: início do sub-fluxo, texto `AAAA-MM-DD HH24:MI` (a página filtra por data com ele);
-  7. `EstadoSubflujo`: `subwork_status` (códigos não conferidos; serve para a página descartar sub-fluxos parados);
+  7. `EstadoSubflujo`: `subwork_status` do sub-fluxo de firma (códigos não conferidos; a página trata negativo como
+     concluído/parado e o oculta);
   8. `Atributos`: JSON com todos os atributos do sub-fluxo, `[{id, t, n, s, i, login, nombre}]` (`wf_attrid`, tipo,
-     entrada, `wf_valstr`, `wf_valint`; para tipo 14, usuário, `login` = `kuaf.name` e `nombre` = nome completo).
+     entrada, `wf_valstr`, `wf_valint`; para tipo 14, usuário, `login` = `kuaf.name` e `nombre` = nome completo);
+  9. `EstadoFlujo`: `wwork.work_status` do processo (`WorkID`). Valores vistos em leituras de PROD (20/10/2026): **2** em
+     andamento, **-1** concluído, **-2** parado ("Workflow stopped"), e **1** em poucos casos (não identificado; tratado como
+     aberto). Um processo parado mantém `subwork_status` 1 nos sub-fluxos, por isso esta coluna é a que separa os já cancelados.
+     Está no fim para não mudar a posição das demais. **VALIDAR NO QA** (tabela `wwork` e os valores).
 - O WebReport escolhe, **por nome de mapa**, quais atributos usar (empregado, documento, DocID). Mapa **Firma** no QA
   (`wf_attrid`, tipo): 4 Empleado (14), 5 Firmante 2 (14), 6 DocID (-1), 7 Nombre del Documento (-1), 8 AttachID (-1),
   9 WFID (-1), 10 Email Firmante 1 (-1), 11 Email Firmante 2 (-1), 14 Tipo documental (10). Os demais mapas de assinatura
@@ -269,7 +280,7 @@ Assim os IDs que mudam entre instâncias e mapas não ficam no SQL.
 - **Executado no QA em 23/10/2026:** 10 tarefas, mapas `Firma_Contratación_Inactivo`, `Firma_Contratación_Activo` e
   `Firma_Documental`, todos com os mesmos `wf_attrid` (4 a 28) e DocID numérico; `WorkID` (pai) diferente de `SubWorkID`.
   Nos `Inactivo` o Empleado (4) vem vazio (o usuário, quando há, está no Firmante 2).
-- A página lê estas 8 colunas por posição e filtra sozinha; testada só com dados simulados (navegador local, 23/10/2026).
+- A página lê estas 9 colunas por posição e filtra sozinha; testada só com dados simulados (navegador local, 23/10/2026).
 - O LiveReport também roda nos ramos `guardar`, `leer` e `reasignar` (o WebReport sempre executa a fonte); as linhas só são
   emitidas na página.
 
@@ -364,7 +375,8 @@ de um acordo `OUT_FOR_SIGNATURE`, o stop do original e o registro em `IDs Cancel
    funcionava. Os marcadores de linha não podem ficar dentro de um IF aberto: os três IF são fechados antes do `STARTROW`,
    reabertos dentro da linha em volta do `<tr>` e reabertos de novo depois do `ENDROW`.
 5. Saída das colunas do LiveReport no WebReport: o JSON de `Atributos` (coluna 8) chega íntegro dentro do textarea e
-   `Fecha` (coluna 6) no formato `AAAA-MM-DD HH24:MI`.
+   `Fecha` (coluna 6) no formato `AAAA-MM-DD HH24:MI`. `EstadoFlujo` (coluna 9) chega como `-2` num processo parado pelo
+   cancelamento e como `2` num em andamento (o fluxo parado some da lista por padrão).
 6. `&WORKID`, `&SUBWORKID` e `&TASKID` disponíveis na tarefa quando o WebReport abre.
 7. Formulário aberto pode sobrescrever o atributo ao enviar a tarefa; e se o formulário permite guardar sem enviar (plano C).
 8. Forma do array que o servidor envia a `IDs Cancelados` (`updateTaskForm`), e a leitura desse atributo multivalor pelo

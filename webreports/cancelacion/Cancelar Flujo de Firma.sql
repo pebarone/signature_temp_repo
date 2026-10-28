@@ -22,12 +22,15 @@ SELECT
         LEFT JOIN kuaf k
                ON a.wf_attrtype = 14 AND k.id = a.wf_valint
         WHERE a.wf_id = t.subworktask_subworkid
-    )                                         AS Atributos
+    )                                         AS Atributos,
+    w.work_status                             AS EstadoFlujo
 FROM wsubworktask t
 JOIN wsubwork sw
        ON sw.subwork_workid = t.subworktask_workid AND sw.subwork_subworkid = t.subworktask_subworkid
 LEFT JOIN wsubwork p
        ON p.subwork_workid = t.subworktask_workid AND p.subwork_subworkid = t.subworktask_workid
+LEFT JOIN wwork w
+       ON w.work_workid = t.subworktask_workid
 LEFT JOIN wmap m
        ON m.map_mapid = sw.subwork_mapid
 LEFT JOIN dtree d
