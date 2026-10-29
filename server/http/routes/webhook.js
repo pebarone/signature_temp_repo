@@ -2,12 +2,18 @@
 // Webhook do Adobe Sign: HEAD/GET (handshake) e POST (eventos).
 // O POST persiste o evento (dedupe por webhookNotificationId) e responde 200 na hora;
 // o download do PDF / SendOn rodam em segundo plano (reconciliationService).
+// Acordo desconhecido (adoção ligada): aguarda a adoção por um tempo limitado e responde 503 se não deu para ler o acordo no
+// Adobe (ou demorou demais), para o Adobe reenviar o evento: com o 200 ele não reenviaria e o evento se perderia.
 const express = require('express');
 const { parseWebhookPayload } = require('../../domain/eventPolicy');
 const { describeError, oneLine } = require('../../infra/util');
 
 // Só caracteres seguros num header (evita injeção de cabeçalho/log); o ClientId do Adobe é alfanumérico
 const CLIENT_ID_RE = /^[A-Za-z0-9._-]{1,200}$/;
+// Espera máxima pela adoção de um acordo desconhecido antes de responder (o Adobe tem timeout próprio no webhook).
+// Sobrescrevível por config.webhookAdoptionWaitMs (testes).
+const ADOPTION_WAIT_MS = 8000;
+const ADOPTION_TRANSIENT = 'transient';
 
 function webhookRoutes({ config, logger, reconciliation }) {
   const router = express.Router();
@@ -47,7 +53,7 @@ function webhookRoutes({ config, logger, reconciliation }) {
   });
 
   // POST: eventos (assinatura concluída, rejeitada, etc.)
-  router.post('/webhook', (req, res) => {
+  router.post('/webhook', async (req, res) => {
     echoClientId(req, res);
 
     // Autenticidade (best effort: o ClientId não é segredo). Com WEBHOOK_REQUIRE_CLIENT_ID=true header
@@ -88,11 +94,36 @@ function webhookRoutes({ config, logger, reconciliation }) {
       return res.status(500).send('Event could not be stored');
     }
 
-    res.status(200).send('OK');
-
     // O processamento (e a adoção de acordo desconhecido) já está em andamento; só garante que nenhuma rejeição fique solta
     if (result.processing) result.processing.catch(() => {});
     if (result.adoption) result.adoption.catch(() => {});
+
+    if (result.adopted) {
+      // Acordo desconhecido: o evento só é persistido depois da adoção. Falha transitória ao ler o acordo no Adobe (ou
+      // demora acima do limite) => 503 para o Adobe reenviar; se a adoção terminar em segundo plano, o reenvio é duplicado
+      // por notificationId e nada é processado duas vezes. Recusado ("não é nosso") => 200 como antes.
+      // Só um número finito positivo sobrescreve (null/0/texto inválido voltam ao padrão, em vez de virar 0 ms)
+      const override = Number(config.webhookAdoptionWaitMs);
+      const waitMs = Number.isFinite(override) && override > 0 ? override : ADOPTION_WAIT_MS;
+      let timer;
+      try {
+        const outcome = await Promise.race([
+          result.adopted,
+          new Promise((resolve) => { timer = setTimeout(() => resolve(ADOPTION_TRANSIENT), waitMs); })
+        ]);
+        if (outcome === ADOPTION_TRANSIENT) {
+          logger.warn(`Webhook: no se pudo adoptar el acuerdo ${oneLine(parsed.agreementId)} ahora (evento ${oneLine(parsed.eventName)}): se responde 503 para que Adobe reenvíe`);
+          return res.status(503).send('Agreement could not be verified, retry later');
+        }
+      } catch (e) {
+        logger.error(`Webhook: falló al persistir el evento ${parsed.notificationId || ''} tras la adopción: ${describeError(e)}`);
+        return res.status(500).send('Event could not be stored');
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+
+    res.status(200).send('OK');
   });
 
   return router;

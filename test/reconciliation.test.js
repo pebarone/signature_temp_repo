@@ -1,10 +1,10 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { parseWebhookPayload } = require('../server/domain/eventPolicy');
-const { backoffDelay } = require('../server/domain/agreementState');
+const { backoffDelay, shouldPoll } = require('../server/domain/agreementState');
 const {
   buildWorld, seedAgreement, seedAdobeForEvent, webhookPayload, makeClock, makeAdobe, makeOtcs, tmpDir, httpError, basicHeader,
-  waitFor
+  waitFor, INTEGRATION_USER_ID, HUMAN_USER_ID
 } = require('./support/fakes');
 const path = require('path');
 
@@ -739,7 +739,7 @@ test('erro 4xx na disposição também retenta com backoff (nenhum status vai di
   }
 });
 
-test('erro 4xx no upload do PDF: nó existente retenta; nó inexistente (400/403/404) cai para a pasta; 429 e download 404 do Adobe retentam', async () => {
+test('erro 4xx no upload do PDF: nó existente (inclusive 403 sem permissão) retenta; nó inexistente (400/404) cai para a pasta; 429 e download 404 do Adobe retentam', async () => {
   // 403 no addVersion com o nó existente (a sonda confirma): transitório, sem fallback
   let world = await buildWorld();
   seedAgreement(world);
@@ -760,16 +760,26 @@ test('erro 4xx no upload do PDF: nó existente retenta; nó inexistente (400/403
   assert.equal(world.otcs.versions.length, 1);
   await world.close();
 
-  // 403 com o nó inexistente/inacessível: fallback para a pasta de anexos
+  // 403 e a sonda também responde 403 (o nó existe, o usuário de integração não tem permissão): o PDF assinado NÃO vai para
+  // a pasta de anexos (o fluxo distribui o DocID sem assinatura); retenta até a permissão ser corrigida
   world = await buildWorld();
   seedAgreement(world);
   world.otcs.missingNodes.add('1001');
   world.otcs.missingNodeStatus = 403;
   await fire(world, 'AGREEMENT_WORKFLOW_COMPLETED');
   rec = world.repo.get('AG-1');
-  assert.equal(rec.state, 'completed');
-  assert.equal(world.otcs.uploads.length, 1);
-  assert.equal(world.otcs.uploads[0].folderId, '2002');
+  assert.equal(rec.state, 'signed');
+  assert.equal(rec.attempts, 1);
+  assert.match(rec.lastError, /el documento 1001 existe pero rechazó la nueva versión.*HTTP 403.*sin permiso/);
+  assert.equal(world.otcs.uploads.length, 0, 'sem fallback para a pasta');
+  assert.equal(world.otcs.dispositionCalls().length, 0);
+  assert.equal(world.timers.length, 1);
+  world.otcs.missingNodes.clear(); // permissão corrigida
+  world.clock.advance(60 * 1000);
+  await world.reconciliation.reconcile('AG-1', { force: false });
+  assert.equal(world.repo.get('AG-1').state, 'completed');
+  assert.deepEqual(world.otcs.versions.map((v) => v.nodeId), ['1001']);
+  assert.equal(world.otcs.uploads.length, 0);
   await world.close();
 
   world = await buildWorld();
@@ -1315,7 +1325,7 @@ test('tarefa de início ambígua (dica = pai, dois subprocessos): needs_attentio
 /* ---------- 4xx do OTCS: sonda do nó e retry (M1) ---------- */
 
 test('M1: addVersion 400 em nó inexistente/inacessível => sonda, fallback para a pasta e conclusão; 404 não sonda', async () => {
-  for (const status of [400, 403, 404]) {
+  for (const status of [400, 404]) {
     const world = await buildWorld();
     seedAgreement(world);
     world.otcs.missingNodes.add('1001');
@@ -1472,4 +1482,440 @@ test('M1: getProcessSteps com 403 é transitório; 404 (workflow inexistente) se
   assert.equal(w3.repo.get('AG-3').attentionKind, 'permanent');
   assert.match(gone.reason, /workflow inexistente \(3003\)/);
   await w3.close();
+});
+
+/* ---------- B1: tarefa de firma com outro responsável ---------- */
+
+test('B1 disposição: "Aguardar Firma" atribuída a outro usuário => espera a reatribuição (sem SendOn nem log de erro), esgota com motivo explícito e conclui depois de reatribuir', async () => {
+  const world = await buildWorld({ env: { RETRY_MAX_ATTEMPTS: '3' } });
+  seedAgreement(world); // 3003/3004 na tarefa de firma
+  world.otcs.assign(3003, 3, HUMAN_USER_ID);
+  await fire(world, 'AGREEMENT_WORKFLOW_COMPLETED');
+  let rec = world.repo.get('AG-1');
+  assert.equal(rec.state, 'pdf_delivered');
+  assert.equal(rec.pdfDelivered, true, 'o PDF segue entregue; só a disposição espera');
+  assert.equal([rec.attempts, rec.lastErrorStage].join(), '1,disposition');
+  assert.match(rec.lastError, /la tarea de firma \(3 "Aguardar Firma"\) está asignada a otro usuario \(279463\); reasígnela al usuario de integración/);
+  assert.equal(world.otcs.sendons.length, 0, 'nenhum SendOn fadado ao erro');
+  assert.ok(!world.otcs.modelCalls.some((c) => c[0] === 'getTaskForm'), 'nem leitura do formulário');
+  assert.equal(world.timers.length, 1, 'retry agendado com backoff');
+  assert.deepEqual(world.logger.lines.error, [], 'espera transitória: info, não erro');
+  assert.ok(world.logger.has('info', /asignada a otro usuario/));
+  assert.deepEqual(await world.reconciliation.runQueue(), [], 'o backoff ainda não venceu');
+
+  world.clock.advance(60 * 1000);
+  assert.equal((await world.reconciliation.reconcile('AG-1', { force: false })).status, 'waiting_assignee');
+  world.clock.advance(120 * 1000);
+  const res = await world.reconciliation.reconcile('AG-1', { force: false });
+  assert.equal(res.status, 'needs_attention');
+  rec = world.repo.get('AG-1');
+  assert.equal(rec.attentionKind, 'retries_exhausted', 'reabre sozinho depois de ATTENTION_RETRY_HOURS');
+  assert.match(rec.attentionReason, /reintentos agotados en disposition \(3\/3\).*asignada a otro usuario \(279463\)/);
+  assert.equal(world.otcs.sendons.length, 0);
+
+  world.otcs.assign(3003, 3, INTEGRATION_USER_ID);
+  assert.equal((await world.reconciliation.reconcile('AG-1', { manual: true })).status, 'completed');
+  rec = world.repo.get('AG-1');
+  assert.equal([rec.state, rec.attempts].join(), 'completed,0');
+  assert.deepEqual(world.otcs.dispositionCalls().map((s) => s.disposition), ['Firmado']);
+  await world.close();
+});
+
+test('B1 disposição (L5): responsáveis informados e VAZIOS ([]: atribuição a grupo) => tenta o SendOn como com null, sem consultar o usuário nem esperar a reatribuição', async () => {
+  const world = await buildWorld();
+  seedAgreement(world);
+  world.otcs.task(3003, 3).assignees = [];
+  world.otcs.currentUserFailure = httpError(500, 'não deve ser chamado');
+  await fire(world, 'AGREEMENT_WORKFLOW_COMPLETED');
+  assert.equal(world.otcs.modelCalls.filter(([m]) => m === 'getCurrentUser').length, 0);
+  assert.equal(world.calls.filter((c) => c[0] === 'otcs.sendon').length, 1, 'tentou o SendOn');
+  const rec = world.repo.get('AG-1');
+  // o fake só aceita o SendOn do responsável (o OTCS real também): a tentativa falha como erro de disposição, não como espera
+  assert.equal(rec.lastErrorStage, 'disposition');
+  assert.doesNotMatch(String(rec.lastError), /asignada a otro usuario/);
+  await world.close();
+});
+
+test('B1 disposição: responsáveis desconhecidos (null) => SendOn como antes; usuário de integração entre vários => SendOn; falha do getCurrentUser é transitória', async () => {
+  // assigneeIds null: nem consulta o usuário
+  let world = await buildWorld();
+  seedAgreement(world);
+  world.otcs.unknownAssignees('3003');
+  world.otcs.currentUserFailure = httpError(500, 'não deve ser chamado');
+  await fire(world, 'AGREEMENT_WORKFLOW_COMPLETED');
+  assert.equal(world.repo.get('AG-1').state, 'completed');
+  assert.equal(world.otcs.modelCalls.filter(([m]) => m === 'getCurrentUser').length, 0);
+  await world.close();
+
+  // vários responsáveis, entre eles o usuário de integração
+  world = await buildWorld();
+  seedAgreement(world);
+  world.otcs.task(3003, 3).assignees = [HUMAN_USER_ID, INTEGRATION_USER_ID];
+  await fire(world, 'AGREEMENT_WORKFLOW_COMPLETED');
+  assert.equal(world.repo.get('AG-1').state, 'completed');
+  await world.close();
+
+  // não deu para saber quem é o usuário de integração: retry (stage disposition), sem SendOn
+  world = await buildWorld();
+  seedAgreement(world);
+  world.otcs.currentUserFailure = httpError(500, 'auth down');
+  await fire(world, 'AGREEMENT_WORKFLOW_COMPLETED');
+  let rec = world.repo.get('AG-1');
+  assert.equal([rec.state, rec.attempts, rec.lastErrorStage].join(), 'pdf_delivered,1,disposition');
+  assert.equal(world.otcs.sendons.length, 0);
+  world.otcs.currentUserFailure = null;
+  world.clock.advance(60 * 1000);
+  await world.reconciliation.reconcile('AG-1', { force: false });
+  assert.equal(world.repo.get('AG-1').state, 'completed');
+  await world.close();
+
+  // tarefa já concluída (por outra pessoa): conclui como externa sem checar o responsável
+  world = await buildWorld();
+  seedAgreement(world);
+  world.otcs.assign(3003, 3, HUMAN_USER_ID);
+  world.otcs.task(3003, 3).status = 'completed';
+  world.otcs.currentUserFailure = httpError(500, 'não deve ser chamado');
+  await fire(world, 'AGREEMENT_WORKFLOW_COMPLETED');
+  rec = world.repo.get('AG-1');
+  assert.equal([rec.state, rec.completedExternally].join(), 'completed,true');
+  await world.close();
+});
+
+/* ---------- B2: "Aguardar Firma" concluída de uma passagem anterior ---------- */
+
+// O SendOn do início reativa a "Aguardar Firma" (a que já estava em completed volta a current), como no laço do mapa
+function loopBackOnStartSendOn(world, processId = '3003', subprocessId = 3004) {
+  const original = world.otcs.sendOnWorkflow;
+  world.otcs.sendOnWorkflow = async (args) => {
+    const r = await original(args);
+    if (!args.disposition) world.otcs.task(processId, 3, subprocessId).status = 'current';
+    return r;
+  };
+}
+
+test('B2 disposição: "Aguardar Firma" concluída de uma passagem anterior com o início deste acordo ainda current => envia o início e dá a disposição na nova passagem', async () => {
+  const world = await buildWorld();
+  world.otcs.addWorkflow('3003', { subprocessId: '3004', stage: 'start' });
+  world.otcs.task(3003, 3, 3004).status = 'completed'; // a firma da passagem anterior continua em completed
+  seedAgreement(world, 'AG-1', { startSendonDone: false });
+  loopBackOnStartSendOn(world);
+
+  await fire(world, 'AGREEMENT_WORKFLOW_COMPLETED');
+  const rec = world.repo.get('AG-1');
+  assert.equal(rec.state, 'completed');
+  assert.equal(rec.completedExternally, false, 'não é conclusão externa');
+  assert.equal(rec.startSendonDone, true);
+  assert.deepEqual(world.otcs.sendons.map((s) => s.disposition || 'sendon'), ['sendon', 'Firmado']);
+  assert.equal(world.otcs.sendons[0].taskId, 2, 'o primeiro SendOn é o do início');
+  assert.equal(world.otcs.task(3003, 3, 3004).status, 'completed');
+  await world.close();
+});
+
+test('B2 disposição: logo após o SendOn do início a firma ainda figura concluída (nova ainda não ativa) => retry transitório, não conclusão externa', async () => {
+  const world = await buildWorld();
+  world.otcs.addWorkflow('3003', { subprocessId: '3004', stage: 'start' });
+  world.otcs.task(3003, 3, 3004).status = 'completed';
+  seedAgreement(world, 'AG-1', { startSendonDone: false });
+
+  await fire(world, 'AGREEMENT_WORKFLOW_COMPLETED');
+  let rec = world.repo.get('AG-1');
+  assert.equal(rec.startSendonDone, true, 'o início foi enviado');
+  assert.equal(rec.sendonDone, false);
+  assert.equal(rec.completedExternally, false);
+  assert.equal(rec.lastErrorStage, 'disposition');
+  assert.match(rec.lastError, /aún figura concluida tras enviar el pedido de firma/);
+  assert.equal(world.otcs.sendons.length, 1, 'só o SendOn do início');
+  assert.equal(world.timers.length, 1);
+
+  world.otcs.task(3003, 3, 3004).status = 'current'; // a nova passagem ativou
+  world.clock.advance(60 * 1000);
+  await world.reconciliation.reconcile('AG-1', { force: false });
+  rec = world.repo.get('AG-1');
+  assert.equal([rec.state, rec.completedExternally].join(), 'completed,false');
+  assert.deepEqual(world.otcs.sendons.map((s) => s.disposition || 'sendon'), ['sendon', 'Firmado']);
+  await world.close();
+});
+
+test('B2 disposição (M3): a firma nova continua sem ativar no retry seguinte => segue transitório (não conclusão externa) até esgotar as tentativas', async () => {
+  const world = await buildWorld({ env: { RETRY_MAX_ATTEMPTS: '3' } });
+  world.otcs.addWorkflow('3003', { subprocessId: '3004', stage: 'start' });
+  world.otcs.task(3003, 3, 3004).status = 'completed'; // a firma da passagem anterior
+  seedAgreement(world, 'AG-1', { startSendonDone: false });
+
+  await fire(world, 'AGREEMENT_WORKFLOW_COMPLETED');
+  let rec = world.repo.get('AG-1');
+  assert.equal(rec.startSendonDone, true);
+  assert.ok(rec.startSendonAt, 'o SendOn de início é nosso e fica registrado');
+  assert.equal(rec.lastErrorStage, 'disposition');
+  assert.equal(world.otcs.sendons.length, 1);
+
+  // retry seguinte: startSentNow é false, mas o início foi enviado depois do final => ainda é a firma da passagem anterior
+  world.clock.advance(60 * 1000);
+  await world.reconciliation.reconcile('AG-1', { force: false });
+  rec = world.repo.get('AG-1');
+  assert.equal(rec.sendonDone, false);
+  assert.equal(rec.completedExternally, false);
+  assert.equal(rec.lastErrorStage, 'disposition');
+  assert.match(rec.lastError, /aún figura concluida tras enviar el pedido de firma/);
+  assert.equal(rec.attempts, 2);
+
+  world.clock.advance(120 * 1000);
+  const res = await world.reconciliation.reconcile('AG-1', { force: false });
+  assert.equal(res.status, 'needs_attention');
+  rec = world.repo.get('AG-1');
+  assert.equal(rec.attentionKind, 'retries_exhausted');
+  assert.equal(rec.completedExternally, false);
+  assert.equal(world.otcs.sendons.length, 1, 'só o SendOn do início');
+  await world.close();
+});
+
+test('B2 disposição (M3): final antes do início; a firma NOVA ativa com outro usuário e concluída à mão => conclusão externa, não trava', async () => {
+  const world = await buildWorld({ env: { RETRY_MAX_ATTEMPTS: '3' } });
+  world.otcs.addWorkflow('3003', { subprocessId: '3004', stage: 'start' });
+  seedAgreement(world, 'AG-1', { startSendonDone: false });
+  world.otcs.task(3003, 3, 3004).assignees = [HUMAN_USER_ID]; // "Aguardar Firma" com outro usuário
+  await fire(world, 'AGREEMENT_WORKFLOW_COMPLETED');
+  let rec = world.repo.get('AG-1');
+  assert.equal(rec.startSendonDone, true);
+  assert.ok(Date.parse(rec.startSendonAt) >= Date.parse(rec.finalAt), 'início enviado depois do final');
+  assert.ok(rec.signTaskId, 'o acordo viu a sua tarefa de firma (current)');
+  assert.equal(rec.sendonDone, false, 'esperando a reatribuição');
+
+  // um humano conclui a "Aguardar Firma" (a nova) à mão
+  world.otcs.task(3003, 3, 3004).status = 'completed';
+  world.clock.advance(10 * 60 * 1000);
+  const res = await world.reconciliation.reconcile('AG-1', { force: false });
+  rec = world.repo.get('AG-1');
+  assert.equal(res.status, 'completed');
+  assert.equal([rec.state, rec.completedExternally].join(), 'completed,true');
+  assert.equal(world.otcs.sendons.length, 1, 'só o SendOn do início');
+  await world.close();
+});
+
+test('B2 disposição (M3): início "já enviado" sem SendOn nosso não grava startSendonAt e a firma concluída segue como conclusão externa', async () => {
+  const world = await buildWorld();
+  world.otcs.addWorkflow('3003', { subprocessId: '3004', stage: 'done' });
+  seedAgreement(world, 'AG-1', { startSendonDone: false });
+  await fire(world, 'AGREEMENT_WORKFLOW_COMPLETED');
+  const rec = world.repo.get('AG-1');
+  assert.equal(rec.startSendonDone, true);
+  assert.equal(rec.startSendonAt, null, 'nenhum SendOn nosso');
+  assert.equal([rec.state, rec.completedExternally].join(), 'completed,true');
+  await world.close();
+});
+
+test('B2 disposição: firma concluída e início também concluído (ou início já enviado) segue como conclusão externa', async () => {
+  // início não é current: nada a enviar, a firma concluída é de fato externa
+  let world = await buildWorld();
+  world.otcs.addWorkflow('3003', { subprocessId: '3004', stage: 'done' });
+  seedAgreement(world, 'AG-1', { startSendonDone: false });
+  await fire(world, 'AGREEMENT_WORKFLOW_COMPLETED');
+  let rec = world.repo.get('AG-1');
+  assert.equal([rec.state, rec.completedExternally].join(), 'completed,true');
+  assert.equal(world.otcs.sendons.length, 0);
+  await world.close();
+
+  // início deste acordo já enviado (startSendonDone): a firma concluída não dispara outro SendOn do início
+  world = await buildWorld();
+  world.otcs.addWorkflow('3003', { subprocessId: '3004', stage: 'start' });
+  world.otcs.task(3003, 3, 3004).status = 'completed';
+  seedAgreement(world, 'AG-1', { startSendonDone: true });
+  await fire(world, 'AGREEMENT_WORKFLOW_COMPLETED');
+  rec = world.repo.get('AG-1');
+  assert.equal([rec.state, rec.completedExternally].join(), 'completed,true');
+  assert.equal(world.otcs.sendons.length, 0);
+  await world.close();
+});
+
+/* ---------- B4: ABORTED no polling x webhook de falha de conversão ---------- */
+
+const CONVERSION_EVENTS = [{ type: 'CREATED' }, { type: 'AUTO_CANCELLED_CONVERSION_PROBLEM' }];
+
+test('B4 polling: ABORTED com o evento de falha de conversão => final_conversion_failed (Rechazado), como o webhook', async () => {
+  const world = await buildWorld();
+  seedAgreement(world);
+  world.adobe.agreements['AG-1'] = { id: 'AG-1', status: 'ABORTED' };
+  world.adobe.events['AG-1'] = CONVERSION_EVENTS;
+  const s = await world.poller.tick();
+  assert.equal(s.finalized, 1);
+  const rec = world.repo.get('AG-1');
+  assert.equal([rec.finalKind, rec.state, rec.adobeStatus, rec.sendonDone].join(), 'final_conversion_failed,cancelled,ABORTED,true');
+  assert.equal(rec.disposition, 'Rechazado');
+  assert.equal(world.otcs.dispositionCalls()[0].comment, 'Adobe Sign no pudo procesar el documento');
+  assert.equal(callNames(world).includes('adobe.download'), false);
+  assert.equal(world.calls.filter((c) => c[0] === 'adobe.getAgreement').length, 1, 'o status gravado dispensa o verify');
+  assert.equal(world.calls.filter((c) => c[0] === 'adobe.getAgreementEvents').length, 1);
+  await world.close();
+});
+
+test('B4 polling: ABORTED sem o evento de conversão continua em needs_attention (event); falha ao ler os eventos não finaliza e o próximo ciclo retenta', async () => {
+  const world = await buildWorld();
+  seedAgreement(world);
+  seedAgreement(world, 'AG-2', { workflowId: '3103', subworkflowId: '3104' });
+  world.adobe.agreements['AG-1'] = { id: 'AG-1', status: 'ABORTED' };
+  world.adobe.events['AG-1'] = [{ type: 'CREATED' }, { type: 'DOCUMENTS_DELETED' }];
+  world.adobe.agreements['AG-2'] = { id: 'AG-2', status: 'ABORTED' };
+  world.adobe.events['AG-2'] = CONVERSION_EVENTS;
+  world.adobe.eventsError = httpError(503, 'events down');
+
+  await world.poller.tick();
+  assert.equal(world.repo.get('AG-1').state, 'pending', 'sem o histórico não decide (nem needs_attention precipitado)');
+  assert.equal(world.repo.get('AG-2').state, 'pending');
+  assert.equal(world.repo.get('AG-1').adobeStatus, null);
+  assert.ok(world.logger.has('warn', /no se pudo consultar los eventos del acuerdo en Adobe/));
+
+  world.adobe.eventsError = null;
+  await world.poller.tick();
+  const r1 = world.repo.get('AG-1');
+  assert.equal([r1.state, r1.attentionKind, r1.finalKind].join(), 'needs_attention,event,');
+  assert.equal(r1.attentionReason, 'estado Adobe ABORTED');
+  assert.equal(world.repo.get('AG-2').finalKind, 'final_conversion_failed');
+  assert.equal(world.otcs.dispositionCalls().length, 1, 'só o AG-2 foi encerrado');
+  await world.close();
+});
+
+test('B4 verify: webhook de recusa com o Adobe em ABORTED + evento de conversão adota a falha de conversão; final OK nunca adota nem pede o histórico', async () => {
+  const world = await buildWorld();
+  seedAgreement(world);
+  world.adobe.agreements['AG-1'] = { id: 'AG-1', status: 'ABORTED' };
+  world.adobe.events['AG-1'] = CONVERSION_EVENTS;
+  await fire(world, 'AGREEMENT_REJECTED');
+  const rec = world.repo.get('AG-1');
+  assert.equal([rec.finalKind, rec.state, rec.sendonDone].join(), 'final_conversion_failed,cancelled,true');
+  assert.equal(world.otcs.dispositionCalls()[0].comment, 'Adobe Sign no pudo procesar el documento');
+  assert.ok(world.repo.listEvents('AG-1').some((e) => e.source === 'verify' && e.canonical === 'VERIFY_STATUS_ABORTED'));
+  assert.equal(world.calls.filter((c) => c[0] === 'adobe.getAgreementEvents').length, 1);
+  await world.close();
+
+  const w2 = await buildWorld();
+  seedAgreement(w2);
+  w2.adobe.agreements['AG-1'] = { id: 'AG-1', status: 'ABORTED' };
+  w2.adobe.events['AG-1'] = CONVERSION_EVENTS;
+  await fire(w2, 'AGREEMENT_WORKFLOW_COMPLETED');
+  assert.equal(w2.repo.get('AG-1').attentionKind, 'unconfirmed');
+  assert.equal(w2.calls.filter((c) => c[0] === 'adobe.getAgreementEvents').length, 0);
+  await w2.close();
+});
+
+test('B4 reconcile manual com refresh: ABORTED com evento de conversão finaliza; falha nos eventos devolve refresh_failed', async () => {
+  const world = await buildWorld();
+  seedAgreement(world);
+  world.adobe.agreements['AG-1'] = { id: 'AG-1', status: 'ABORTED' };
+  world.adobe.events['AG-1'] = CONVERSION_EVENTS;
+  world.adobe.eventsError = httpError(500, 'events down');
+  assert.equal((await world.reconciliation.reconcile('AG-1', { refresh: true })).status, 'refresh_failed');
+  assert.equal(world.repo.get('AG-1').finalKind, null);
+
+  world.adobe.eventsError = null;
+  const res = await world.reconciliation.reconcile('AG-1', { refresh: true });
+  assert.equal(res.status, 'completed');
+  assert.equal(world.repo.get('AG-1').finalKind, 'final_conversion_failed');
+  await world.close();
+});
+
+/* ---------- B5: polling até o prazo do acordo ---------- */
+
+test('B5 shouldPoll: além de POLL_MAX_AGE_DAYS só continua até expiresAt + 1 dia', () => {
+  const DAY = 24 * 60 * 60 * 1000;
+  const created = '2026-01-01T00:00:00.000Z';
+  const base = Date.parse(created);
+  const rec = (extra = {}) => ({ createdAt: created, state: 'pending', ...extra });
+  const at = (days) => base + days * DAY;
+  const expiresAt = new Date(at(200)).toISOString();
+
+  assert.equal(shouldPoll(rec(), at(89), 90), true);
+  assert.equal(shouldPoll(rec(), at(91), 90), false, 'sem prazo conhecido: como antes');
+  assert.equal(shouldPoll(rec({ expiresAt: null }), at(91), 90), false);
+  assert.equal(shouldPoll(rec({ expiresAt: 'lixo' }), at(91), 90), false);
+  assert.equal(shouldPoll(rec({ expiresAt }), at(91), 90), true, 'mais velho que o máximo, mas dentro do prazo');
+  assert.equal(shouldPoll(rec({ expiresAt }), at(201), 90), true, 'folga de 1 dia depois do prazo');
+  assert.equal(shouldPoll(rec({ expiresAt }), at(201) + 1, 90), false);
+  assert.equal(shouldPoll(rec({ expiresAt: new Date(at(30)).toISOString() }), at(60), 90), true, 'dentro da idade máxima nada muda');
+  assert.equal(shouldPoll(rec({ expiresAt }), at(500), 0), true, 'maxAgeDays 0 = sem limite');
+  // o resto das regras não muda
+  assert.equal(shouldPoll(rec({ expiresAt, finalKind: 'final_ok' }), at(91), 90), false);
+  assert.equal(shouldPoll(rec({ expiresAt, sendonDone: true }), at(91), 90), false);
+  assert.equal(shouldPoll(rec({ expiresAt, state: 'needs_attention' }), at(91), 90), false);
+});
+
+test('B5 poller: acordo com prazo (expiresAt) além de POLL_MAX_AGE_DAYS continua sendo consultado e finaliza; sem prazo ou vencido há mais de 1 dia não', async () => {
+  const DAY = 24 * 60 * 60 * 1000;
+  const world = await buildWorld({ env: { POLL_MAX_AGE_DAYS: '90' } });
+  seedAgreement(world, 'AG-DUE', { expiresAt: new Date(world.clock.ms() + 200 * DAY).toISOString() });
+  seedAgreement(world, 'AG-NODUE', { workflowId: '3103', subworkflowId: '3104' });
+  seedAgreement(world, 'AG-LATE', { workflowId: '3203', subworkflowId: '3204', expiresAt: new Date(world.clock.ms() + 50 * DAY).toISOString() });
+  for (const id of ['AG-DUE', 'AG-NODUE', 'AG-LATE']) world.adobe.agreements[id] = { id, status: 'EXPIRED' };
+  world.clock.advance(100 * DAY);
+
+  const s = await world.poller.tick();
+  assert.equal(s.polled, 1);
+  assert.equal(s.finalized, 1);
+  assert.equal(world.repo.get('AG-DUE').state, 'expired');
+  assert.equal(world.repo.get('AG-NODUE').finalKind, null);
+  assert.equal(world.repo.get('AG-LATE').finalKind, null);
+  await world.close();
+});
+
+/* ---------- B7: exceção inesperada no pipeline ---------- */
+
+test('B7: exceção inesperada na reconciliação conta como falha (backoff) e esgota em retries_exhausted, em vez de repetir para sempre', async () => {
+  const world = await buildWorld({ env: { RETRY_MAX_ATTEMPTS: '3', ATTENTION_RETRY_HOURS: '6' } });
+  seedAgreement(world);
+  const upsert = world.repo.upsert;
+  world.repo.upsert = (id, patch) => {
+    if (patch && 'signSubprocessId' in patch) throw new TypeError('bug simulado');
+    return upsert(id, patch);
+  };
+
+  await fire(world, 'AGREEMENT_WORKFLOW_COMPLETED');
+  let rec = world.repo.get('AG-1');
+  assert.equal(rec.state, 'pdf_delivered');
+  assert.equal([rec.attempts, rec.lastErrorStage].join(), '1,reconcile');
+  assert.match(rec.lastError, /bug simulado/);
+  assert.ok(rec.nextAttemptAt, 'backoff gravado');
+  assert.equal(world.timers.length, 1);
+  assert.ok(world.logger.has('error', /error inesperado en la reconciliación: .*bug simulado/));
+  assert.deepEqual(await world.reconciliation.runQueue(), [], 'o runQueue respeita o backoff (antes: repetia a cada tick)');
+
+  world.clock.advance(60 * 1000);
+  await world.reconciliation.reconcile('AG-1', { force: false });
+  assert.equal(world.repo.get('AG-1').attempts, 2);
+  world.clock.advance(120 * 1000);
+  await world.reconciliation.reconcile('AG-1', { force: false });
+  rec = world.repo.get('AG-1');
+  assert.equal([rec.state, rec.attentionKind].join(), 'needs_attention,retries_exhausted');
+  assert.match(rec.attentionReason, /reintentos agotados en reconcile \(3\/3\).*bug simulado/);
+  assert.deepEqual(await world.reconciliation.runQueue(), [], 'needs_attention não volta à fila');
+
+  // corrigido o bug, a reabertura automática (ATTENTION_RETRY_HOURS) devolve o acordo à fila e ele conclui
+  world.repo.upsert = upsert;
+  world.clock.advance(7 * 60 * 60 * 1000);
+  assert.deepEqual(await world.reconciliation.reopenStale(), ['AG-1']);
+  assert.deepEqual(await world.reconciliation.runQueue(), ['AG-1']);
+  assert.equal(world.repo.get('AG-1').state, 'completed');
+  await world.close();
+});
+
+test('B7: exceção inesperada com falha também no registro (banco indisponível) só vai para o log e não lança', async () => {
+  const world = await buildWorld();
+  seedAgreement(world);
+  world.repo.get = () => { throw new Error('db fechado'); };
+  const res = await world.reconciliation.reconcile('AG-1');
+  assert.equal(res.status, 'error');
+  assert.ok(world.logger.has('error', /no se pudo registrar el error inesperado de la reconciliación/));
+  await world.close();
+});
+
+test('B4 verify: falha de conversão já registrada e o Adobe em ABORTED => confirma sem buscar os eventos (falha do /events não trava)', async () => {
+  const world = await buildWorld();
+  seedAgreement(world, 'AG-1', { finalKind: 'final_conversion_failed', state: 'cancelled', finalAt: '2026-06-22T12:00:00.000Z', adobeStatus: null });
+  world.adobe.agreements['AG-1'] = { id: 'AG-1', status: 'ABORTED' };
+  world.adobe.eventsError = httpError(503, 'events down');
+  await world.reconciliation.reconcile('AG-1', { force: true });
+  assert.equal(world.calls.filter((c) => c[0] === 'adobe.getAgreementEvents').length, 0);
+  const rec = world.repo.get('AG-1');
+  assert.equal(rec.adobeStatus, 'ABORTED');
+  assert.equal(rec.sendonDone, true);
+  assert.equal(rec.disposition, 'Rechazado');
+  await world.close();
 });

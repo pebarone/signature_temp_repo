@@ -1207,6 +1207,36 @@ test('/start em sub-workflow: nó HTML nas dicas => 422 NOT_PDF e a tarefa NÃO 
   await world.close();
 });
 
+test('/start em sub-workflow: Adobe sem sessão => 401 LOGIN_REQUIRED e a tarefa NÃO é reatribuída (com ou sem dicas)', async () => {
+  const world = await verifyWorld();
+  seedStartFlow(world, { assignee: HUMAN_USER_ID });
+  world.adobe.authOk = false;
+
+  for (const body of [undefined, { workflowId: '3003', subworkflowId: '3004' }]) {
+    const r = await authThenStart(world, body);
+    assert.equal(r.status, 401);
+    assert.deepEqual(await r.json(), { error: 'LOGIN_REQUIRED' });
+  }
+  assert.deepEqual(world.otcs.downloads, [], 'sem sessão não baixa o PDF');
+  assert.equal(world.adobe.created.length, 0);
+  assert.deepEqual(world.otcs.task(3003, 2, 3004).assignees, [HUMAN_USER_ID], 'a tarefa continua com o usuário');
+  assert.ok(world.logger.has('warn', /Adobe sin sesión; no se pide la reasignación: .*REFRESH_TOKEN_MISSING/));
+
+  // o fluxo já tem acordo deste ciclo: a reatribuição não depende do Adobe (o /start seguinte devolve existing)
+  world.repo.upsert('AG-1', { ...OTHER_FLOW, workflowId: '3003', subworkflowId: '3004', state: 'pending', startSendonDone: false });
+  let r = await authThenStart(world);
+  assert.equal(r.status, 409);
+  assert.equal((await r.json()).code, 'REASSIGN_REQUIRED');
+
+  // com o login de volta, o ciclo novo segue para o REASSIGN_REQUIRED
+  world.repo.upsert('AG-1', { state: 'completed', finalKind: 'final_ok', sendonDone: true });
+  world.adobe.authOk = true;
+  r = await authThenStart(world);
+  assert.equal(r.status, 409);
+  assert.equal((await r.json()).code, 'REASSIGN_REQUIRED');
+  await world.close();
+});
+
 test('/start em sub-workflow: acordo aberto do mesmo documento em outro fluxo => 409 DUPLICATE_OPEN antes de pedir a reatribuição', async () => {
   const world = await verifyWorld();
   seedStartFlow(world, { assignee: HUMAN_USER_ID });
@@ -1240,7 +1270,9 @@ test('/start em sub-workflow: sem dicas, ou com acordo do próprio fluxo, ou com
   assert.ok(world.logger.has('info', /se omite la prevalidación/));
 
   // o fluxo já tem acordo deste documento: a página pode reatribuir (o /start seguinte devolve existing); nada a validar
-  world.repo.upsert('AG-1', { ...OTHER_FLOW, workflowId: '3003', subworkflowId: '3004', state: 'cancelled', finalKind: 'final_conversion_failed' });
+  world.repo.upsert('AG-1', {
+    ...OTHER_FLOW, workflowId: '3003', subworkflowId: '3004', state: 'cancelled', finalKind: 'final_conversion_failed', startSendonDone: false
+  });
   r = await authThenStart(world);
   assert.equal((await r.json()).code, 'REASSIGN_REQUIRED');
   assert.deepEqual(world.otcs.downloads, []);
@@ -1253,6 +1285,140 @@ test('/start em sub-workflow: sem dicas, ou com acordo do próprio fluxo, ou com
   assert.deepEqual(await r.json(), { error: 'Error al solicitar la firma.' });
   assert.ok(world.logger.has('error', /\[START ERROR\].*HTTP 502/));
   assert.deepEqual(world.otcs.task(3003, 2, 3004).assignees, [HUMAN_USER_ID]);
+  await world.close();
+});
+
+test('/start em sub-workflow: attachId das dicas não numérico => 422 AttachID e a tarefa NÃO é reatribuída; attachId vazio segue como antes', async () => {
+  const world = await verifyWorld();
+  seedStartFlow(world, { assignee: HUMAN_USER_ID });
+
+  for (const attachId of ['12ab', 'abc', '-5']) {
+    const r = await authThenStart(world, { ...FIELDS, attachId });
+    assert.equal(r.status, 422, attachId);
+    assert.deepEqual(await r.json(), { error: 'El flujo no tiene la carpeta de destino (AttachID).' });
+  }
+  assert.deepEqual(world.otcs.downloads, [], 'barrado antes de baixar o documento');
+  assert.equal(world.adobe.created.length, 0);
+  assert.deepEqual(world.otcs.task(3003, 2, 3004).assignees, [HUMAN_USER_ID], 'a tarefa continua com o usuário');
+
+  // sem attachId nas dicas (mas com nodeId e e-mails) o comportamento é o de antes: pré-checagem do PDF e REASSIGN_REQUIRED
+  const r = await authThenStart(world, { ...FIELDS, attachId: '' });
+  assert.equal(r.status, 409);
+  assert.equal((await r.json()).code, 'REASSIGN_REQUIRED');
+  assert.deepEqual(world.otcs.downloads, ['1001']);
+  await world.close();
+});
+
+/* ---------- acordo de um ciclo ANTERIOR ainda aberto: 409 PREVIOUS_CYCLE_OPEN, nunca um falso sucesso ---------- */
+
+const PREVIOUS_CYCLE_MESSAGE = (id) => `Este flujo tiene la solicitud de firma ${id} de un envío anterior, aún sin concluir; `
+  + 'cancélela o espere su resultado antes de reenviar.';
+
+test('/start (fluxo puro, tarefa de início current): acordo com o SendOn de início já feito e não concluído => 409 PREVIOUS_CYCLE_OPEN, sem acordo novo nem SendOn', async () => {
+  for (const extra of [{ state: 'pending' }, { state: 'rejected', finalKind: 'final_rejected' }]) {
+    const world = await verifyWorld();
+    seedStartFlow(world, { subprocessId: '3003' });
+    world.repo.upsert('AG-OLD', { ...SAME_FLOW, subworkflowId: '3003', sendonDone: false, startSendonDone: true, ...extra });
+
+    const r = await authThenStart(world, STANDALONE);
+    assert.equal(r.status, 409, JSON.stringify(extra));
+    assert.deepEqual(await r.json(), { error: PREVIOUS_CYCLE_MESSAGE('AG-OLD'), code: 'PREVIOUS_CYCLE_OPEN', id: 'AG-OLD' });
+    assert.equal(world.adobe.created.length, 0);
+    assert.deepEqual(adobeCalls(world), []);
+    assert.equal(world.otcs.sendons.length, 0);
+    assert.equal(world.repo.get('AG-OLD').sendonDone, false, 'o acordo antigo não é tocado');
+    assert.ok(world.logger.has('warn', /Workflow 3003\/3003: .*AG-OLD.*envío anterior/));
+
+    // legítimo: o SendOn de início ainda pendente (recarga enquanto a página reatribui) continua existing
+    world.repo.upsert('AG-OLD', { startSendonDone: false });
+    const ok = await authThenStart(world, STANDALONE);
+    assert.equal(ok.status, 200, await ok.clone().text());
+    const body = await ok.json();
+    assert.equal(body.id, 'AG-OLD');
+    assert.equal(body.existing, true);
+    assert.equal(world.adobe.created.length, 0);
+    await world.close();
+  }
+});
+
+test('/start (sub-workflow, tarefa no usuário humano): acordo de ciclo anterior ainda aberto => 409 PREVIOUS_CYCLE_OPEN e NÃO REASSIGN_REQUIRED', async () => {
+  const world = await verifyWorld();
+  seedStartFlow(world, { assignee: HUMAN_USER_ID }); // processo 3003, subprocesso 3004
+  world.repo.upsert('AG-OLD', { ...SAME_FLOW, state: 'pending', sendonDone: false, startSendonDone: true });
+
+  const r = await authThenStart(world);
+  assert.equal(r.status, 409);
+  assert.deepEqual(await r.json(), { error: PREVIOUS_CYCLE_MESSAGE('AG-OLD'), code: 'PREVIOUS_CYCLE_OPEN', id: 'AG-OLD' });
+  assert.deepEqual(world.otcs.task(3003, 2, 3004).assignees, [HUMAN_USER_ID], 'a tarefa continua com o usuário');
+  assert.deepEqual(world.otcs.downloads, [], 'barrado antes da pré-checagem do PDF');
+  assert.equal(world.adobe.created.length, 0);
+  assert.ok(world.logger.has('warn', /Workflow 3003\/3004: .*AG-OLD.*envío anterior/));
+
+  // acordo deste ciclo (SendOn de início pendente): REASSIGN_REQUIRED como antes, sem validar de novo
+  world.repo.upsert('AG-OLD', { startSendonDone: false });
+  const again = await authThenStart(world);
+  assert.equal(again.status, 409);
+  assert.equal((await again.json()).code, 'REASSIGN_REQUIRED');
+
+  // concluído (sendonDone=true): ciclo novo, a pré-checagem roda normalmente
+  world.repo.upsert('AG-OLD', { startSendonDone: true, sendonDone: true, state: 'completed', finalKind: 'final_ok' });
+  const fresh = await authThenStart(world);
+  assert.equal(fresh.status, 409);
+  assert.equal((await fresh.json()).code, 'REASSIGN_REQUIRED');
+  assert.deepEqual(world.otcs.downloads, ['1001']);
+  await world.close();
+});
+
+test('/start (M1): SendOn de início feito em background ENTRE a leitura do step_list e a consulta ao repo => existing sem handoff (não 409 PREVIOUS_CYCLE_OPEN falso)', async () => {
+  const world = await verifyWorld();
+  seedStartFlow(world, { subprocessId: '3003', assignee: HUMAN_USER_ID });
+  let r = await authThenStart(world, STANDALONE);
+  assert.equal(r.status, 200, await r.clone().text());
+  await new Promise((resolve) => setTimeout(resolve, 50)); // o kickStart em background espera a reatribuição
+  assert.equal(world.repo.get('AG-1').startSendonDone, false);
+  world.otcs.assign(3003, 2, INTEGRATION_USER_ID); // a página reatribuiu
+
+  // o retry em background faz o SendOn entre a leitura do step_list (tarefa de início ainda current) e o repo check
+  const original = world.otcs.getTaskForm;
+  world.otcs.getTaskForm = async (...args) => {
+    const form = await original.apply(world.otcs, args);
+    await world.reconciliation.reconcile('AG-1', { force: true });
+    return form;
+  };
+  r = await authThenStart(world, STANDALONE);
+  assert.equal(r.status, 200, await r.clone().text());
+  const body = await r.json();
+  assert.equal(body.id, 'AG-1');
+  assert.equal(body.existing, true);
+  assert.equal('handoff' in body, false, 'o envio já saiu: nada a reatribuir');
+  assert.equal(world.repo.get('AG-1').startSendonDone, true);
+  assert.equal(world.adobe.created.length, 1, 'nenhum acordo novo');
+  assert.equal(world.otcs.sendons.length, 1, 'um único SendOn de início');
+  await world.close();
+});
+
+test('/start (M1): SendOn de início ANTERIOR à leitura do step_list continua sendo ciclo anterior (409 PREVIOUS_CYCLE_OPEN)', async () => {
+  const world = await verifyWorld();
+  seedStartFlow(world, { subprocessId: '3003' });
+  world.repo.upsert('AG-OLD', {
+    ...SAME_FLOW, subworkflowId: '3003', sendonDone: false, startSendonDone: true, startSendonAt: '2026-01-01T00:00:00.000Z'
+  });
+  const r = await authThenStart(world, STANDALONE);
+  assert.equal(r.status, 409);
+  assert.equal((await r.json()).code, 'PREVIOUS_CYCLE_OPEN');
+  assert.equal(world.adobe.created.length, 0);
+  await world.close();
+});
+
+test('/start com a tarefa de início já avançada: o acordo mais recente continua existing em qualquer estado (não PREVIOUS_CYCLE_OPEN)', async () => {
+  const world = await verifyWorld();
+  seedStartFlow(world, { stage: 'sign' });
+  world.repo.upsert('AG-1', { ...SAME_FLOW, state: 'pending', sendonDone: false, startSendonDone: true });
+  const r = await authThenStart(world);
+  assert.equal(r.status, 200, await r.clone().text());
+  const body = await r.json();
+  assert.equal(body.existing, true);
+  assert.equal(body.id, 'AG-1');
   await world.close();
 });
 
@@ -1306,7 +1472,7 @@ test('repo.consumeNonce: uso único, purga dos expirados a cada inserção', () 
 });
 
 test('db: banco no schema v2 recebe a migração v3 (start_nonces) preservando os dados', () => {
-  assert.equal(MIGRATIONS.length, 5); // v4: cancelamento de fluxos (test/cancellation.test.js); v5: caducidad (test/workflow.test.js)
+  assert.equal(MIGRATIONS.length, 6); // v4: cancelamento de fluxos (test/cancellation.test.js); v5: caducidad (test/workflow.test.js); v6: expires_at
   const file = path.join(tmpDir(), 'v2.db');
   const raw = new Database(file);
   raw.exec(MIGRATIONS[0]);
@@ -1349,16 +1515,50 @@ test('/start: DUE_DATE no formulário da tarefa => createAgreement recebe expira
   assert.equal(world.adobe.created[0].expirationTime, inDays(world, 15));
   assert.equal(modelCalled(world, 'getWorkflowAttributes'), 0, 'veio no formulário: sem fallback');
   assert.ok(world.logger.has('info', /Acuerdo AG-1: vence en 15 días/));
-  assert.equal(world.logger.has('warn', /ventana de consulta/), false, '15 dias cabem nos 90 do polling');
   await world.close();
 });
 
-test('/start: prazo além da janela do polling (POLL_MAX_AGE_DAYS) => mantém o expirationTime e avisa', async () => {
+test('/start: prazo longo (acima da janela do polling) => mantém o expirationTime, sem aviso (o polling cobre até o prazo)', async () => {
   const world = await verifyWorld({ POLL_MAX_AGE_DAYS: '90' });
   seedStartFlow(world, { subprocessId: '3003', fields: { DUE_DATE: '89' } });
   await startOk(world);
   assert.equal(world.adobe.created[0].expirationTime, inDays(world, 89));
-  assert.ok(world.logger.has('warn', /plazo de 89 días supera la ventana de consulta \(POLL_MAX_AGE_DAYS=90\)/));
+  assert.equal(world.logger.has('warn', /ventana de consulta/), false);
+  await world.close();
+});
+
+test('/start: o registro do acordo leva expiresAt = o expirationTime enviado ao Adobe (null sem DUE_DATE)', async () => {
+  const withDue = await verifyWorld();
+  seedStartFlow(withDue, { subprocessId: '3003', fields: { DUE_DATE: '15' } });
+  await startOk(withDue);
+  assert.equal(withDue.repo.get('AG-1').expiresAt, inDays(withDue, 15));
+  assert.equal(withDue.repo.get('AG-1').expiresAt, withDue.adobe.created[0].expirationTime);
+  await withDue.close();
+
+  const without = await verifyWorld();
+  seedStartFlow(without, { subprocessId: '3003' });
+  await startOk(without);
+  assert.equal(without.repo.get('AG-1').expiresAt, null);
+  await without.close();
+});
+
+test('/start: repo.upsert falha depois do createAgreement => 500 genérico e o log traz o ID do acordo e o /admin/adopt', async () => {
+  const world = await verifyWorld();
+  seedStartFlow(world, { subprocessId: '3003' });
+  const real = world.repo.upsert;
+  world.repo.upsert = () => { throw new Error('disk I/O error'); };
+
+  const r = await authThenStart(world, STANDALONE);
+  assert.equal(r.status, 500);
+  assert.deepEqual(await r.json(), { error: 'Error al solicitar la firma.' });
+  assert.equal(world.adobe.created.length, 1, 'o acordo já estava criado no Adobe');
+  assert.equal(world.otcs.sendons.length, 0, 'sem registro não há SendOn');
+  assert.ok(world.logger.has('info', /Acuerdo AG-1 creado en Adobe \(workflow 3003\/3003, nodo 1001\)/), 'ID no log antes de gravar');
+  assert.ok(world.logger.has('error', /El acuerdo AG-1 se creó en Adobe pero no se pudo registrar.*disk I\/O error.*POST \/admin\/adopt\/AG-1/));
+  assert.ok(world.logger.has('error', /\[START ERROR\]/), 'segue o tratamento genérico do 500');
+  assert.equal(world.logger.has('info', /Signature requested/), false);
+  world.repo.upsert = real;
+  assert.deepEqual(world.repo.list(), []);
   await world.close();
 });
 

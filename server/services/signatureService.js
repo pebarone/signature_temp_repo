@@ -33,9 +33,22 @@ const startInProgressError = () => new ServiceError(409, {
 });
 const notPdfError = () =>
   new ServiceError(422, { error: 'El documento a firmar no es un PDF válido.', code: 'NOT_PDF' });
+// A tarefa de início voltou a ser current, mas o acordo mais recente do fluxo é de um ciclo ANTERIOR: o SendOn de início dele
+// já foi feito e o resultado ainda não foi aplicado. Responder sucesso (existing) mostraria "enviado" com o fluxo parado em
+// "Enviar"; criar outro acordo duplicaria o anterior. Bloqueia até ele ser cancelado ou concluir.
+const previousCycleOpenError = (rec) => new ServiceError(409, {
+  error: `Este flujo tiene la solicitud de firma ${rec.id} de un envío anterior, aún sin concluir; `
+    + 'cancélela o espere su resultado antes de reenviar.',
+  code: 'PREVIOUS_CYCLE_OPEN',
+  id: rec.id
+});
+const attachIdMissingError = () =>
+  new ServiceError(422, { error: 'El flujo no tiene la carpeta de destino (AttachID).' });
 const flowNotFound = () => new ServiceError(409, { error: 'Flujo no encontrado.' });
 const otcsUnavailable = () =>
   new ServiceError(503, { error: 'Content Server no disponible; intente nuevamente.' });
+// Adobe sem sessão (tokens ausentes ou refresh falhou): o administrador precisa entrar em /admin/login
+const loginRequiredError = () => new ServiceError(401, { error: 'LOGIN_REQUIRED' });
 
 // E-mails separados por ; ou , (itens sem "@" descartados)
 const parseEmails = (...values) =>
@@ -95,13 +108,33 @@ function createSignatureService({ repo, adobe, otcs, logger, config, now = () =>
     return content;
   }
 
-  // Acordo DESTE ciclo do fluxo, com a tarefa de início current: o mais recente de (workflow, subprocesso, nó) que ainda não foi
-  // concluído (sendonDone=false): aberto, ou final com o resultado ainda não aplicado ao fluxo (o caso do incidente de QA).
-  // Um acordo CONCLUÍDO (sendonDone=true, inclusive completedExternally) já teve o resultado aplicado: se a tarefa de início
-  // voltou a ser current, o mapa voltou ao envio e é um ciclo NOVO; o acordo antigo é ignorado.
-  function currentCycleAgreement(workflowId, subworkflowId, nodeId) {
+  // Acordo mais recente de (workflow, subprocesso, nó) que ainda não foi concluído (sendonDone=false): aberto, ou final com o
+  // resultado ainda não aplicado ao fluxo (o caso do incidente de QA). Com a tarefa de início current ele pode ser DESTE ciclo
+  // (SendOn de início pendente) ou de um ciclo ANTERIOR ainda aberto (startSendonDone=true): quem chama decide com
+  // assertNotPreviousCycle. Um acordo CONCLUÍDO (sendonDone=true, inclusive completedExternally) já teve o resultado aplicado:
+  // se a tarefa de início voltou a ser current, o mapa voltou ao envio e é um ciclo NOVO; o acordo antigo é ignorado.
+  function latestUnconcludedAgreement(workflowId, subworkflowId, nodeId) {
     const latest = repo.findLatestByWorkflow(workflowId, subworkflowId, nodeId);
     return latest && !latest.sendonDone ? latest : null;
+  }
+
+  // Com a tarefa de início current, o acordo não concluído só é DESTE ciclo se o SendOn de início dele ainda está pendente
+  // (startSendonDone=false: recarga enquanto a página reatribui). Com o SendOn de início já feito (startSendonDone=true), o fluxo
+  // avançou e voltou ao envio: é de um ciclo anterior ainda aberto e o /start responde 409 PREVIOUS_CYCLE_OPEN (nunca um falso OK).
+  // Exceção: o SendOn de início feito durante ESTE pedido (startSendonAt >= instante da leitura do step_list; o retry em
+  // background pode fazê-lo entre a leitura e a consulta ao repositório) é deste ciclo, não de um anterior: sentDuringRequest.
+  // Limite conhecido: se nesse intervalo o background só DETECTAR o início como já enviado (sem SendOn nosso, startSendonAt
+  // fica null), ainda sai o 409; a janela exige um PUT nosso perdido ou um SendOn humano exatamente nesse instante.
+  const sentDuringRequest = (rec, stepsReadAt) =>
+    !!rec.startSendonDone && Number.isFinite(stepsReadAt) && Date.parse(rec.startSendonAt || '') >= stepsReadAt;
+
+  function assertNotPreviousCycle(rec) {
+    if (!rec.startSendonDone) return;
+    logger.warn(
+      `[START] Workflow ${rec.workflowId}/${rec.subworkflowId}: la tarea de inicio está activa de nuevo pero la solicitud de firma ${rec.id} `
+      + `(nodo ${rec.nodeId}) es de un envío anterior y aún no concluyó (estado ${rec.state}${rec.finalKind ? `, ${rec.finalKind}` : ''}); no se reenvía`
+    );
+    throw previousCycleOpenError(rec);
   }
 
   // Trava anti-duplicidade: acordo ABERTO do mesmo documento + destinatários criado na janela de 15 min. Com `flow`, só vale o
@@ -119,19 +152,39 @@ function createSignatureService({ repo, adobe, otcs, logger, config, now = () =>
   /*
     Sub-workflow com a tarefa ainda no usuário humano: o servidor não consegue ler o formulário (só quem tem a tarefa o lê) e
     pede a reatribuição ANTES de existir acordo. Antes de pedir, valida o que dá com as DICAS do corpo (nodeId numérico e ao menos
-    um e-mail; nunca usadas para criar acordo): o documento é um PDF e não há acordo aberto dele em outro fluxo. Se falhar, o
-    erro sai aqui e a tarefa NÃO é reatribuída. Depois da reatribuição, o caminho normal relê o formulário e valida tudo de novo.
-    Sem dicas (ou com o acordo deste ciclo do fluxo já existente, não concluído) não há o que validar: segue para o
-    REASSIGN_REQUIRED. Um acordo concluído é de um ciclo anterior: a pré-checagem roda normalmente.
+    um e-mail; nunca usadas para criar acordo): o attachId, se veio, é numérico (o mesmo 422 do formulário), o documento é um PDF
+    e não há acordo aberto dele em outro fluxo. Se falhar, o erro sai aqui e a tarefa NÃO é reatribuída. Depois da reatribuição, o
+    caminho normal relê o formulário e valida tudo de novo.
+    Sem dicas não há o que validar: segue para o REASSIGN_REQUIRED. Com o acordo deste ciclo do fluxo já existente (não concluído
+    e com o SendOn de início pendente) também: o /start seguinte o devolve como existing. Se o SendOn de início dele já foi feito,
+    o acordo é de um ciclo anterior ainda aberto: 409 PREVIOUS_CYCLE_OPEN e a tarefa NÃO é reatribuída. Um acordo concluído é de um
+    ciclo anterior já encerrado: a pré-checagem roda normalmente.
+    O login do Adobe não depende das dicas: é conferido sempre, salvo quando as dicas mostram o acordo deste ciclo (sem dicas não
+    dá para saber e ele é conferido). Sem login o acordo não sai e a tarefa ficaria reatribuída sem acordo: 401 LOGIN_REQUIRED,
+    como no envio.
   */
-  async function precheckBeforeReassign(input, handoff) {
+  async function precheckBeforeReassign(input, handoff, stepsReadAt) {
     const nodeHint = clean(input.nodeId);
     const emailHints = dedupeEmails(parseEmails(input.userEmail1, input.userEmail2));
-    if (!/^\d+$/.test(nodeHint) || !emailHints.length) {
+    const hasHints = /^\d+$/.test(nodeHint) && emailHints.length > 0;
+    const cycle = hasHints ? latestUnconcludedAgreement(handoff.workflowId, handoff.subworkflowId, nodeHint) : null;
+    if (cycle) {
+      if (!sentDuringRequest(cycle, stepsReadAt)) assertNotPreviousCycle(cycle);
+      return;
+    }
+    try {
+      await adobe.checkAuth();
+    } catch (e) {
+      logger.warn(`[START] Workflow ${handoff.workflowId}/${handoff.subworkflowId}: Adobe sin sesión; no se pide la reasignación: ${describeError(e)}`);
+      throw loginRequiredError();
+    }
+    if (!hasHints) {
       logger.info(`[START] Workflow ${handoff.workflowId}/${handoff.subworkflowId}: el pedido no trae nodeId/correos; se omite la prevalidación antes de reasignar`);
       return;
     }
-    if (currentCycleAgreement(handoff.workflowId, handoff.subworkflowId, nodeHint)) return;
+    // O attachId das dicas, se veio, também precisa ser numérico (sem ele o formulário daria este mesmo 422 depois da reatribuição)
+    const attachHint = clean(input.attachId);
+    if (attachHint && !/^\d+$/.test(attachHint)) throw attachIdMissingError();
     assertNoOpenElsewhere(nodeHint, emailHints, { workflowId: handoff.workflowId, subworkflowId: handoff.subworkflowId });
     try {
       await fetchPdf(nodeHint);
@@ -177,7 +230,7 @@ function createSignatureService({ repo, adobe, otcs, logger, config, now = () =>
       - tarefa atribuída ao usuário de integração: formulário da tarefa (como sempre);
       - tarefa ainda no usuário humano + fluxo puro (subprocesso == processo): GET status/info do workflow;
       - tarefa ainda no usuário humano + sub-workflow: 409 REASSIGN_REQUIRED (status/info só traz os atributos do pai), depois
-        da pré-checagem com as dicas do corpo (PDF e trava; ver precheckBeforeReassign).
+        da pré-checagem (login do Adobe e, com as dicas do corpo, PDF e trava; ver precheckBeforeReassign).
     handoff = { workflowId, subworkflowId, taskId, integrationUserId, assigned } (números): o que a página deve
     reatribuir ao usuário de integração depois do envio (só quando assigned=false).
     O payload do navegador só é conferido (divergência => 409, detalhe só no log).
@@ -189,6 +242,9 @@ function createSignatureService({ repo, adobe, otcs, logger, config, now = () =>
     if (!/^\d+$/.test(workflowId)) throw new ServiceError(400, { error: 'workflowId is mandatory.' });
 
     let steps;
+    // Instante imediatamente ANTES da leitura do step_list: o que o retry em background gravar a partir dele pode não estar
+    // refletido no step_list lido (ver sentDuringRequest)
+    const stepsReadAt = now().getTime();
     try {
       steps = await otcs.getProcessSteps(workflowId);
     } catch (e) {
@@ -267,8 +323,8 @@ function createSignatureService({ repo, adobe, otcs, logger, config, now = () =>
       fromAttributes = true;
     } else {
       // Sub-workflow: status/info só devolve os atributos do pai e o formulário exige a tarefa no usuário de integração.
-      // A regra é reatribuir só com acordo gerado: aqui ainda não há, então valida antes o que as dicas do corpo permitem
-      await precheckBeforeReassign(input, handoff);
+      // A regra é reatribuir só com acordo gerado: aqui ainda não há, então valida antes o que dá (login do Adobe e dicas do corpo)
+      await precheckBeforeReassign(input, handoff, stepsReadAt);
       logger.info(`[START] Workflow ${workflowId}/${task.subprocessId}: tarea ${task.taskId} aún en el usuario; la página debe reasignarla antes del envío`);
       throw new ServiceError(409, {
         error: 'La tarea debe asignarse al usuario de integración antes del envío.',
@@ -286,9 +342,7 @@ function createSignatureService({ repo, adobe, otcs, logger, config, now = () =>
       throw new ServiceError(422, { error: 'El flujo no tiene el documento a firmar (DocID).' });
     }
     if (!emails.length) throw new ServiceError(422, { error: 'El flujo no tiene correos de firmantes.' });
-    if (!/^\d+$/.test(attachId)) {
-      throw new ServiceError(422, { error: 'El flujo no tiene la carpeta de destino (AttachID).' });
-    }
+    if (!/^\d+$/.test(attachId)) throw attachIdMissingError();
 
     // Conferência do payload (só o que veio preenchido): divergência => 409 genérico
     const diffs = [];
@@ -318,7 +372,8 @@ function createSignatureService({ repo, adobe, otcs, logger, config, now = () =>
       // Leitura do prazo adiada: o /start só a chama quando o acordo vai mesmo ser criado (recarga da página, que devolve o
       // acordo existente, não faz as consultas extras de atributos). O REASSIGN_REQUIRED acima nunca chega aqui.
       readDueDays: () => resolveDueDays(fields, task, fromAttributes),
-      handoff
+      handoff,
+      stepsReadAt
     };
   }
 
@@ -350,7 +405,11 @@ function createSignatureService({ repo, adobe, otcs, logger, config, now = () =>
     current, o acordo mais recente deste ciclo (aberto, ou final com sendonDone=false); com ela já avançada, o mais recente em
     qualquer estado. Já final ou concluído leva `final` ({ kind, state, message }). Com a tarefa current e o acordo mais recente
     CONCLUÍDO (sendonDone=true), o fluxo voltou ao envio: ciclo novo, o antigo é ignorado e o envio segue normal (trava e PDF
-    valem). `handoff` só vem com a validação do OTCS
+    valem). Com a tarefa current e o acordo mais recente não concluído mas com o SendOn de início JÁ feito (startSendonDone=true),
+    ele é de um ciclo anterior ainda aberto: 409 PREVIOUS_CYCLE_OPEN (com o `id`), sem existing, sem acordo novo e sem handoff.
+    Exceção: se esse SendOn foi feito DURANTE este pedido (startSendonAt >= a leitura do step_list), é o envio deste ciclo: devolve
+    existing, sem handoff (nada a reatribuir).
+    `handoff` só vem com a validação do OTCS
     e com a tarefa de início ainda ativa. No caso existing e com o SendOn ainda pendente, a etapa start é retomada
     (onCreated(id, { existing: true })): depois do REASSIGN da página, o segundo /start dispara o SendOn já.
     Ordem: o acordo existe antes da reatribuição e do SendOn (a página só reatribui com acordo gerado).
@@ -372,8 +431,18 @@ function createSignatureService({ repo, adobe, otcs, logger, config, now = () =>
       handoff = resolved.handoff;
       // O mesmo fluxo vê o acordo do ciclo dele, mesmo se já for final mas ainda não concluído (a trava de 15 min abaixo só olha
       // OUTROS fluxos). resolved.existing: a tarefa de início já avançou, o mais recente em qualquer estado
-      const known = resolved.existing || currentCycleAgreement(resolved.workflowId, resolved.subworkflowId, resolved.nodeId);
-      if (known) return existingResult(known, handoff);
+      if (resolved.existing) return existingResult(resolved.existing, handoff);
+      // Tarefa de início current: o acordo não concluído só vale se é deste ciclo; o de um ciclo anterior ainda aberto bloqueia (409)
+      const cycle = latestUnconcludedAgreement(resolved.workflowId, resolved.subworkflowId, resolved.nodeId);
+      if (cycle) {
+        // SendOn de início feito em background durante este pedido: o envio deste ciclo já saiu, não há o que reatribuir
+        if (sentDuringRequest(cycle, resolved.stepsReadAt)) {
+          logger.info(`[START] Workflow ${cycle.workflowId}/${cycle.subworkflowId}: el SendOn de inicio de ${cycle.id} ocurrió durante esta solicitud; se devuelve el acuerdo existente`);
+          return existingResult(cycle, undefined);
+        }
+        assertNotPreviousCycle(cycle);
+        return existingResult(cycle, handoff);
+      }
       ({ workflowId, subworkflowId, taskId, nodeId, attachId, docName, emails, readDueDays } = resolved);
     } else {
       emails = parseEmails(input.userEmail1, input.userEmail2);
@@ -395,7 +464,7 @@ function createSignatureService({ repo, adobe, otcs, logger, config, now = () =>
       try {
         await adobe.checkAuth();
       } catch {
-        throw new ServiceError(401, { error: 'LOGIN_REQUIRED' });
+        throw loginRequiredError();
       }
 
       try {
@@ -415,30 +484,35 @@ function createSignatureService({ repo, adobe, otcs, logger, config, now = () =>
           ...(expirationTime ? { expirationTime } : {})
         });
         if (expirationTime) logger.info(`[START] Acuerdo ${ag.id}: vence en ${dueDays} días (${expirationTime})`);
-        // O polling para de consultar acordos mais velhos que POLL_MAX_AGE_DAYS; o EXPIRED pode chegar até 12 h depois do
-        // prazo (margem de 1 dia). O prazo é mantido (o Adobe o impõe), mas a caducidad dependerá só do webhook.
-        const pollMaxAgeDays = Number(config.poll?.maxAgeDays) || 0;
-        if (dueDays && pollMaxAgeDays > 0 && dueDays + 1 >= pollMaxAgeDays) {
-          logger.warn(
-            `[START] Acuerdo ${ag.id}: el plazo de ${dueDays} días supera la ventana de consulta (POLL_MAX_AGE_DAYS=${pollMaxAgeDays}); `
-            + 'la caducidad solo se procesará si llega el webhook'
-          );
-        }
+
+        // Janela do acordo órfão: o acordo já existe no Adobe e ainda não está no repositório. O id vai para o log ANTES de gravar,
+        // para que uma falha da gravação deixe o rastro de que ele precisa ser adotado.
+        logger.info(`[START] Acuerdo ${ag.id} creado en Adobe (workflow ${workflowId || '-'}/${subId || '-'}, nodo ${nodeId}); se registra a continuación`);
 
         // Mapeamento persistido ANTES do SendOn: um webhook imediato já encontra o acordo
-        repo.upsert(ag.id, {
-          nodeId: String(nodeId),
-          attachId: String(attachId),
-          fileName,
-          workflowId: String(workflowId || ''),
-          subworkflowId: subId,
-          taskId: taskId ? Number(taskId) : null,
-          emails,
-          state: 'pending',
-          // O SendOn da tarefa de início é uma etapa persistida da reconciliação (com retry), não mais um fire-and-forget
-          startSendonDone: !workflowId,
-          createdAt: now().toISOString()
-        });
+        try {
+          repo.upsert(ag.id, {
+            nodeId: String(nodeId),
+            attachId: String(attachId),
+            fileName,
+            workflowId: String(workflowId || ''),
+            subworkflowId: subId,
+            taskId: taskId ? Number(taskId) : null,
+            emails,
+            state: 'pending',
+            // O SendOn da tarefa de início é uma etapa persistida da reconciliação (com retry), não mais um fire-and-forget
+            startSendonDone: !workflowId,
+            // Mesmo instante enviado ao Adobe: o polling segue consultando o acordo até o prazo (mais a margem)
+            expiresAt: expirationTime || null,
+            createdAt: now().toISOString()
+          });
+        } catch (e) {
+          logger.error(
+            `[START] El acuerdo ${ag.id} se creó en Adobe pero no se pudo registrar (workflow ${workflowId || '-'}/${subId || '-'}, nodo ${nodeId}): `
+            + `${describeError(e)}. Adóptelo con POST /admin/adopt/${ag.id}`
+          );
+          throw e;
+        }
         logger.info(`Signature requested: ${ag.id}`);
 
         // Etapa start em background (não bloqueia o cliente). `sendOn` nunca rejeita.

@@ -7,6 +7,14 @@
 [LL_REPTAG_{'[LL_REPTAG_&WORKID /]','[LL_REPTAG_&SUBWORKID /]','[LL_REPTAG_&TASKID /]'} WFTASKACTION:REASSIGN:11742766 /]
 REASIGNADO_OK
 [LL_WEBREPORT_ELSE /]
+[// Ramo devolver: la pagina lo pide cuando, despues de reasignar la tarea al usuario de integracion, el envio fallo y no hay acuerdo. /]
+[// Devuelve la tarea al usuario que ejecuta el reporte (el mismo que la tenia antes de reasignar), para que no quede en la bandeja del usuario de integracion. /]
+[// La URL solo trae los IDs de la tarea. El destino es quien abrio la pagina (ACTUALUSERID: con RunAs, USERID seria el usuario del RunAs); la URL no lo elige. /]
+[// VALIDAR EN QA: no esta validado que un usuario pueda reasignar una tarea que ya no tiene asignada (permiso en el OTCS), ni que DEVUELTO_OK dependa del resultado del WFTASKACTION: la marca se imprime siempre, tambien si el OTCS rechazo la reasignacion. Por eso la pagina nunca da por hecho que la tarea volvio: solo avisa que lo intento y muestra los IDs. Si se valida que la marca puede salir sin que la tarea vuelva, este ramo necesita una poscondicion (leer el responsable de la tarea) antes de imprimirla. /]
+[LL_WEBREPORT_IF "[LL_REPTAG_&ACCION /]" == "devolver" /]
+[LL_REPTAG_{'[LL_REPTAG_&WORKID /]','[LL_REPTAG_&SUBWORKID /]','[LL_REPTAG_&TASKID /]'} WFTASKACTION:REASSIGN:[LL_REPTAG_ACTUALUSERID /] /]
+DEVUELTO_OK
+[LL_WEBREPORT_ELSE /]
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -392,15 +400,20 @@ REASIGNADO_OK
   const EMAIL_1 = valorEmail(valorDe('dato-email1'));
   const EMAIL_2 = valorEmail(valorDe('dato-email2'));
 
-  /* Marca que devuelve el ramo reasignar. Se arma en JS para no aparecer en la pagina normal. */
+  /* Marcas que devuelven los ramos reasignar y devolver. Se arman en JS para no aparecer en la pagina normal. */
   const MARCA_REASIGNADO = 'REASIGNADO' + '_OK';
+  const MARCA_DEVUELTO = 'DEVUELTO' + '_OK';
   const MSG_ASIGNAR = 'No fue posible asignar la tarea. Intente de nuevo.';
   const CABECERAS = { 'Content-Type': 'application/json', 'ngrok-skip-browser-warning': 'true' };
   const ORDEN_PASOS = ['envio', 'asignar', 'listo'];
-  const TEXTO_PASO = { envio: 'Enviando a Adobe Sign...', asignar: 'Asignando la tarea...' };
+  const TEXTO_PASO = { envio: 'Enviando a Adobe Sign...', asignar: 'Asignando la tarea...', devolver: 'Devolviendo la tarea...' };
 
-  /* Unico estado de la pagina. */
-  const state = { ocupado: false, paso: 'envio', acuerdoId: null, existente: false, handoff: null, final: null };
+  /* Unico estado de la pagina.
+     reasignadoSinAcuerdo: ESTA pagina reasigno la tarea al usuario de integracion y todavia no hay acuerdo (sub-flujo).
+     Si el envio falla en ese punto la tarea debe volver al usuario (devolver); se limpia al devolverla o al existir el acuerdo. */
+  const state = {
+    ocupado: false, paso: 'envio', acuerdoId: null, existente: false, handoff: null, final: null, reasignadoSinAcuerdo: false
+  };
 
   /* ---------- Utilidades ---------- */
 
@@ -434,7 +447,9 @@ REASIGNADO_OK
 
   /* Error de una respuesta del servidor. Conserva el codigo para mostrarlo bien:
        NOT_PDF: el documento no es un PDF. Se puede subir una version PDF y reintentar (Reintentar visible);
-       DUPLICATE_OPEN: ya hay una solicitud abierta del mismo documento en otro flujo (muestra su ID y flujo). */
+       DUPLICATE_OPEN: ya hay una solicitud abierta del mismo documento en otro flujo (muestra su ID y flujo);
+       PREVIOUS_CYCLE_OPEN: el flujo tiene la solicitud de un envio anterior sin concluir (el ID va en el mensaje del servidor);
+       START_IN_PROGRESS: otra peticion esta creando el acuerdo ahora mismo (ver devolverSiCorresponde). */
   function errorServidor(r, porDefecto) {
     const err = new Error(mensajeDeError(r.data) || porDefecto);
     err.codigo = typeof r.data.code === 'string' ? r.data.code : '';
@@ -589,13 +604,11 @@ REASIGNADO_OK
     return postJson(SERVER_URL + '/start', { ...campos, ...firma }, CABECERAS);
   }
 
-  /* Reasigna la tarea al usuario de integracion fijado en el ramo reasignar del WebReport.
-     La URL solo lleva los IDs de la tarea: el destino no lo elige la URL. */
-  async function reasignar() {
+  /* URL de un ramo del WebReport (reasignar o devolver) para la tarea del handoff. Solo lleva los IDs de la tarea y la accion:
+     el destino de la reasignacion no lo elige la URL. null si los IDs no son validos. */
+  function urlRamo(accion) {
     const h = state.handoff || {};
-    if (![h.workflowId, h.subworkflowId, h.taskId, REPORT_ID].every(esDigitos)) {
-      throw new Error('Datos de reasignación inválidos.');
-    }
+    if (![h.workflowId, h.subworkflowId, h.taskId, REPORT_ID].every(esDigitos)) return null;
     const params = new URLSearchParams({
       func: 'll',
       objAction: 'RunReport',
@@ -603,11 +616,19 @@ REASIGNADO_OK
       workid: h.workflowId,
       subworkid: h.subworkflowId,
       taskid: h.taskId,
-      accion: 'reasignar'
+      accion
     });
+    return OTCS_URL + '?' + params.toString();
+  }
+
+  /* Reasigna la tarea al usuario de integracion fijado en el ramo reasignar del WebReport.
+     La URL solo lleva los IDs de la tarea: el destino no lo elige la URL. */
+  async function reasignar() {
+    const url = urlRamo('reasignar');
+    if (!url) throw new Error('Datos de reasignación inválidos.');
     let resp;
     try {
-      resp = await fetch(OTCS_URL + '?' + params.toString(), { credentials: 'same-origin', cache: 'no-store' });
+      resp = await fetch(url, { credentials: 'same-origin', cache: 'no-store' });
     } catch (_) {
       throw new Error('No se pudo reasignar la tarea: sin conexión con OpenText.');
     }
@@ -615,6 +636,40 @@ REASIGNADO_OK
     if (!resp.ok || !texto.includes(MARCA_REASIGNADO)) {
       throw new Error('No se pudo asignar la tarea. Verifique su sesión en OpenText y reintente.');
     }
+  }
+
+  /* Pide al ramo devolver que reasigne la tarea al usuario que ejecuta el WebReport (el destino es el usuario de la sesion, no la URL).
+     Best effort: nunca lanza. Devuelve true si el ramo respondio con la marca. OJO: la marca NO prueba que la tarea volvio: el ramo la
+     imprime tras el WFTASKACTION sin comprobar su resultado (no validado en el OTCS; el permiso de un usuario para reasignar una tarea que
+     ya no tiene asignada tampoco). El llamador nunca debe afirmarlo como un hecho. */
+  async function devolver() {
+    const url = urlRamo('devolver');
+    if (!url) return false;
+    try {
+      const resp = await fetch(url, { credentials: 'same-origin', cache: 'no-store' });
+      const texto = await resp.text().catch(() => '');
+      return resp.ok && texto.includes(MARCA_DEVUELTO);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /* Un envio fallo con la tarea ya (o posiblemente) en el usuario de integracion y sin acuerdo: intenta devolverla y deja una nota en
+     el error. La nota es siempre cautelosa y lleva los IDs de la tarea: la pagina no puede comprobar que la tarea volvio.
+     No devuelve si hay acuerdo ni si otra peticion esta creando el acuerdo ahora mismo (START_IN_PROGRESS): la tarea la necesita. */
+  async function devolverSiCorresponde(err) {
+    if (!state.reasignadoSinAcuerdo || state.acuerdoId || !err || err.codigo === 'START_IN_PROGRESS') return;
+    const h = state.handoff || {};
+    const ids = '(flujo ' + (h.workflowId || '-') + ', subflujo ' + (h.subworkflowId || '-') + ', tarea ' + (h.taskId || '-') + ')';
+    setEstado(TEXTO_PASO.devolver, '');
+    let nota;
+    if (await devolver()) {
+      state.reasignadoSinAcuerdo = false;
+      nota = 'Se intentó devolver la tarea a su bandeja. Si no aparece, contacte al administrador ' + ids + '.';
+    } else {
+      nota = 'Es posible que la tarea haya quedado asignada al usuario de integración ' + ids + '; contacte al administrador.';
+    }
+    err.detalle = err.detalle ? err.detalle + ' ' + nota : nota;
   }
 
   /* Confirma con /auth + /start que la tarea ya esta asignada. Solo entonces hay exito.
@@ -635,25 +690,56 @@ REASIGNADO_OK
     state.final = finalDe(r.data) || state.final;
   }
 
+  /* Resultado ambiguo de /start: el servidor puede haber creado el acuerdo aunque la respuesta no llegue (502/503/504 de un proxy
+     o del OTCS, sin `code` en el cuerpo; el error de red se detecta aparte en iniciarTrasReasignar). */
+  const respuestaAmbigua = (r) => !r.ok && [502, 503, 504].includes(r.status) && !r.data.code;
+
+  /* Segundo /auth + /start (ya reasignada la tarea). Si el fallo es ambiguo (sin red, o 502/503/504 sin code) lo repite UNA vez antes
+     de decidir: el servidor es idempotente por flujo y devuelve el acuerdo existente (existing: true), de modo que no se devuelve la
+     tarea cuando el primer intento si llego. START_IN_PROGRESS u otro error en la repeticion los trata enviar() como siempre. */
+  async function iniciarTrasReasignar() {
+    let r;
+    try {
+      r = await iniciar();
+    } catch (err) {
+      if (!err.sinRed) throw err;
+      return iniciar();
+    }
+    return respuestaAmbigua(r) ? iniciar() : r;
+  }
+
   /* Envio del acuerdo. Si el servidor exige reasignar antes (sub-flujo), reasigna y repite /start una sola vez.
      Orden: acuerdo, luego reasignacion, luego el SendOn (lo hace el servidor). En el sub-flujo el servidor valida antes
-     lo que puede (PDF y solicitud abierta en otro flujo): si falla, responde el error y NO pide reasignar.
+     lo que puede (sesión de Adobe, PDF, AttachID, solicitud abierta en otro flujo y solicitud de un envio anterior sin concluir):
+     si falla, responde el error y NO pide reasignar.
      Si el flujo ya tiene su acuerdo (existing), el servidor lo devuelve aunque ya sea final (data.final):
-     la tarea se reasigna igual (el acuerdo existe) y al final se muestra ese resultado. */
+     la tarea se reasigna igual (el acuerdo existe) y al final se muestra ese resultado.
+     Si, despues de reasignar, el segundo /start falla (respuesta de error, REASSIGN_REQUIRED otra vez o sin red) y no hay acuerdo,
+     la tarea quedaria en el usuario de integracion, fuera de la bandeja del usuario y sin que el servidor la vuelva a ver:
+     se intenta devolverla antes de mostrar el error. Lo mismo vale en un Reintentar posterior (el estado se conserva). */
   async function enviar() {
-    let r = await iniciar();
-    if (reasignaRequerido(r) && r.data.handoff) {
-      state.handoff = r.data.handoff;
-      pasoActivo('asignar');
-      await reasignar();
-      r = await iniciar();
-      if (reasignaRequerido(r)) throw new Error(MSG_ASIGNAR);
+    try {
+      let r = await iniciar();
+      if (reasignaRequerido(r) && r.data.handoff) {
+        state.handoff = r.data.handoff;
+        pasoActivo('asignar');
+        // Antes de reasignar: si el resultado de reasignar() es ambiguo (la tarea puede haber cambiado de usuario), el error
+        // igual intenta devolverla (devolver a uno mismo no hace nada)
+        state.reasignadoSinAcuerdo = true;
+        await reasignar();
+        r = await iniciarTrasReasignar();
+        if (reasignaRequerido(r)) throw new Error(MSG_ASIGNAR);
+      }
+      if (!r.ok) throw errorServidor(r, 'No se pudo enviar la solicitud de firma.');
+      state.acuerdoId = r.data.id || null;
+      state.existente = r.data.existing === true;
+      state.handoff = r.data.handoff || null;
+      state.final = finalDe(r.data);
+      if (state.acuerdoId) state.reasignadoSinAcuerdo = false;
+    } catch (err) {
+      await devolverSiCorresponde(err);
+      throw err;
     }
-    if (!r.ok) throw errorServidor(r, 'No se pudo enviar la solicitud de firma.');
-    state.acuerdoId = r.data.id || null;
-    state.existente = r.data.existing === true;
-    state.handoff = r.data.handoff || null;
-    state.final = finalDe(r.data);
   }
 
   function validarDatos() {
@@ -699,4 +785,5 @@ REASIGNADO_OK
 </script>
 </body>
 </html>
+[LL_WEBREPORT_ENDIF /]
 [LL_WEBREPORT_ENDIF /]

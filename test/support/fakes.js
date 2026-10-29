@@ -165,7 +165,8 @@ const HUMAN_USER_ID = 279463;
   Atributos do workflow (status/info): `workflowAttributes[processId]` ({ rótulo: valor }); sem entrada, vêm de `formFields`.
   Conteúdo baixado: `nodeContents[nodeId]` (Buffer; padrão um PDF) simula um HTML/DOCX no lugar do PDF.
   Nós: `missingNodes` (inexistentes; addVersion falha com `missingNodeStatus`, 404 por padrão; a spec do OTCS usa 400) e
-  `lockedNodes` (existem, mas addVersion falha com `lockedNodeStatus`, 409). `nodeExists` consulta `missingNodes`;
+  `lockedNodes` (existem, mas addVersion falha com `lockedNodeStatus`, 409). `nodeExists` consulta `missingNodes`
+  (como o cliente real, `missingNodeStatus` 403 = o nó existe mas sem permissão: nodeExists devolve true);
   `nodeExistsFailures` faz as próximas N sondagens falharem com `nodeExistsFailStatus`.
 */
 function makeOtcs(calls = []) {
@@ -305,7 +306,8 @@ function makeOtcs(calls = []) {
         otcs.nodeExistsFailures--;
         throw httpError(otcs.nodeExistsFailStatus, 'node probe failed');
       }
-      return !otcs.missingNodes.has(String(nodeId));
+      // 403: o nó existe, mas o usuário de integração não tem permissão (igual ao otcsClient.nodeExists)
+      return !otcs.missingNodes.has(String(nodeId)) || otcs.missingNodeStatus === 403;
     },
     async getProcessSteps(processId) {
       otcs.modelCalls.push(['getProcessSteps', String(processId)]);

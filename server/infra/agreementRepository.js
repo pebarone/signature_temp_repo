@@ -43,6 +43,7 @@ const COLUMNS = [
   ['cancelSource', 'cancel_source', 'text'],
   ['workflowStopPending', 'workflow_stop_pending', 'bool'],
   ['workflowStoppedAt', 'workflow_stopped_at', 'text'],
+  ['expiresAt', 'expires_at', 'text'],
   ['createdAt', 'created_at', 'text'],
   ['updatedAt', 'updated_at', 'text']
 ];

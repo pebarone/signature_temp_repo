@@ -54,7 +54,23 @@ Os itens comuns (`SERVER_URL`, usuário de integração, Basic, CORS) estão em
       a página responde `existing: true`, reatribui, confirma e envia.
 - [ ] Nome de documento com apóstrofo (ex.: `Ana's`) aparece certo e o envio funciona. Nome com
       `<img src=x onerror=...>` aparece como texto e não cria elemento.
-- [ ] Sem `REASIGNADO_OK` na página normal (abrir a URL do WebReport sem `accion`).
+- [ ] Sem `REASIGNADO_OK` na página normal (abrir a URL do WebReport sem `accion`). Idem `DEVUELTO_OK`.
+- [ ] Ramo devolver: com uma tarefa do sub-fluxo já reatribuída ao usuário de integração, abrir
+      `…&accion=devolver` logado com o usuário que a tinha. A resposta traz `DEVUELTO_OK` e a tarefa volta à caixa dele.
+      **Não validado:** que `[LL_REPTAG_ACTUALUSERID /]` resolve para o ID de quem abriu a página (mesmo com RunAs) e que ele tem permissão para reatribuir
+      uma tarefa que já não é dele (ver [`../README.md`](../README.md#ramo-acciondevolver-só-firma-flujo-puro)).
+- [ ] Ramo devolver, caso negativo: rodar `accion=devolver` sobre uma tarefa que o usuário **não** pode reatribuir (de outro usuário,
+      sem permissão) e conferir se `DEVUELTO_OK` aparece mesmo assim. O ramo imprime a marca depois do `WFTASKACTION` sem checar o
+      resultado; se ela aparecer, o ramo precisa de uma pós-condição (ler o responsável da tarefa) antes de imprimi-la. Enquanto isso
+      a página só diz que "se intentó devolver" e mostra os IDs.
+- [ ] Devolução pela página (sub-fluxo): forçar o segundo `/start` a falhar depois da reatribuição (ex.: apagar o PDF do `DocID`
+      entre as duas chamadas ou derrubar o servidor). Esperado: o erro original mais "Se intentó devolver la tarea a su bandeja. Si no aparece, contacte al
+      administrador (flujo X, subflujo Y, tarea Z)." e a tarefa de volta ao usuário (conferir na caixa dele: a nota é cautelosa
+      de propósito); com o ramo devolver quebrado, a nota "Es posible que la tarea haya quedado asignada al usuario de integración".
+      Derrubar a rede **uma única vez** no segundo `/start` não devolve a tarefa: a página repete e mostra o sucesso (`existing`, ou o acordo recém-criado). Com `START_IN_PROGRESS` ou com acordo
+      existente a tarefa **não** é devolvida.
+- [ ] `PREVIOUS_CYCLE_OPEN`: com o acordo de um envio anterior ainda aberto e a tarefa de envio de novo ativa, a página mostra a
+      mensagem do servidor com o ID, sem reatribuir (a tarefa não sai do usuário).
 
 Os itens do checklist comum (NOT_PDF, acordo final, DUPLICATE_OPEN, CORS, logs) também valem aqui: ver
 [`../README.md`](../README.md#checklist-comum-de-qa-servidor-e-protocolo).

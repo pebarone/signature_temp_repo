@@ -1284,3 +1284,72 @@ test('stop pendente: o stop falha => retry agendado, continua pendente e sem Sen
   assert.equal(world.otcs.sendons.length, 0);
   await world.close();
 });
+
+/* ---------- B5/B6: adoção grava o prazo; falha transitória x recusa ---------- */
+
+test('B5 adoção (webhook e manual) grava expiresAt a partir do expirationTime do Adobe; sem ele fica null', async () => {
+  const world = await buildWorld();
+  world.otcs.addWorkflow('3003', { subprocessId: '3004' });
+  world.adobe.agreements['AG-X'] = {
+    id: 'AG-X', name: 'Documento a.pdf', status: 'OUT_FOR_SIGNATURE', externalId: { id: signedExt(world) },
+    expirationTime: '2026-12-31T12:00:00-03:00'
+  };
+  await world.reconciliation.handleEvent(parseWebhookPayload(webhookPayload('AGREEMENT_ACTION_REQUESTED', 'AG-X'))).adoption;
+  assert.equal(world.repo.get('AG-X').expiresAt, '2026-12-31T15:00:00.000Z', 'normalizado para ISO UTC');
+
+  // adoção manual (POST /admin/adopt) usa o mesmo caminho
+  world.adobe.agreements['AG-M'] = { id: 'AG-M', name: 'Documento b.pdf', status: 'OUT_FOR_SIGNATURE', expirationTime: '2027-01-15T00:00:00Z' };
+  const rec = await world.reconciliation.adopt('AG-M', { workflowId: '3003', subworkflowId: '3004', nodeId: '1001', attachId: '2002' });
+  assert.equal(rec.expiresAt, '2027-01-15T00:00:00.000Z');
+
+  // sem expirationTime (ou inválido): sem prazo conhecido
+  world.adobe.agreements['AG-N'] = { id: 'AG-N', name: 'Documento c.pdf', status: 'OUT_FOR_SIGNATURE', expirationTime: 'lixo' };
+  const none = await world.reconciliation.adopt('AG-N', { workflowId: '3003', subworkflowId: '3004', nodeId: '1001', attachId: '2002' });
+  assert.equal(none.expiresAt, null);
+  await world.close();
+});
+
+test('B6 adoção: erro transitório ao ler o acordo (rede, 5xx, 401, 429) => transient e nada é persistido; reenvio adota; 404/403/alheio => refused', async () => {
+  const world = await buildWorld();
+  world.otcs.addWorkflow('3003', { subprocessId: '3004' });
+  world.adobe.agreements['AG-X'] = { id: 'AG-X', name: 'Documento a.pdf', status: 'OUT_FOR_SIGNATURE', externalId: { id: signedExt(world) } };
+  const original = world.adobe.getAgreement;
+  const hit = (n) => parseWebhookPayload(webhookPayload('AGREEMENT_ACTION_REQUESTED', 'AG-X', { notificationId: n }));
+
+  const transient = [
+    httpError(500, 'adobe down'), httpError(503, 'adobe down'), httpError(401, 'token'), httpError(429, 'rate'),
+    Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' })
+  ];
+  for (const [i, err] of transient.entries()) {
+    world.adobe.getAgreement = async () => { throw err; };
+    const res = world.reconciliation.handleEvent(hit(`n-${i}`));
+    assert.equal(await res.adopted, 'transient', err.message);
+    assert.equal(world.repo.has('AG-X'), false, 'nada persistido: o reenvio do Adobe reaplica o evento');
+  }
+  assert.ok(world.logger.has('warn', /\(error transitorio\)/));
+
+  // 4xx permanente do Adobe (acordo inexistente, sem acesso): reenviar não muda nada
+  for (const status of [404, 403]) {
+    world.adobe.getAgreement = async () => { throw httpError(status, 'nope'); };
+    assert.equal(await world.reconciliation.handleEvent(hit(`p-${status}`)).adopted, 'refused', String(status));
+  }
+  assert.equal(world.repo.has('AG-X'), false);
+
+  // o Adobe voltou: o reenvio adota e reaplica o evento (uma vez)
+  world.adobe.getAgreement = original;
+  const ok = world.reconciliation.handleEvent(hit('n-0'));
+  assert.equal(await ok.adopted, 'adopted');
+  assert.equal(world.repo.has('AG-X'), true);
+  assert.equal(world.repo.listEvents('AG-X').length, 1);
+  await ok.adoption;
+  const dup = world.reconciliation.handleEvent(hit('n-0'));
+  assert.equal(dup.duplicate, true, 'o mesmo notificationId não é processado de novo');
+  assert.equal(world.repo.listEvents('AG-X').length, 1);
+
+  // externalId sem assinatura / de outra integração => refused (não é falha transitória)
+  world.adobe.agreements['AG-O'] = { id: 'AG-O', status: 'SIGNED', externalId: { id: 'crm|123' } };
+  assert.equal(await world.reconciliation.handleEvent(
+    parseWebhookPayload(webhookPayload('AGREEMENT_WORKFLOW_COMPLETED', 'AG-O'))
+  ).adopted, 'refused');
+  await world.close();
+});

@@ -1,8 +1,8 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const {
-  KINDS, isFinalKind, canonicalName, classifyEvent, classifyAgreementStatus, classifyCancelled,
-  confirmsFinalKind, parseWebhookPayload
+  KINDS, isFinalKind, canonicalName, classifyEvent, classifyAgreementStatus, classifyCancelled, classifyAborted,
+  needsAgreementEvents, confirmsFinalKind, parseWebhookPayload
 } = require('../server/domain/eventPolicy');
 
 const kindOf = (event, status) => classifyEvent(event, { agreement: { status } }).kind;
@@ -87,6 +87,31 @@ test('classifyCancelled: evento REJECTED/ACTION_REJECTED => recusa; senão recal
   assert.equal(classifyCancelled([]), KINDS.FINAL_RECALLED);
   assert.equal(classifyCancelled(undefined), KINDS.FINAL_RECALLED);
   assert.equal(classifyAgreementStatus('CANCELLED', [{ type: 'REJECTED' }]), KINDS.FINAL_REJECTED);
+});
+
+test('classifyAborted (B4): ABORTED com evento de falha de conversão => final_conversion_failed; senão exige intervenção', () => {
+  assert.equal(classifyAborted([{ type: 'CREATED' }, { type: 'AUTO_CANCELLED_CONVERSION_PROBLEM' }]), KINDS.FINAL_CONVERSION_FAILED);
+  assert.equal(classifyAborted([{ eventType: 'auto_cancelled_conversion_problem' }]), KINDS.FINAL_CONVERSION_FAILED);
+  assert.equal(classifyAborted([{ type: 'CREATED' }, { type: 'DOCUMENTS_DELETED' }]), KINDS.NEEDS_ATTENTION);
+  assert.equal(classifyAborted([]), KINDS.NEEDS_ATTENTION);
+  assert.equal(classifyAborted(undefined), KINDS.NEEDS_ATTENTION);
+  // sem histórico o ABORTED continua exigindo intervenção (quem não consulta os eventos não finaliza por engano)
+  assert.equal(classifyAgreementStatus('ABORTED'), KINDS.NEEDS_ATTENTION);
+  assert.equal(classifyAgreementStatus('ABORTED', [{ type: 'AUTO_CANCELLED_CONVERSION_PROBLEM' }]), KINDS.FINAL_CONVERSION_FAILED);
+  // a conversão só vale para ABORTED: um CANCELLED com o mesmo evento segue a regra de recusa/recall
+  assert.equal(classifyAgreementStatus('CANCELLED', [{ type: 'AUTO_CANCELLED_CONVERSION_PROBLEM' }]), KINDS.FINAL_RECALLED);
+  assert.equal(needsAgreementEvents('CANCELLED'), true);
+  assert.equal(needsAgreementEvents(' aborted '), true);
+  for (const s of ['SIGNED', 'EXPIRED', 'OUT_FOR_SIGNATURE', '', undefined]) assert.equal(needsAgreementEvents(s), false, String(s));
+});
+
+test('confirmsFinalKind (B4): ABORTED com o histórico de conversão só confirma a falha de conversão', () => {
+  const conv = [{ type: 'AUTO_CANCELLED_CONVERSION_PROBLEM' }];
+  assert.equal(confirmsFinalKind(KINDS.FINAL_CONVERSION_FAILED, 'ABORTED', conv), true);
+  assert.equal(confirmsFinalKind(KINDS.FINAL_CONVERSION_FAILED, 'ABORTED', []), true, 'o Adobe não informa o motivo');
+  assert.equal(confirmsFinalKind(KINDS.FINAL_REJECTED, 'ABORTED', conv), false);
+  assert.equal(confirmsFinalKind(KINDS.FINAL_RECALLED, 'ABORTED', conv), false);
+  assert.equal(confirmsFinalKind(KINDS.FINAL_OK, 'ABORTED', conv), false);
 });
 
 test('parseWebhookPayload: formato v6 (event string, id em agreement.id)', () => {

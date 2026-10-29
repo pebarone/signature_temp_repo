@@ -6,7 +6,7 @@
 //   disposition  -> Firmado/Rechazado na tarefa de firma, localizada dinamicamente pelo nome
 // A lógica de decisão vive em domain/; aqui só I/O (repositório, Adobe, OTCS) e serialização.
 const {
-  KINDS, isFinalKind, classifyEvent, classifyAgreementStatus, isCancelledStatus, confirmsFinalKind
+  KINDS, isFinalKind, classifyEvent, classifyAgreementStatus, needsAgreementEvents, confirmsFinalKind
 } = require('../domain/eventPolicy');
 const state = require('../domain/agreementState');
 const { locate, normalizeName } = require('../domain/workflowSteps');
@@ -19,6 +19,8 @@ const { ATTENTION_KINDS } = state;
 const START_COMMENT = 'Documento enviado para assinatura – etapa automatizada';
 const NOT_OURS_TTL_MS = 10 * 60 * 1000;   // acordos de outras integrações da mesma conta: não consulta o Adobe a cada evento
 const NOT_OURS_MAX = 2000;
+// Resultado da adoção de um acordo desconhecido (webhook)
+const ADOPTION = { OK: 'adopted', REFUSED: 'refused', TRANSIENT: 'transient' };
 
 // Comentário gravado na tarefa do workflow, por resultado
 const DISPOSITION_COMMENTS = {
@@ -260,12 +262,36 @@ function createReconciliationService({
   // needs_attention com o motivo explícito (reabre sozinho após ATTENTION_RETRY_HOURS ou ao repetir o /start).
   function waitForHandoff(id, rec, t) {
     const message = `la tarea de envío (${t.taskId}) sigue asignada al usuario; reabra la página para completar el envío`;
-    const { patch, delayMs, attention, attentionKind } = state.failurePatch(rec, 'start', message, now().getTime(), backoff);
+    return waitTransient(id, rec, 'start', message, 'waiting_handoff');
+  }
+
+  // Espera transitória (sem log de erro a cada tentativa): conta como tentativa da etapa, com backoff e limite normais
+  function waitTransient(id, rec, stage, message, status) {
+    const { patch, delayMs, attention, attentionKind } = state.failurePatch(rec, stage, message, now().getTime(), backoff);
     repo.upsert(id, patch);
     if (attention) return markAttention(id, attention, attentionKind);
     logger.info(`[${id}] ${message} (intento ${patch.attempts}); próximo intento: ${patch.nextAttemptAt}`);
     scheduleRetry(id, delayMs);
-    return { status: 'waiting_handoff', stage: 'start', attempts: patch.attempts };
+    return { status, stage, attempts: patch.attempts };
+  }
+
+  // Id do usuário de integração (OTCS_USER); lança se o OTCS não o informar
+  async function integrationUserId() {
+    const userId = Number((await otcs.getCurrentUser())?.id);
+    if (!Number.isFinite(userId)) throw new Error('usuario de integración desconocido');
+    return userId;
+  }
+
+  /*
+    Tarefa de firma ("Aguardar Firma") atribuída a outro usuário: o SendOn do usuário de integração falharia (o OTCS só aceita
+    o responsável pela tarefa). Mesmo tratamento do waitForHandoff: espera transitória com backoff e, esgotadas as tentativas,
+    needs_attention retries_exhausted com o motivo explícito (reabre sozinho após ATTENTION_RETRY_HOURS; resolve-se
+    reatribuindo a tarefa ao usuário de integração). Nada é enviado ao OTCS.
+  */
+  function waitForSignAssignee(id, rec, t) {
+    const message = `la tarea de firma (${t.taskId} "${t.name}") está asignada a otro usuario (${t.assigneeIds.join(', ') || 'ninguno'}); `
+      + 'reasígnela al usuario de integración';
+    return waitTransient(id, rec, 'disposition', message, 'waiting_assignee');
   }
 
   /*
@@ -289,14 +315,13 @@ function createReconciliationService({
       // humano não há SendOn possível (nem erro): espera a reatribuição com o backoff normal
       // assigneeIds null = o OTCS não informou os responsáveis: segue como antes (tenta o SendOn), sem consultar o usuário
       if (Array.isArray(t.assigneeIds)) {
-        let integrationUserId;
+        let userId;
         try {
-          integrationUserId = Number((await otcs.getCurrentUser())?.id);
-          if (!Number.isFinite(integrationUserId)) throw new Error('usuario de integración desconocido');
+          userId = await integrationUserId();
         } catch (e) {
           return { result: registerFailure(id, 'start', e) };
         }
-        if (!t.assigneeIds.includes(integrationUserId)) return { result: waitForHandoff(id, rec, t) };
+        if (!t.assigneeIds.includes(userId)) return { result: waitForHandoff(id, rec, t) };
       }
       await syncWorkflowAttributes(id, { located: start }); // antes do SendOn; nunca falha
       try {
@@ -319,7 +344,8 @@ function createReconciliationService({
       return { result: attentionAmbiguous(id, rec, signNames(), sign) };
     }
     if (start.where === 'completed' || sign.where === 'current' || sign.where === 'completed') {
-      rec = repo.upsert(id, state.startDonePatch(rec, nowIso()));
+      // Sem SendOn nosso: não grava startSendonAt (o disposition o usa para saber se o início foi enviado depois do final)
+      rec = repo.upsert(id, { ...state.startDonePatch(rec, nowIso()), startSendonAt: rec.startSendonAt || null });
       logger.info(
         `[${id}] solicitud de firma ya enviada (tarea de inicio: ${start.where}; tarea de firma: ${sign.where}): sin SendOn`
       );
@@ -344,8 +370,12 @@ function createReconciliationService({
     let events;
     try {
       status = String((await adobe.getAgreement(id))?.status || '').trim().toUpperCase();
-      // recusa x recall (CANCELLED) depende do histórico; o final OK não precisa dele
-      if (rec.finalKind !== KINDS.FINAL_OK && isCancelledStatus(status)) events = await adobe.getAgreementEvents(id);
+      // recusa x recall (CANCELLED) e falha de conversão (ABORTED) dependem do histórico; o final OK não precisa dele, nem a
+      // falha de conversão já registrada (confirmsFinalKind a confirma só pelo status): uma falha do /events não deve travar o verify
+      const needsEvents = rec.finalKind !== KINDS.FINAL_OK
+        && !(rec.finalKind === KINDS.FINAL_CONVERSION_FAILED && confirmsFinalKind(rec.finalKind, status))
+        && needsAgreementEvents(status);
+      if (needsEvents) events = await adobe.getAgreementEvents(id);
     } catch (e) {
       return { result: registerFailure(id, 'verify', e) };
     }
@@ -393,10 +423,11 @@ function createReconciliationService({
 
   /*
     pdf: o PDF assinado vira NOVA VERSÃO do nó que foi enviado à assinatura (DocID): o workflow devolve e a
-    distribuição ao workspace copia esse nó. Se o nó não existe mais ou não é acessível, cai para um documento na pasta
-    de anexos. Falha no addVersion: 404 => fallback direto; outro 4xx (o OTCS documenta 400 para nó inexistente/sem
-    acesso; 409/423 para nó reservado) => sonda o nó: inexistente => fallback; existente => transitório (retry, o nó
-    pode estar reservado); sonda com erro => transitório, sem fallback. Erros não-4xx (5xx, rede, 401/408/429) e
+    distribuição ao workspace copia esse nó. Se o nó não existe mais, cai para um documento na pasta de anexos. Falha no
+    addVersion: 404 => fallback direto; outro 4xx (o OTCS documenta 400 para nó inexistente/sem acesso; 409/423 para nó
+    reservado; 403 sem permissão) => sonda o nó: inexistente (400/404) => fallback; existente (inclusive 403: sem permissão)
+    => transitório (retry, o nó pode estar reservado ou sem permissão: o fluxo distribui o DocID, então o PDF não pode ir
+    para outro lugar); sonda com erro => transitório, sem fallback. Erros não-4xx (5xx, rede, 401/408/429) e
     qualquer falha no upload para a pasta também são transitórios.
   */
   async function deliverSignedPdf(id, plan, rec) {
@@ -440,7 +471,7 @@ function createReconciliationService({
           }
         }
         logger.warn(
-          `[${id}] el nodo ${rec.nodeId} ya no existe o no es accesible (HTTP ${status}): el PDF irá a la carpeta ${rec.attachId || '(sin attachId)'}`
+          `[${id}] el nodo ${rec.nodeId} ya no existe (HTTP ${status}): el PDF irá a la carpeta ${rec.attachId || '(sin attachId)'}`
         );
       }
     }
@@ -514,6 +545,7 @@ function createReconciliationService({
     }
 
     let located;
+    let startSentNow = false; // o pedido de firma foi enviado por esta execução (o step_list lido antes não o reflete)
     for (let pass = 0; ; pass++) {
       let steps;
       try {
@@ -524,7 +556,37 @@ function createReconciliationService({
       const hint = { subprocessHint: rec.subworkflowId, processId: rec.workflowId };
       located = locate(steps, signNames(), hint);
       if (located.where === 'ambiguous') return { result: attentionAmbiguous(id, rec, signNames(), located) };
-      if (located.where === 'current' || located.where === 'completed') break;
+      if (located.where === 'current') break;
+
+      if (located.where === 'completed') {
+        // O fluxo pode ter voltado ao início (novo ciclo de firma): a "Aguardar Firma" de uma passagem anterior continua em
+        // completed enquanto a de início deste acordo ainda não recebeu o SendOn. Concluir agora como "externa" deixaria o
+        // "Enviar" parado: envia o pedido de firma e olha de novo (uma vez).
+        if (!rec.startSendonDone && pass === 0) {
+          const start = locate(steps, startNames(), hint);
+          if (start.where === 'current') {
+            const r = await ensureStartSent(id, rec, { steps });
+            if (r.result) return r;
+            rec = r.rec;
+            startSentNow = true;
+            continue;
+          }
+        }
+        // Acabamos de enviar o início (nesta execução, ou numa anterior, DEPOIS do resultado final) e a firma ainda aparece
+        // concluída: é a da passagem anterior, a nova ainda não ativou. startSendonAt só guarda SendOn feito por nós (o caminho
+        // "já enviada" não o grava), então um envio anterior ao resultado final (caso normal) segue como conclusão externa.
+        // signTaskId gravado = este acordo já viu a SUA tarefa de firma (current): concluída agora é conclusão externa (ex.:
+        // Firmado à mão com a tarefa em outro usuário), não a da passagem anterior; esperar aqui travaria o acordo para sempre
+        const startAfterFinal = Date.parse(rec.startSendonAt || '') >= Date.parse(rec.finalAt || '');
+        if (startSentNow || (startAfterFinal && !rec.signTaskId)) {
+          return {
+            result: registerFailure(id, 'disposition', new Error(
+              `la tarea de firma (${signNames().join(' / ')}) del workflow ${rec.workflowId} aún figura concluida tras enviar el pedido de firma; esperando que se active la nueva`
+            ))
+          };
+        }
+        break;
+      }
 
       // Tarefa de firma ainda não existe: se o pedido de firma não foi enviado, envia agora e olha de novo (uma vez)
       const start = locate(steps, startNames(), hint);
@@ -562,6 +624,20 @@ function createReconciliationService({
           id, `resultado ${rec.finalKind} sin disposición configurada (${plan.dispositionKey})`, ATTENTION_KINDS.CONFIG
         )
       };
+    }
+
+    // Tarefa de firma com outro responsável: o SendOn falharia (e o PDF já foi entregue). Espera a reatribuição, com backoff
+    // normal, em vez de uma tentativa de PUT fadada ao erro. assigneeIds null ou vazio = o OTCS não informou: tenta o SendOn
+    // como antes. Atribuição a grupo NÃO foi validada: o OTCS provavelmente informa o id do grupo, e aí a espera não acaba
+    // (pendência de QA)
+    if (Array.isArray(t.assigneeIds) && t.assigneeIds.length) {
+      let userId;
+      try {
+        userId = await integrationUserId();
+      } catch (e) {
+        return { result: registerFailure(id, 'disposition', e) };
+      }
+      if (!t.assigneeIds.includes(userId)) return { result: waitForSignAssignee(id, rec, t) };
     }
 
     // Valida a disposição contra as ações reais da tarefa. Se o formulário não puder ser lido não bloqueia
@@ -695,6 +771,22 @@ function createReconciliationService({
     return step.result;
   }
 
+  /*
+    Exceção inesperada no pipeline (bug, não um erro de OTCS/Adobe, que as etapas já tratam): sem isto o acordo voltava para a
+    fila a cada runQueue, para sempre e só visível no log. Conta como falha da etapa genérica 'reconcile' do acordo com
+    trabalho pendente: backoff, limite RETRY_MAX_ATTEMPTS e, esgotado, needs_attention retries_exhausted (reabre sozinho).
+    Nunca lança (o próprio registro pode falhar, p.ex. banco indisponível).
+  */
+  function failUnexpected(id, err) {
+    try {
+      const rec = repo.get(id);
+      if (!rec || rec.sendonDone || rec.state === state.STATES.NEEDS_ATTENTION || !state.hasPendingWork(rec)) return;
+      registerFailure(id, 'reconcile', err);
+    } catch (e) {
+      logger.error(`[${id}] no se pudo registrar el error inesperado de la reconciliación: ${describeError(e)}`);
+    }
+  }
+
   /* ---------- serialização por acordo ---------- */
 
   function enqueue(id, opts) {
@@ -715,6 +807,7 @@ function createReconciliationService({
       queuedOpts.delete(id);
       const run = doReconcile(id, runOpts).catch((e) => {
         logger.error(`[${id}] error inesperado en la reconciliación: ${describeError(e)}`);
+        failUnexpected(id, e);
         return { status: 'error', error: describeError(e) };
       });
       const tracked = run.then(() => {
@@ -773,6 +866,7 @@ function createReconciliationService({
   // Cria o registro de um acordo existente no Adobe a partir de { workflowId, subworkflowId, nodeId, attachId }
   function createAdoptedRecord(id, ag, src, fileName) {
     const createdMs = Date.parse(ag?.createdDate || '');
+    const expiresMs = Date.parse(ag?.expirationTime || '');
     return repo.upsert(id, {
       nodeId: String(src.nodeId),
       attachId: String(src.attachId),
@@ -784,13 +878,19 @@ function createReconciliationService({
       adopted: true,
       // Sem o estado local não sabemos se o SendOn ocorreu; a etapa start confirma no OTCS antes de enviar.
       startSendonDone: false,
-      ...(Number.isFinite(createdMs) ? { createdAt: new Date(createdMs).toISOString() } : {})
+      ...(Number.isFinite(createdMs) ? { createdAt: new Date(createdMs).toISOString() } : {}),
+      // Prazo do acordo no Adobe (mantém o polling vivo até expirar, mesmo mais velho que POLL_MAX_AGE_DAYS)
+      ...(Number.isFinite(expiresMs) ? { expiresAt: new Date(expiresMs).toISOString() } : {})
     });
   }
 
-  // Resolve true se o acordo já está (ou passou a estar) no store. Nunca rejeita.
+  /*
+    Resolve ADOPTION.OK se o acordo já está (ou passou a estar) no store; REFUSED se não é nosso / foi recusado (retentar não
+    muda nada); TRANSIENT se não deu para ler o acordo no Adobe (rede, 5xx, 401/408/429): o webhook responde 503 para o Adobe
+    reenviar o evento. Nunca rejeita.
+  */
   function ensureAdopted(id) {
-    if (repo.has(id)) return Promise.resolve(true);
+    if (repo.has(id)) return Promise.resolve(ADOPTION.OK);
     if (adopting.has(id)) return adopting.get(id);
     const p = Promise.resolve().then(async () => {
       try {
@@ -799,13 +899,13 @@ function createReconciliationService({
         if (!ext) {
           rememberNotOurs(id);
           logger.warn(`[${id}] acuerdo desconocido sin externalId propio: no se adopta`);
-          return false;
+          return ADOPTION.REFUSED;
         }
         // O externalId é texto livre no Adobe: só adota sozinho o que o /start assinou (HMAC). O resto, via /admin/adopt.
         if (!verifyExternalId(ext, config.signatureSecret)) {
           rememberNotOurs(id);
           logger.warn(`[${id}] acuerdo desconocido con externalId sin firma válida: no se adopta automáticamente. Use POST /admin/adopt/:id`);
-          return false;
+          return ADOPTION.REFUSED;
         }
         // Repetição: um externalId assinado copiado de um acordo real para outro. Se o fluxo já tem qualquer acordo no store
         // (aberto ou encerrado: o PDF entraria como versão do DocID real mesmo depois do fim), não adota sozinho.
@@ -813,16 +913,18 @@ function createReconciliationService({
         if (known && known.id !== id) {
           rememberNotOurs(id);
           logger.warn(`[${id}] acuerdo desconocido con externalId de un flujo ya registrado (${known.id}): no se adopta automáticamente. Use POST /admin/adopt/:id`);
-          return false;
+          return ADOPTION.REFUSED;
         }
         if (!repo.has(id)) {
           createAdoptedRecord(id, ag, ext);
           logger.warn(`[${id}] acuerdo desconocido adoptado por su externalId (workflow ${ext.workflowId}, nodo ${ext.nodeId})`);
         }
-        return true;
+        return ADOPTION.OK;
       } catch (e) {
-        logger.warn(`[${id}] no se pudo adoptar el acuerdo desconocido: ${describeError(e)}`);
-        return false;
+        // 4xx do Adobe (acordo inexistente, sem acesso...) não muda ao reenviar; o resto (rede, 5xx, 401/408/429) é transitório
+        const transient = !state.isPermanentHttpError(e);
+        logger.warn(`[${id}] no se pudo adoptar el acuerdo desconocido${transient ? ' (error transitorio)' : ''}: ${describeError(e)}`);
+        return transient ? ADOPTION.TRANSIENT : ADOPTION.REFUSED;
       }
     }).finally(() => adopting.delete(id));
     adopting.set(id, p);
@@ -870,8 +972,11 @@ function createReconciliationService({
   /*
     Registra o evento (persistido e deduplicado) e aplica a transição de estado de forma síncrona.
     O processamento (PDF -> disposição) segue assíncrono em `result.processing` (Promise que nunca
-    rejeita); o chamador do webhook não precisa aguardá-lo. Acordo desconhecido: tenta adotá-lo em background
-    (`result.adoption`, também nunca rejeita) e reaplica o evento.
+    rejeita); o chamador do webhook não precisa aguardá-lo. Acordo desconhecido: tenta adotá-lo e reaplica o evento
+    (`result.adoption`: inclui o processamento, nunca rejeita). `result.adopted` resolve assim que o evento foi reaplicado
+    e persistido (ADOPTION.OK), recusado (REFUSED) ou não deu para ler o acordo no Adobe (TRANSIENT); rejeita se o evento
+    não pôde ser persistido. O webhook o usa para responder 503 (Adobe reenvia) na falha transitória: o evento ainda não
+    foi persistido e o reenvio é deduplicado por notificationId se a adoção acabar concluindo em segundo plano.
   */
   function handleEvent(parsed, { noAdopt = false } = {}) {
     const id = parsed.agreementId && String(parsed.agreementId);
@@ -881,16 +986,27 @@ function createReconciliationService({
     }
     const rec = repo.get(id);
     if (!rec) {
+      // O payload já traz o externalId e ele não é nosso (não é do formato ou a assinatura não confere): recusa na hora,
+      // sem consultar o Adobe (que pode estar indisponível, ex.: REFRESH_TOKEN_MISSING) e sem o 503 que faria o Adobe reenviar
+      if (config.adoptUnknownAgreements && !noAdopt && !isNotOurs(id) && parsed.externalId) {
+        const ext = parseExternalId(parsed.externalId);
+        if (!ext || !verifyExternalId(ext, config.signatureSecret)) {
+          // Sem rememberNotOurs: o payload não é autenticado, e um webhook forjado não pode silenciar o legítimo do mesmo acordo
+          logger.warn(`Webhook de un acuerdo desconocido ${id} (evento ${parsed.eventName}): el externalId del payload no es propio; no se adopta`);
+          return { known: false, reason: 'unknown_agreement' };
+        }
+      }
       if (config.adoptUnknownAgreements && !noAdopt && !isNotOurs(id)) {
         logger.warn(`Webhook de un acuerdo desconocido ${id} (evento ${parsed.eventName}): intentando adoptarlo por su externalId`);
-        const adoption = ensureAdopted(id)
-          .then((ok) => {
-            if (!ok) return undefined;
-            const again = handleEvent(parsed, { noAdopt: true });
-            return again.processing;
-          })
+        let processing;
+        const adopted = ensureAdopted(id).then((outcome) => {
+          if (outcome === ADOPTION.OK) processing = handleEvent(parsed, { noAdopt: true }).processing;
+          return outcome;
+        });
+        const adoption = adopted
+          .then(() => processing)
           .catch((e) => logger.error(`[${id}] error al reaplicar el evento tras la adopción: ${describeError(e)}`));
-        return { known: false, reason: 'unknown_agreement', adoption };
+        return { known: false, reason: 'unknown_agreement', adoption, adopted };
       }
       logger.warn(`Webhook de un acuerdo desconocido ${id} (evento ${parsed.eventName}): no está en el store`);
       return { known: false, reason: 'unknown_agreement' };
@@ -949,9 +1065,10 @@ function createReconciliationService({
   */
   async function applyAdobeStatus(id, status) {
     if (!repo.has(id)) return KINDS.UNKNOWN;
-    // CANCELLED: recusa ou recall? Só os eventos dizem. Se falhar, não finaliza (o próximo ciclo retenta)
+    // CANCELLED: recusa ou recall? ABORTED: falha de conversão ou intervenção? Só os eventos dizem. Se falhar, não finaliza
+    // (o próximo ciclo retenta)
     let events;
-    if (isCancelledStatus(status)) {
+    if (needsAgreementEvents(status)) {
       try {
         events = await adobe.getAgreementEvents(id);
       } catch (e) {

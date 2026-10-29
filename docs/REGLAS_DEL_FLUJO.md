@@ -29,8 +29,8 @@ Cada etapa só roda se a anterior concluiu, grava seu resultado no SQLite e, se 
 | `AGREEMENT_REJECTED`; polling `CANCELLED` + evento `REJECTED`/`ACTION_REJECTED` | recusado | não | `DISPOSITION_REJECTED` = `Rechazado` | `rejected` | idem |
 | `AGREEMENT_EXPIRED`; polling `EXPIRED` | expirado (prazo `DUE_DATE` vencido; seção 4.5) | não | `DISPOSITION_EXPIRED` = `Rechazado`, com o comentário de caducidad; no fluxo puro, depois **stop do fluxo** (`EXPIRED_STOP_WORKFLOW`); no subfluxo só a firma é cancelada | `expired` | idem |
 | `AGREEMENT_RECALLED`; polling `CANCELLED` sem recusa | cancelado | não | `DISPOSITION_RECALLED` = `Rechazado` (**exceto** acordo já encerrado por pedido de cancelamento: sem disposição, seção 10) | `cancelled` | idem |
-| `AGREEMENT_AUTO_CANCELLED_CONVERSION_PROBLEM` | falha de conversão | não | `DISPOSITION_CONVERSION_FAILED` = `Rechazado` | `cancelled` | idem |
-| `AGREEMENT_DOCUMENTS_DELETED`; polling `ABORTED` | exige intervenção | não | nenhuma | `needs_attention` (`event`) | integração `needs_attention` |
+| `AGREEMENT_AUTO_CANCELLED_CONVERSION_PROBLEM`; polling `ABORTED` com o evento `AUTO_CANCELLED_CONVERSION_PROBLEM` (seção 4.2) | falha de conversão | não | `DISPOSITION_CONVERSION_FAILED` = `Rechazado` | `cancelled` | idem |
+| `AGREEMENT_DOCUMENTS_DELETED`; polling `ABORTED` sem o evento de conversão | exige intervenção | não | nenhuma | `needs_attention` (`event`) | integração `needs_attention` |
 | `AGREEMENT_ACTION_COMPLETED` com status em andamento; informativos (`CREATED`, `ACTION_REQUESTED`, `MODIFIED`, `EMAIL_VIEWED`, `REMINDER_SENT`...) | progresso/histórico | não | nenhuma | `pending` | estado Adobe atualizado se o polling o viu mudar |
 | indisponíveis (`VAULTED`, `KBA_AUTHENTICATED`, `WEB_IDENTITY_AUTHENTICATED`) e desconhecidos | ignorados (desconhecido gera warn) | não | nenhuma | sem mudança | — |
 
@@ -60,7 +60,8 @@ qualquer estado aberto --(pedido de cancelamento confirmado no Adobe, seção 10
 Campos que acompanham: `start_sendon_done` (pedido de firma enviado), `pdf_delivered`/`pdf_node_id` (PDF gravado e nó que o
 recebeu), `sendon_done`/`disposition` (tarefa concluída pela integração), `completed_externally` (tarefa já concluída
 fora da integração), `sign_subprocess_id`/`sign_task_id` (tarefa de firma resolvida), `attention_kind`, `adopted`,
-`cancel_requested_at`/`cancel_source` (acordo encerrado por pedido de cancelamento, seção 10).
+`expires_at` (migração v6; prazo do acordo no Adobe, ISO; `NULL` = desconhecido, seção 4.5), `cancel_requested_at`/`cancel_source`
+(acordo encerrado por pedido de cancelamento, seção 10).
 
 ## 4. Etapas
 
@@ -87,23 +88,31 @@ fora da integração), `sign_subprocess_id`/`sign_task_id` (tarefa de firma reso
     (rótulos = `START_FIELD_*`; o mesmo conjunto de validações 422/409);
   - com o usuário humano + **sub-workflow** → `409` `REASSIGN_REQUIRED` (o `status/info` só devolve os atributos do
     **pai**, e o formulário exige a tarefa no usuário de integração): a página reatribui antes e repete o `/start`
-    (com novo `/auth`: o nonce é de uso único). Antes de pedir a reatribuição há a **pré-checagem** (abaixo).
+    (com novo `/auth`: o nonce é de uso único). Antes de pedir a reatribuição há a **pré-checagem** (abaixo). Se, depois de
+    reatribuir, o segundo `/start` falhar sem acordo, a página do fluxo puro devolve a tarefa ao usuário (ramo `accion=devolver`;
+    ver `webreports/README.md`), porque o servidor nunca revisita uma tarefa que ficou com o usuário de integração sem acordo.
   - `task_assignees` ausente na resposta do OTCS → trata como atribuída (caminho antigo), sem consultar `GET /v1/auth`
     (`handoff.integrationUserId` vem `null`; o SendOn é tentado direto).
 - A resposta do `/start` leva `handoff` = `{ workflowId, subworkflowId, taskId, integrationUserId, assigned }` (números):
   o que a página deve reatribuir quando `assigned=false`. Também vem no `existing: true` enquanto a tarefa de início
   ainda está `current`; com ela já avançada, `handoff` é omitido (nada a reatribuir). Sem `START_VERIFY_WORKFLOW`, não há `handoff`.
 - **Pré-checagem do sub-workflow (antes do `REASSIGN_REQUIRED`).** Aqui o servidor não consegue ler o formulário (só quem tem a
-  tarefa o lê) e, por isso, hoje pede a reatribuição **antes** de existir acordo. Para não reatribuir à toa, usa os valores do
-  corpo, que aqui são só **dicas** (nunca usadas para criar acordo): se houver `nodeId` numérico e ao menos um e-mail, baixa o nó,
-  roda a validação de PDF e a trava de duplicidade (abaixo). Se algo falhar, devolve o erro (`NOT_PDF`, `DUPLICATE_OPEN`, ou o 500
+  tarefa o lê) e, por isso, hoje pede a reatribuição **antes** de existir acordo. Para não reatribuir à toa, confere primeiro o
+  **login do Adobe** (com ou sem dicas): sem sessão devolve `401` `LOGIN_REQUIRED` e não pede a reatribuição. Em seguida usa os valores do
+  corpo, que aqui são só **dicas** (nunca usadas para criar acordo): se houver `nodeId` numérico e ao menos um e-mail, confere o
+  `attachId` da dica (se veio preenchido, precisa ser numérico; senão o mesmo `422` do formulário, "El flujo no tiene la carpeta de
+  destino (AttachID).", e `attachId` vazio nas dicas segue como antes), baixa o nó, roda a validação de PDF e a trava de duplicidade
+  (abaixo). Se algo falhar, devolve o erro (`422` do AttachID, `NOT_PDF`, `DUPLICATE_OPEN`, ou o 500
   genérico se o OTCS falhar ao baixar) e **não** pede a reatribuição. Sem dicas, ou se o fluxo já tem acordo **deste ciclo** desse documento (não
-  concluído; o `/start` seguinte o devolve como `existing`), segue direto para o `REASSIGN_REQUIRED`. Um acordo **concluído** é de um ciclo
-  anterior: a pré-checagem roda normalmente. Depois da reatribuição, o caminho normal
+  concluído e com o SendOn de início ainda pendente; o `/start` seguinte o devolve como `existing`), segue direto para o
+  `REASSIGN_REQUIRED`. Se o acordo mais recente não está concluído mas o SendOn de início dele **já foi feito**, é de um ciclo
+  anterior ainda aberto: `409 PREVIOUS_CYCLE_OPEN` (abaixo) e a tarefa **não** é reatribuída. Um acordo **concluído** é de um ciclo
+  anterior já encerrado: a pré-checagem roda normalmente. Depois da reatribuição, o caminho normal
   relê o formulário (a fonte da verdade) e valida tudo de novo. Custo: um download extra do documento por abertura da página.
   - **Pendência (não validada):** a ordem estrita "acordo antes de reatribuir" no sub-fluxo depende de uma forma de ler os
     atributos do sub-fluxo **sem ser o responsável pela tarefa**. A candidata é `GET /v2/workflows/status/info?workid=<subworkid>`
-    (com o ID do subprocesso no lugar do pai); ainda não foi testada no OTCS. Enquanto isso, a pré-checagem com as dicas é a
+    (com o ID do subprocesso no lugar do pai): no QA (29/10/2026, sub-fluxo 12353419) ela responde **400**, então não serve.
+    Enquanto isso, a pré-checagem com as dicas é a
     mitigação: o dado que ela confere pode divergir do formulário, mas a validação definitiva roda depois da reatribuição.
 - **O mesmo fluxo vê o acordo do ciclo dele, mesmo se já for final.** Com a validação do OTCS, o `/start` procura o acordo **mais
   recente** de (`workflowId`, `subworkflowId`, `nodeId`) (`findLatestByWorkflow`):
@@ -112,7 +121,20 @@ fora da integração), `sign_subprocess_id`/`sign_task_id` (tarefa de firma reso
     **concluído** (`sendonDone=true`, inclusive `completedExternally`), o resultado já foi aplicado e o mapa voltou ao passo de envio
     (ex.: `Rechazado` com retorno ao envio, mesmo `DocID`); o acordo antigo é ignorado e o envio segue normal, criando um acordo novo,
     com a trava de duplicidade e a validação do PDF valendo como sempre;
-  - tarefa de início já fora de `current` (recarga depois do SendOn): o mais recente em qualquer estado, inclusive concluído.
+  - **Exceção, ciclo anterior ainda aberto (`PREVIOUS_CYCLE_OPEN`).** Com a tarefa de início `current`, o acordo não concluído só é
+    deste ciclo se o SendOn de início dele ainda está pendente (`start_sendon_done=false`: recarga enquanto a página reatribui). Se
+    esse SendOn **já foi feito** (`start_sendon_done=true`) e o acordo segue sem concluir (aberto, ou final com a disposição ainda
+    pendente), o fluxo avançou e voltou ao passo de envio: responder sucesso (`existing`) faria a página mostrar "enviado" com o fluxo
+    parado em "Enviar", e criar outro acordo duplicaria o anterior. O `/start` responde
+    `409 { error: "Este flujo tiene la solicitud de firma <id> de un envío anterior, aún sin concluir; cancélela o espere su resultado antes de reenviar.", code: "PREVIOUS_CYCLE_OPEN", id }`,
+    sem acordo novo, sem SendOn, **sem `handoff`** (a tarefa não é reatribuída) e com um `warn` no log. Vale no caminho do
+    formulário, no do fluxo puro com a tarefa no usuário humano e na pré-checagem do sub-workflow. Para liberar o envio: cancelar o
+    acordo antigo (cancelamento de fluxos / Adobe) ou esperar o resultado dele ser aplicado.
+    **Corrida com o background:** se o SendOn de início foi feito DURANTE o próprio `/start` (o retry em background grava
+    `start_sendon_at` depois do instante em que o `/start` leu o `step_list`, com a tarefa ainda `current`), é o envio deste ciclo, não
+    de um anterior: o `/start` responde `existing` **sem `handoff`** (nada a reatribuir), nunca um 409 falso;
+  - tarefa de início já fora de `current` (recarga depois do SendOn): o mais recente em qualquer estado, inclusive concluído
+    (nunca `PREVIOUS_CYCLE_OPEN`).
 
   Se existe um acordo (nesses casos):
   - aberto (sem resultado final e sem a disposição enviada): `200 { message: "Signature already requested. ID: ...", id, existing: true, handoff? }`;
@@ -129,6 +151,10 @@ fora da integração), `sign_subprocess_id`/`sign_task_id` (tarefa de firma reso
   (`id` e `workflowId` são os do acordo aberto). Acordo final ou concluído **nunca** bloqueia. Sem a validação do workflow
   (caminho legado, sem identidade de fluxo) vale só o critério "aberto". Uma requisição igual ainda em processamento neste servidor
   responde `409 { code: "START_IN_PROGRESS" }` (outra mensagem: o acordo dela ainda não existe).
+- **Janela do acordo órfão.** Entre o `createAgreement` no Adobe e a gravação do registro (`repo.upsert`) o acordo só existe no
+  Adobe. O `/start` registra o ID no log (`info`, com workflow/subprocesso/nó) **antes** de gravar; se a gravação falhar, loga um
+  `error` em espanhol com o ID ("El acuerdo <id> se creó en Adobe pero no se pudo registrar ... Adóptelo con POST /admin/adopt/<id>")
+  e responde o 500 genérico. Recuperação: `POST /admin/adopt/:id`.
 - Repetir o `/start` (`existing: true`) com a etapa start ainda pendente retoma a reconciliação do acordo na hora
   (`resumeStart`: ignora o backoff e reabre um `needs_attention` `retries_exhausted`), então o SendOn sai logo após o
   REASSIGN da página. A reconciliação é serializada por acordo; repetir é seguro.
@@ -150,9 +176,12 @@ fora da integração), `sign_subprocess_id`/`sign_task_id` (tarefa de firma reso
 ### 4.2 verify
 Todo resultado final (webhook ou polling) é confirmado no Adobe por `GET /agreements/{id}` antes do PDF e da disposição:
 o `agreement.status` do payload não basta. Um `adobeStatus` já gravado por consulta ao Adobe que confirma o resultado
-dispensa nova consulta (é o caso do polling). Em `CANCELLED` consulta-se também `GET /agreements/{id}/events` para separar
-recusa de recall; a falha de conversão aceita `CANCELLED` (com ou sem recusa) e `ABORTED`. Confirmado ⇒ segue e grava
-`adobeStatus`. Estado em andamento é **transitório** (retry com backoff).
+dispensa nova consulta (é o caso do polling). Em `CANCELLED` e `ABORTED` também se consulta `GET /agreements/{id}/events`:
+em `CANCELLED`, recusa x recall; em `ABORTED`, o evento `AUTO_CANCELLED_CONVERSION_PROBLEM` é falha de conversão e, sem ele,
+intervenção (`needs_attention`, `event`, no polling). Para confirmar uma falha de conversão vinda do webhook, `CANCELLED` (com ou
+sem recusa) e `ABORTED` valem com ou sem o evento, porque o status não informa o motivo. Falha ao ler os eventos não finaliza:
+no polling o próximo ciclo tenta de novo; no verify, retry com backoff. Confirmado ⇒ segue e grava `adobeStatus`. Estado em
+andamento é **transitório** (retry com backoff).
 Outro resultado final no Adobe (ex.: webhook `REJECTED` com Adobe `SIGNED`, ou `RECALLED` com evento de recusa) ⇒ **vale o
 do Adobe**: grava-se o evento `VERIFY_STATUS_<status>` (`source=verify`), registra-se um warn e o pipeline roda de novo, uma
 única vez. Sem resultado final no Adobe (`NEEDS_ATTENTION`, `UNKNOWN`, vazio) ⇒ `needs_attention` (`unconfirmed`); o final
@@ -163,14 +192,15 @@ não há consulta extra.
 
 ### 4.3 pdf
 Baixa `combinedDocument?attachAuditReport=true` e grava como **nova versão do `nodeId`** (o `DocID` do fluxo: é o nó que o
-fluxo devolve ao pai e que a distribuição ao workspace copia). Se o nó não existe mais ou não é acessível, cai para
+fluxo devolve ao pai e que a distribuição ao workspace copia). Se o nó não existe mais (sonda abaixo: 400/404), cai para
 `uploadToFolder(attachId)`; sem `attachId` → `needs_attention`. Falha no `addVersion`:
 - 404 → fallback direto para a pasta;
 - 5xx, rede, 401/408/429 → retry com backoff (sem fallback);
 - outro 4xx (400, 403, 409, 423…; a spec do OTCS documenta **400**, não 404, para nó inexistente ou sem acesso) → a
-  integração **sonda o nó** (`GET /v1/nodes/{id}`): inexistente (400/403/404) → fallback para a pasta; existente → retry
-  com backoff (`el documento N existe pero rechazó la nueva versión…`: pode estar reservado ou sem permissão); sonda com
-  erro (5xx/rede) → retry, sem fallback.
+  integração **sonda o nó** (`GET /v1/nodes/{id}`): **400/404** = inexistente → fallback para a pasta; **existe** (200, ou
+  **403**, que é o nó sem permissão para o usuário de integração) → retry com backoff, **sem** fallback, para o PDF não ir à
+  pasta (`el documento N existe pero rechazó la nueva versión…; puede estar reservado o sin permiso`); sonda com erro
+  (5xx/rede) → retry, sem fallback.
 
 Falha no `uploadToFolder` (qualquer status) também é retry. Esgotadas as tentativas → `needs_attention`
 `retries_exhausted` (reabre sozinho, seção 5).
@@ -186,8 +216,8 @@ Localiza a tarefa de firma por `SIGN_TASK_NAMES`, **só no subprocesso do acordo
 
 | Onde está a tarefa | O que acontece |
 |---|---|
-| `current` | lê o formulário (`custom_actions`); disposição ausente → `needs_attention` permanente listando as disponíveis; senão (opcional: grava atributos) e SendOn com a disposição, no `processId/subprocessId/taskId` **resolvidos** |
-| `completed` (recuperação manual, ex.: alguém clicou Firmado) | conclui com `completed_externally=true`, `disposition=null`; log info; **não** é `needs_attention` |
+| `current` | se o OTCS informa os responsáveis (`assigneeIds`) e o usuário de integração não está entre eles, **não** tenta o SendOn: espera com backoff (stage `disposition`, log info: `la tarea de firma (N "nome") está asignada a otro usuario (ids); reasígnela al usuario de integración`); esgotadas as tentativas, `needs_attention` `retries_exhausted` (reabre sozinho; resolve-se reatribuindo a tarefa). `assigneeIds` desconhecido (null) ou **vazio** (`[]`, ex.: atribuição a grupo, sem ids de usuário) mantém o comportamento anterior: tenta o SendOn, sem consultar o usuário de integração. Depois: lê o formulário (`custom_actions`); disposição ausente → `needs_attention` permanente listando as disponíveis; senão (opcional: grava atributos) e SendOn com a disposição, no `processId/subprocessId/taskId` **resolvidos** |
+| `completed` (recuperação manual, ex.: alguém clicou Firmado) | conclui com `completed_externally=true`, `disposition=null`; log info; **não** é `needs_attention`. Exceção: com `start_sendon_done=false` e a tarefa de início `current` no mesmo subprocesso, a firma `completed` é de uma passagem anterior do mapa (laço): envia o início primeiro e relocaliza. Se a firma ainda aparece `completed` logo depois, é retry transitório (não conclusão externa): vale tanto na mesma execução quanto nos retries seguintes enquanto o SendOn de início nosso (`start_sendon_at`, gravado só quando o SendOn é feito por nós, nunca no caminho "já enviada") for igual ou posterior ao resultado final (`final_at`); esgotadas as tentativas, `needs_attention` `retries_exhausted`. Um início enviado antes do final (caso normal) mantém a conclusão externa |
 | ainda não existe e a tarefa de início está `current` | executa a etapa start agora e relocaliza (uma vez) |
 | `next` / `absent` | retry transitório (vira `needs_attention` pelo limite de tentativas); se existir só em outro subprocesso, a mensagem traz os ids |
 | `ambiguous` (vários subprocessos, acordo sem dica clara) | `needs_attention` permanente; nada é enviado |
@@ -246,9 +276,10 @@ com a leitura do processo falhando (ex.: 404), o stop é tentado.
   como conclusão externa e **não** para o fluxo (que fica parado em "Rechazado"/seguinte; parar à mão).
 - Se o Adobe recusar o `expirationTime`, o `/start` falha para os fluxos com `DUE_DATE` (500 genérico; de propósito não há
   retentativa silenciosa sem o prazo, para nunca criar um acordo sem a caducidad que o fluxo pediu).
-- Prazo além da janela do polling (`dias + 1 >= POLL_MAX_AGE_DAYS`, padrão 90): o `/start` mantém o prazo e só avisa no log; a
-  caducidad passa a depender só do webhook (sem ele, o acordo deixa de ser consultado antes de vencer). Com os 15 dias pedidos
-  isso não ocorre.
+- Prazo além da janela do polling (`POLL_MAX_AGE_DAYS`, padrão 90): o `/start` grava `expires_at` (o mesmo instante ISO enviado
+  ao Adobe como `expirationTime`; `NULL` sem `DUE_DATE`; na adoção, o `expirationTime` lido do Adobe). O polling só deixa de
+  consultar um acordo mais velho que `POLL_MAX_AGE_DAYS` depois de `expires_at` + 1 dia; sem `expires_at`, vale só a regra de
+  idade. O `/start` registra o prazo no log (`info`: `vence en N días`).
 - O Adobe bloqueia a assinatura no prazo, mas pode levar até 12 h para passar o acordo a `EXPIRED`; o comentário (e, no fluxo puro, o stop) no OTCS
   vêm depois disso e ainda dependem do processamento (webhook ou polling) e de eventuais retentativas.
 
@@ -265,10 +296,14 @@ por testes com OTCS falso.
   `needs_attention` imediato (`attention_kind=permanent`).
 - **Transitório**: qualquer outro erro do OTCS/Adobe, **inclusive 4xx** (400, 403, 409, 423… no PUT, no `addVersion` com
   nó existente, no upload para a pasta, na leitura do processo) → retry com backoff.
+- **Exceção inesperada** na reconciliação (bug, não erro do OTCS/Adobe, que as etapas já tratam): conta como falha da etapa
+  genérica `reconcile` (com trabalho pendente): backoff, `RETRY_MAX_ATTEMPTS` e, esgotado, `retries_exhausted` (reabre sozinho).
+  Sem isso o acordo voltaria à fila a cada tick, só com log. Mensagem do limite: `reintentos agotados en reconcile (n/n): …`.
 - **Tentativas esgotadas**: `RETRY_MAX_ATTEMPTS` (padrão 10; 0 = sem limite) → `needs_attention` (`retries_exhausted`), que
   reabre sozinho após `ATTENTION_RETRY_HOURS`.
 - Tipos de `attention_kind`: `permanent`, `retries_exhausted`, `config` (disposição vazia), `unconfirmed` (final que o
-  Adobe não confirmou, inclusive a troca de resultado bloqueada por PDF já entregue), `event` (`DOCUMENTS_DELETED`/`ABORTED`).
+  Adobe não confirmou, inclusive a troca de resultado bloqueada por PDF já entregue), `event` (`DOCUMENTS_DELETED`;
+  `ABORTED` sem o evento de conversão).
 - **Reabertura automática**: o poller (com `POLL_ENABLED` true **ou** false) reabre os `needs_attention` do tipo
   `retries_exhausted` cuja última falha (`last_error_at`) é mais antiga que `ATTENTION_RETRY_HOURS` (padrão 6; 0 desliga):
   zera as tentativas, loga warn e reprocessa. Os demais tipos exigem `POST /admin/reconcile/:id`, novo evento final ou
@@ -309,9 +344,20 @@ posterior do mesmo workflow, exige `POST /admin/adopt/:id`). Risco residual: com
 checagem do remetente/conta no Adobe fecharia isso).
 
 - **Webhook de acordo desconhecido** (banco efêmero perdido, deploy novo) com `ADOPT_UNKNOWN_AGREEMENTS=true`: consulta o
-  Adobe em background, faz o parse do `externalId`; se for nosso **e tiver o `sig` válido** cria o registro (`adopted=true`, `start_sendon_done=false`,
-  `fileName` = nome do acordo sem o prefixo `Documento `) e reaplica o evento; senão log warn. O webhook responde 200
-  sem esperar. A fila confirma a etapa start no OTCS: envia apenas se a tarefa de início ainda estiver ativa; se já
+  Adobe, faz o parse do `externalId`; se for nosso **e tiver o `sig` válido** cria o registro (`adopted=true`,
+  `start_sendon_done=false`, `fileName` = nome do acordo sem o prefixo `Documento `, `expires_at` = `expirationTime`
+  do Adobe, quando presente) e reaplica o evento; senão log warn. O webhook **espera a adoção por até 8 s** e responde
+  conforme o resultado:
+  - acordo conhecido: 200 na hora (sem espera);
+  - recusa (sem `externalId` nosso, sem `sig` válido, fluxo já registrado, 4xx do Adobe): 200, como antes;
+    o evento não é gravado. Se o **payload do webhook já traz o `externalId`** (`agreement.externalId`, quando o Adobe o inclui) e ele
+    não é nosso (formato inválido ou `sig` que não confere), a recusa é imediata, sem consultar o Adobe: um Adobe fora do ar (ex.:
+    `REFRESH_TOKEN_MISSING`) não gera 503 para um acordo que não é nosso;
+  - falha transitória ao ler o acordo no Adobe (rede, 5xx, 401/408/429) ou demora acima de 8 s: **503**, para o
+    Adobe reenviar. Nada foi persistido; se a adoção terminar em segundo plano, o reenvio é deduplicado por
+    `notificationId`;
+  - erro ao persistir o evento: 500.
+  A fila confirma a etapa start no OTCS: envia apenas se a tarefa de início ainda estiver ativa; se já
   avançou, só marca como concluída. Isso recupera também um restart entre criar o acordo e enviar o início, mesmo com
   `POLL_ENABLED=false`. Acordos de outras integrações da mesma conta são lembrados por 10 min (sem nova consulta por evento).
 - **`POST /admin/adopt/:id`** (Basic Auth): adota manualmente e roda `reconcile(refresh, manual)`. Sem `externalId`
@@ -355,8 +401,9 @@ incluídos nos formulários dessas tarefas:
 | `DISPOSITION_EXPIRED` / `_RECALLED` / `_CONVERSION_FAILED` | `Rechazado` | vazio ⇒ `needs_attention` |
 | `EXPIRED_STOP_WORKFLOW` | `true` | acordo expirado: com o comentário de caducidad; no fluxo puro (firma = workflow), depois da disposição para o fluxo no Content (exige permissão de stop); no subfluxo só a firma é cancelada (seção 4.5) |
 | `START_FIELD_DUE_DATE` | `DUE_DATE` | rótulo do atributo oculto com o prazo em dias (1 a 365) enviado ao Adobe como `expirationTime`; vazio desliga (seção 4.5) |
+| `POLL_MAX_AGE_DAYS` | `90` | idade (desde a criação) além da qual o polling deixa de consultar um acordo sem resultado final; com `expires_at`, só depois de `expires_at` + 1 dia (seção 4.5) |
 | `ATTENTION_RETRY_HOURS` | `6` | reabertura automática de `retries_exhausted` (0 desliga) |
-| `ADOPT_UNKNOWN_AGREEMENTS` | `true` | adoção de acordo desconhecido pelo `externalId` assinado |
+| `ADOPT_UNKNOWN_AGREEMENTS` | `true` | adoção de acordo desconhecido pelo `externalId` assinado; o webhook espera até 8 s e responde 503 na falha transitória (seção 7) |
 | `WEBHOOK_CLIENT_IDS` | vazio | ClientIds extras aceitos no webhook além do `CLIENT_ID` |
 | `WF_ATTRIBUTES_ENABLED` | `false` | grava dados do Adobe nos atributos do workflow |
 | `WF_ATTR_AGREEMENT_ID`, `WF_ATTR_STATUS`, `WF_ATTR_LAST_EVENT`, `WF_ATTR_UPDATED_AT`, `WF_ATTR_INTEGRATION_STATE` | ver seção 8 | rótulos dos atributos (vazio desliga) |

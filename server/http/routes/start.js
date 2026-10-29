@@ -38,7 +38,9 @@ function startRoutes({ config, logger, signatureService, startBasicAuth, verifyS
       res.json({ message: `Signature requested. ID: ${id}`, id, ...extra });
     } catch (e) {
       // Corpos de ServiceError são fixos: 409 REASSIGN_REQUIRED leva { code, handoff }; 422 NOT_PDF e 409 START_IN_PROGRESS
-      // levam { code }; 409 DUPLICATE_OPEN leva { code, id, workflowId } do acordo aberto em outro fluxo
+      // levam { code }; 401 LOGIN_REQUIRED leva só { error: 'LOGIN_REQUIRED' } (sem code); 409 DUPLICATE_OPEN leva
+      // { code, id, workflowId } do acordo aberto em outro fluxo; 409 PREVIOUS_CYCLE_OPEN leva { code, id } do acordo de um
+      // envio anterior ainda aberto
       if (e instanceof ServiceError) return res.status(e.status).json(e.body);
       logger.error(`[START ERROR] ${describeError(e)}`);
       res.status(500).json({ error: START_ERROR_MESSAGE });

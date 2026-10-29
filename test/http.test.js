@@ -705,3 +705,131 @@ test('/logs/stream envia o conteúdo atual e as novas linhas (SSE)', async () =>
   ac.abort();
   await world.close();
 });
+
+/* ---------- webhook: adoção de acordo desconhecido (B6) ---------- */
+
+const ADOPT_EXT = { workflowId: '3003', subworkflowId: '3004', nodeId: '1001', attachId: '2002' };
+function seedUnknownSigned(world, id = 'AG-X') {
+  world.otcs.addWorkflow('3003', { subprocessId: '3004' });
+  world.adobe.agreements[id] = {
+    id, name: 'Documento contrato.pdf', status: 'SIGNED', externalId: { id: buildExternalId(ADOPT_EXT, world.config.signatureSecret) }
+  };
+}
+
+test('webhook POST (B6): acordo desconhecido com falha transitória ao ler o Adobe => 503 e nada persistido; o reenvio adota, processa uma vez e responde 200', async () => {
+  const world = await buildWorld({ listen: true });
+  seedUnknownSigned(world);
+  const original = world.adobe.getAgreement;
+  world.adobe.getAgreement = async () => { throw httpError(503, 'adobe down'); };
+  const payload = webhookPayload('AGREEMENT_WORKFLOW_COMPLETED', 'AG-X', { notificationId: 'n-b6' });
+
+  let r = await post(world, '/webhook', payload);
+  assert.equal(r.status, 503, 'o Adobe reenvia');
+  assert.equal(r.headers.get('x-adobesign-clientid'), 'test-client-id', 'o eco do ClientId vale também no 503');
+  assert.equal(world.repo.has('AG-X'), false);
+  assert.ok(world.logger.has('warn', /se responde 503 para que Adobe reenvíe/));
+
+  world.adobe.getAgreement = original; // o Adobe voltou
+  r = await post(world, '/webhook', payload);
+  assert.equal(r.status, 200);
+  assert.equal(world.repo.get('AG-X').adopted, true);
+  assert.equal(world.repo.listEvents('AG-X').length, 1);
+  await waitFor(() => world.repo.get('AG-X').state === 'completed');
+  assert.equal(world.otcs.dispositionCalls().length, 1);
+
+  // um reenvio a mais (mesmo notificationId) é deduplicado: responde 200 sem processar de novo
+  r = await post(world, '/webhook', payload);
+  assert.equal(r.status, 200);
+  assert.equal(world.repo.listEvents('AG-X').length, 1);
+  assert.equal(world.otcs.dispositionCalls().length, 1);
+  assert.equal(world.otcs.versions.length, 1);
+  await world.close();
+});
+
+test('webhook POST (B6): adoção que demora além do limite => 503; ela termina em segundo plano e o reenvio é duplicado (200, sem processar duas vezes)', async () => {
+  const world = await buildWorld({ listen: true });
+  world.config.webhookAdoptionWaitMs = 50;
+  seedUnknownSigned(world);
+  const original = world.adobe.getAgreement;
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  world.adobe.getAgreement = async (id) => { await gate; return original(id); };
+  const payload = webhookPayload('AGREEMENT_WORKFLOW_COMPLETED', 'AG-X', { notificationId: 'n-slow' });
+
+  let r = await post(world, '/webhook', payload);
+  assert.equal(r.status, 503);
+  assert.equal(world.repo.has('AG-X'), false);
+
+  release(); // o Adobe responde depois do limite: a adoção segue em segundo plano
+  await waitFor(() => world.repo.get('AG-X')?.state === 'completed');
+  assert.equal(world.otcs.dispositionCalls().length, 1);
+
+  r = await post(world, '/webhook', payload); // o reenvio do Adobe
+  assert.equal(r.status, 200);
+  assert.equal(world.repo.listEvents('AG-X').length, 1);
+  assert.equal(world.otcs.dispositionCalls().length, 1, 'processado uma vez só');
+  await world.close();
+});
+
+test('webhook POST (B6): adoção recusada (4xx do Adobe, não é nosso) segue respondendo 200; acordo conhecido responde 200 sem esperar o Adobe', async () => {
+  const world = await buildWorld({ listen: true });
+  world.config.webhookAdoptionWaitMs = 50;
+  seedUnknownSigned(world);
+  world.adobe.agreements.OUTRO = { id: 'OUTRO', status: 'SIGNED', externalId: { id: 'crm|123' } };
+  for (const id of ['NAO-EXISTE', 'OUTRO']) {
+    const r = await post(world, '/webhook', webhookPayload('AGREEMENT_WORKFLOW_COMPLETED', id, { notificationId: `n-${id}` }));
+    assert.equal(r.status, 200, id);
+  }
+  assert.equal(world.repo.list().length, 0);
+
+  // acordo conhecido: 200 imediato mesmo com o Adobe lento (o processamento é em segundo plano)
+  seedAgreement(world, 'AG-1');
+  world.adobe.agreements['AG-1'] = { id: 'AG-1', status: 'SIGNED' };
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const original = world.adobe.getAgreement;
+  world.adobe.getAgreement = async (id) => { await gate; return original(id); };
+  const started = Date.now();
+  const r = await post(world, '/webhook', webhookPayload('AGREEMENT_WORKFLOW_COMPLETED', 'AG-1', { notificationId: 'n-known' }));
+  assert.equal(r.status, 200);
+  assert.ok(Date.now() - started < 1000);
+  release();
+  await waitFor(() => world.repo.get('AG-1').state === 'completed');
+  await world.close();
+});
+
+test('webhook POST (L6): payload com externalId que não é nosso => 200 sem consultar o Adobe (nem 503 com o Adobe fora do ar); externalId assinado segue para a adoção', async () => {
+  const world = await buildWorld({ listen: true });
+  world.config.webhookAdoptionWaitMs = 50;
+  seedUnknownSigned(world);
+  let adobeReads = 0;
+  const original = world.adobe.getAgreement;
+  world.adobe.getAgreement = async (id) => { adobeReads++; throw httpError(500, 'REFRESH_TOKEN_MISSING'); };
+  const withExt = (id, extId, n) => webhookPayload('AGREEMENT_WORKFLOW_COMPLETED', id, {
+    notificationId: n, extra: { agreement: { id, status: 'SIGNED', externalId: { id: extId } } }
+  });
+
+  // externalId de outro sistema e externalId no nosso formato mas com assinatura inválida: recusados na hora
+  const forged = buildExternalId(ADOPT_EXT, 'outro-segredo');
+  for (const [id, ext] of [['OUTRO-1', 'crm|123'], ['OUTRO-2', forged]]) {
+    const r = await post(world, '/webhook', withExt(id, ext, `n-${id}`));
+    assert.equal(r.status, 200, id);
+  }
+  assert.equal(adobeReads, 0, 'não consultou o Adobe');
+  assert.equal(world.repo.list().length, 0);
+  assert.ok(world.logger.has('warn', /externalId del payload no es propio/));
+
+  // a recusa pelo payload (não autenticado) não entra no cache "não é nosso": o webhook seguinte do mesmo acordo, sem
+  // externalId, ainda tenta a adoção (aqui o Adobe falha => 503)
+  const again = await post(world, '/webhook', webhookPayload('AGREEMENT_WORKFLOW_COMPLETED', 'OUTRO-2', { notificationId: 'n-again' }));
+  assert.equal(again.status, 503);
+  assert.equal(adobeReads, 1, 'o forjado não silenciou o webhook seguinte');
+
+  // externalId assinado por nós: segue o caminho normal da adoção (aqui o Adobe falha => 503 para ele reenviar)
+  const ours = buildExternalId(ADOPT_EXT, world.config.signatureSecret);
+  const r = await post(world, '/webhook', withExt('AG-X', ours, 'n-ours'));
+  assert.equal(r.status, 503);
+  assert.equal(adobeReads, 2);
+  world.adobe.getAgreement = original;
+  await world.close();
+});

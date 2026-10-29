@@ -93,6 +93,11 @@ const MIGRATIONS = [
   `
   ALTER TABLE agreements ADD COLUMN workflow_stop_pending INTEGER NOT NULL DEFAULT 0;
   ALTER TABLE agreements ADD COLUMN workflow_stopped_at TEXT;
+  `,
+  // v6: prazo do acordo no Adobe (expirationTime enviado no /start ou lido na adoção, ISO). O polling só desiste de um acordo
+  // mais velho que POLL_MAX_AGE_DAYS depois de expires_at + 1 dia (DUE_DATE vai até 365 dias). NULL = sem prazo conhecido.
+  `
+  ALTER TABLE agreements ADD COLUMN expires_at TEXT;
   `
 ];
 

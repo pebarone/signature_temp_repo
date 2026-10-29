@@ -115,9 +115,10 @@ function createOtcsClient({
     addVersionWithTicket(tck, nodeId, buffer, fileName, deliveryMarker(agreementId)));
 
   /*
-    O nó existe e está acessível? GET /v1/nodes/{id}: 2xx => true. A spec do OTCS documenta 400 (não 404) para nó
-    inexistente ou sem acesso; 403/404 também valem como "não existe/acessível". Qualquer outro erro (5xx, rede...) é
-    transitório e sobe para o chamador.
+    O nó existe? GET /v1/nodes/{id}: 2xx => true. A spec do OTCS documenta 400 (não 404) para nó inexistente ou sem acesso;
+    400/404 valem como "não existe". 403 = o nó EXISTE mas o usuário de integração não tem permissão: devolve true, para o
+    PDF assinado não ir para a pasta de anexos enquanto o fluxo distribui o DocID sem assinatura (a entrega retenta até
+    a permissão ser corrigida). Qualquer outro erro (5xx, rede...) é transitório e sobe para o chamador.
   */
   const nodeExists = (nodeId) => withTicket(async (tck) => {
     try {
@@ -126,7 +127,8 @@ function createOtcsClient({
       });
       return true;
     } catch (e) {
-      if ([400, 403, 404].includes(e.response?.status)) return false;
+      if ([400, 404].includes(e.response?.status)) return false;
+      if (e.response?.status === 403) return true; // existe, mas sem permissão para o usuário de integração
       throw e;
     }
   });

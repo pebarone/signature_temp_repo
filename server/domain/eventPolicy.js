@@ -77,6 +77,10 @@ const PROGRESS_STATUSES = new Set([
 ]);
 
 const isCancelledStatus = (status) => String(status || '').trim().toUpperCase() === 'CANCELLED';
+const isAbortedStatus = (status) => String(status || '').trim().toUpperCase() === 'ABORTED';
+// Estados cuja classificação depende do histórico (GET /agreements/{id}/events): CANCELLED (recusa x recall) e ABORTED
+// (falha de conversão x exige intervenção). Quem consulta o Adobe busca os eventos nestes casos.
+const needsAgreementEvents = (status) => isCancelledStatus(status) || isAbortedStatus(status);
 
 // No v6 uma recusa do signatário também aparece como CANCELLED: o histórico (GET /agreements/{id}/events)
 // tem um evento REJECTED / ACTION_REJECTED quando foi recusa; sem ele, foi cancelamento (recall).
@@ -86,20 +90,29 @@ function classifyCancelled(events) {
   return rejected ? KINDS.FINAL_REJECTED : KINDS.FINAL_RECALLED;
 }
 
-// Estado do acordo (GET /agreements/{id}) usado pelo polling. Para CANCELLED passe `events`.
+// ABORTED: o Adobe cancela sozinho um acordo cujo documento não converte (webhook AGREEMENT_AUTO_CANCELLED_CONVERSION_PROBLEM);
+// o histórico traz o evento AUTO_CANCELLED_CONVERSION_PROBLEM. Com ele é falha de conversão (o mesmo resultado do webhook, para
+// o polling não deixar o acordo preso em needs_attention se o webhook se perder); sem ele, exige intervenção.
+function classifyAborted(events) {
+  const conversion = (Array.isArray(events) ? events : []).some((e) =>
+    String(e?.type || e?.eventType || '').toUpperCase().includes('CONVERSION_PROBLEM'));
+  return conversion ? KINDS.FINAL_CONVERSION_FAILED : KINDS.NEEDS_ATTENTION;
+}
+
+// Estado do acordo (GET /agreements/{id}) usado pelo polling. Para CANCELLED e ABORTED passe `events`.
 function classifyAgreementStatus(status, events) {
   const s = String(status || '').trim().toUpperCase();
   if (s === 'SIGNED') return KINDS.FINAL_OK;
   if (s === 'CANCELLED') return classifyCancelled(events);
   if (s === 'EXPIRED') return KINDS.FINAL_EXPIRED;
-  if (s === 'ABORTED') return KINDS.NEEDS_ATTENTION;
+  if (s === 'ABORTED') return classifyAborted(events);
   if (PROGRESS_STATUSES.has(s)) return KINDS.PROGRESS;
   return KINDS.UNKNOWN;
 }
 
 /*
   O estado do acordo no Adobe confirma o resultado final pedido (webhook ou polling)? `events` (GET /events) só é
-  preciso para CANCELLED, para distinguir recusa de recall. `events === undefined` = histórico não consultado (status
+  preciso para CANCELLED (recusa x recall) e ABORTED (falha de conversão). `events === undefined` = histórico não consultado (status
   já gravado por consulta anterior): CANCELLED então confirma recusa ou recall. Falha de conversão aceita CANCELLED
   (com ou sem recusa) e ABORTED, porque o Adobe não informa o motivo.
 */
@@ -116,6 +129,11 @@ function confirmsFinalKind(finalKind, status, events) {
   Extrai os campos relevantes do payload do webhook (formato v6; tolera o formato antigo
   em que `event` era um objeto).
 */
+function externalIdOf(raw) {
+  const v = raw && typeof raw === 'object' ? raw.id : raw;
+  return typeof v === 'string' && v.trim() ? v.trim() : null;
+}
+
 function parseWebhookPayload(payload) {
   const p = payload && typeof payload === 'object' ? payload : {};
   const ev = p.event;
@@ -128,11 +146,13 @@ function parseWebhookPayload(payload) {
     eventDate: p.eventDate || evObj.eventDate || null,
     participant: p.participantUserEmail || evObj.participantUserEmail || null,
     status: p.agreement?.status || null,
+    // externalId do acordo, se o Adobe o inclui no payload (objeto { id } ou texto); null quando ausente
+    externalId: externalIdOf(p.agreement?.externalId),
     payload: p
   };
 }
 
 module.exports = {
-  KINDS, isFinalKind, canonicalName, classifyEvent, classifyAgreementStatus, classifyCancelled, isCancelledStatus,
-  confirmsFinalKind, parseWebhookPayload
+  KINDS, isFinalKind, canonicalName, classifyEvent, classifyAgreementStatus, classifyCancelled, classifyAborted,
+  isCancelledStatus, isAbortedStatus, needsAgreementEvents, confirmsFinalKind, parseWebhookPayload
 };

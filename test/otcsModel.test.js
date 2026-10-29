@@ -70,11 +70,13 @@ test('otcs.addVersion: resposta perdida após a escrita não duplica versão, in
   assert.equal(writes, 1);
 });
 
-test('otcs.nodeExists: 2xx => true; 400/403/404 => false; outros erros sobem (transitórios)', async () => {
+test('otcs.nodeExists: 2xx => true; 403 (sem permissão) => true; 400/404 => false; outros erros sobem (transitórios)', async () => {
   const httpErr = (status) => Object.assign(new Error(`HTTP ${status}`), { response: { status } });
   const answer = (status) => otcsStub(() => { if (status >= 400) throw httpErr(status); return { data: {} }; }).client;
   assert.equal(await answer(200).nodeExists(1001), true);
-  for (const status of [400, 403, 404]) assert.equal(await answer(status).nodeExists(1001), false, String(status));
+  // 403: o nó existe, só falta permissão ao usuário de integração (o PDF não pode ir para outra pasta)
+  assert.equal(await answer(403).nodeExists(1001), true);
+  for (const status of [400, 404]) assert.equal(await answer(status).nodeExists(1001), false, String(status));
   for (const status of [500, 502, 429]) await assert.rejects(() => answer(status).nodeExists(1001), { response: { status } });
   const { client, seen } = otcsStub(() => ({ data: {} }));
   await client.nodeExists(1001);
@@ -282,7 +284,7 @@ test('adobe.createAgreement: envia externalId { id } só quando informado', asyn
 /* ---------- banco: migração v1 -> v2 ---------- */
 
 test('db: arquivo criado no schema v1 recebe as migrações seguintes (v2, v3) preservando os dados', () => {
-  assert.equal(MIGRATIONS.length, 5); // v4: cancelamento de fluxos (test/cancellation.test.js); v5: caducidad (test/workflow.test.js)
+  assert.equal(MIGRATIONS.length, 6); // v4: cancelamento de fluxos (test/cancellation.test.js); v5: caducidad (test/workflow.test.js); v6: expires_at
   const file = path.join(tmpDir(), 'v1.db');
 
   // banco "antigo": só a migração 1
@@ -364,4 +366,28 @@ test('repo.listPending inclui etapa start pendente (com workflowId) e listAttent
   att('DONE', { sendonDone: true });
   assert.deepEqual(repo.listAttentionToReopen('2026-06-22T06:00:00.000Z').map((r) => r.id), ['OLD-RETRIES']);
   db.close();
+});
+
+test('db: banco no schema v5 recebe a migração v6 (expires_at) e o prazo é gravado/lido como expiresAt', () => {
+  const file = path.join(tmpDir(), 'v5.db');
+  const raw = new Database(file);
+  for (let i = 0; i < 5; i++) raw.exec(MIGRATIONS[i]);
+  raw.pragma('user_version = 5');
+  raw.prepare(`INSERT INTO agreements (id, node_id, workflow_id, state, created_at, updated_at) VALUES ('OLD', '1', '3003', 'pending', 'a', 'b')`).run();
+  raw.close();
+
+  const db = openDatabase(file);
+  assert.equal(db.pragma('user_version', { simple: true }), MIGRATIONS.length);
+  assert.ok(db.pragma('table_info(agreements)').some((c) => c.name === 'expires_at'));
+  const repo = createAgreementRepository(db);
+  assert.equal(repo.get('OLD').expiresAt, null, 'acordo antigo: prazo desconhecido');
+  assert.equal(repo.upsert('OLD', { expiresAt: '2027-06-22T12:00:00.000Z' }).expiresAt, '2027-06-22T12:00:00.000Z');
+  assert.equal(repo.upsert('NEW', { expiresAt: '2026-07-07T12:00:00.000Z' }).expiresAt, '2026-07-07T12:00:00.000Z');
+  assert.equal(repo.upsert('NEW', { state: 'pending' }).expiresAt, '2026-07-07T12:00:00.000Z', 'um patch sem o campo não o apaga');
+  db.close();
+
+  const again = openDatabase(file); // reabrir é idempotente
+  assert.equal(again.pragma('user_version', { simple: true }), MIGRATIONS.length);
+  assert.equal(createAgreementRepository(again).get('OLD').expiresAt, '2027-06-22T12:00:00.000Z');
+  again.close();
 });

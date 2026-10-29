@@ -226,12 +226,13 @@ const isStartPending = (rec) => !rec.startSendonDone && !rec.sendonDone && !!rec
 
 const hasPendingWork = (rec) => (!!rec.finalKind && !rec.sendonDone) || isStartPending(rec);
 
-// Marca a etapa start como concluída (zera o contador só se a última falha era do próprio start)
+// Marca a etapa start como concluída (zera o contador só se a última falha era do próprio start ou uma exceção inesperada
+// genérica 'reconcile', que também pode ter ocorrido antes do SendOn)
 const startDonePatch = (rec, nowIso) => ({
   startSendonDone: true,
   startSendonAt: nowIso,
   startSendOnError: null,
-  ...(rec.lastErrorStage === 'start'
+  ...(['start', 'reconcile'].includes(rec.lastErrorStage)
     ? { attempts: 0, lastError: null, lastErrorStage: null, nextAttemptAt: null }
     : {})
 });
@@ -242,12 +243,19 @@ const isDue = (rec, nowMs) => !rec.nextAttemptAt || Date.parse(rec.nextAttemptAt
 const isRetryable = (rec, nowMs) =>
   hasPendingWork(rec) && rec.state !== STATES.NEEDS_ATTENTION && isDue(rec, nowMs);
 
-// Candidato a polling: ainda sem resultado final conhecido
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+// Candidato a polling: ainda sem resultado final conhecido. Além de maxAgeDays desde a criação deixa de ser consultado,
+// salvo se o prazo do acordo no Adobe (expiresAt, DUE_DATE até 365 dias) ainda não passou há mais de 1 dia: com o webhook
+// perdido, é o polling que vê o EXPIRED/SIGNED desse acordo.
 function shouldPoll(rec, nowMs, maxAgeDays = 0) {
   if (rec.finalKind || rec.sendonDone || rec.state === STATES.NEEDS_ATTENTION) return false;
   if (maxAgeDays > 0 && rec.createdAt) {
     const age = nowMs - Date.parse(rec.createdAt);
-    if (Number.isFinite(age) && age > maxAgeDays * 24 * 60 * 60 * 1000) return false;
+    if (Number.isFinite(age) && age > maxAgeDays * DAY_MS) {
+      const expiresMs = Date.parse(rec.expiresAt || '');
+      return Number.isFinite(expiresMs) && nowMs <= expiresMs + DAY_MS;
+    }
   }
   return true;
 }

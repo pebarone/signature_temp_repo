@@ -305,7 +305,7 @@ test('otcs: getTaskForm entrega o valor multivalor (array) do atributo intacto, 
 /* ---------- banco e repositório ---------- */
 
 test('db: banco no schema v3 recebe a migração v4 (cancelamento) preservando os dados', () => {
-  assert.equal(MIGRATIONS.length, 5);
+  assert.equal(MIGRATIONS.length, 6);
   const file = path.join(tmpDir(), 'v3.db');
   const raw = new Database(file);
   for (let i = 0; i < 3; i++) raw.exec(MIGRATIONS[i]);
@@ -318,6 +318,7 @@ test('db: banco no schema v3 recebe a migração v4 (cancelamento) preservando o
   const cols = db.prepare('PRAGMA table_info(agreements)').all().map((c) => c.name);
   assert.ok(cols.includes('cancel_requested_at') && cols.includes('cancel_source'));
   assert.ok(cols.includes('workflow_stop_pending') && cols.includes('workflow_stopped_at'), 'v5 (caducidad) aplicada em seguida');
+  assert.ok(cols.includes('expires_at'), 'v6 (prazo do acordo) aplicada em seguida');
   assert.ok(db.prepare('PRAGMA index_list(agreements)').all().some((i) => i.name === 'idx_agreements_workflow'));
   const repo = createAgreementRepository(db);
   const old = repo.get('OLD');

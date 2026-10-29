@@ -67,6 +67,8 @@ tratam o mesmo contrato:
 | `409 { code: 'REASSIGN_REQUIRED', handoff }` | sub-fluxo com a tarefa ainda no usuário | reatribui e repete `/auth` + `/start` uma vez (o servidor já validou PDF e duplicidade antes de pedir; ver `docs/REGLAS_DEL_FLUJO.md`) |
 | `422 { code: 'NOT_PDF' }` | o documento (`DocID`) não é um PDF válido; nada foi criado no Adobe | mostra a mensagem do servidor e a dica "Suba una versión PDF...", com **Reintentar** visível. **Não** reatribui |
 | `409 { code: 'DUPLICATE_OPEN', id, workflowId }` | já existe uma solicitação **aberta** do mesmo documento e destinatários em **outro** fluxo (janela de 15 min) | mostra a mensagem e "Acuerdo abierto: id (flujo workflowId)", com **Reintentar** visível. **Não** reatribui |
+| `409 { code: 'PREVIOUS_CYCLE_OPEN', id }` | a tarefa de envio voltou a ser a atual, mas o fluxo tem a solicitação `id` de um envio **anterior** ainda sem concluir (o SendOn de início dela já foi feito) | mostra a mensagem do servidor (leva o ID), com **Reintentar** visível: cancele o acordo antigo ou espere o resultado e reenvie. **Não** reatribui (no sub-fluxo o servidor responde antes de pedir a reatribuição); se a página já tinha reatribuído (pedido sem dicas), ela tenta devolver a tarefa |
+| `422` AttachID ("El flujo no tiene la carpeta de destino (AttachID).") | `AttachID` ausente ou não numérico; no sub-fluxo também vale para o `attachId` das dicas, **antes** da reatribuição | mostra a mensagem, com **Reintentar**. No sub-fluxo a tarefa continua com o usuário |
 | outros `4xx/5xx` | dados divergentes (409), fluxo fora do passo de envio (409), DocID/e-mails ausentes (422), OTCS indisponível (503)... | mostra a mensagem do servidor, com **Reintentar** |
 
 Reintentar depois de `NOT_PDF` repete o envio inteiro: o servidor baixa a versão atual do nó, então basta subir uma nova versão
@@ -110,10 +112,27 @@ roda quando a página o pede. A ordem nas páginas de envio é:
    nuevo.", ou a mensagem do servidor) com "Reintentar". Falha de **rede** na confirmação não bloqueia: vai para o console
    e a página mostra sucesso, porque o servidor cobre com o backoff.
 4. Sem `handoff` (orquestrador antigo, sem o campo), a página só mostra o sucesso.
-5. `NOT_PDF` e `DUPLICATE_OPEN` vêm **antes** de qualquer reatribuição (inclusive no sub-fluxo, onde o servidor valida com as
-   dicas do corpo antes de responder `REASSIGN_REQUIRED`): nesses casos a tarefa continua com o usuário.
+5. `NOT_PDF`, `DUPLICATE_OPEN`, `PREVIOUS_CYCLE_OPEN`, o `422` do AttachID e `LOGIN_REQUIRED` vêm **antes** de qualquer reatribuição
+   (inclusive no sub-fluxo, onde o servidor valida com as dicas do corpo antes de responder `REASSIGN_REQUIRED`): nesses casos a
+   tarefa continua com o usuário.
 6. Reintentar: se o acordo já existe, reatribui e confirma de novo; se não, repete o envio inteiro. O botão fica oculto
    enquanto a execução anterior não termina, e um clique repetido é ignorado.
+7. **Devolução da tarefa (só `firma-flujo-puro`).** No sub-fluxo, se a página reatribuiu a tarefa ao usuário de integração e o
+   segundo `/start` falha **sem acordo** (resposta de erro, `REASSIGN_REQUIRED` de novo ou falha de rede), a tarefa ficaria com o
+   usuário de integração: some da caixa de quem a tinha e nada no servidor volta a olhá-la. Por isso a página chama o ramo
+   `accion=devolver` (abaixo) antes de mostrar o erro. A página **nunca afirma como fato** que a tarefa voltou (a marca
+   `DEVUELTO_OK` não prova isso, ver o ramo abaixo). Mostra o erro original mais "Se intentó devolver la tarea a su bandeja. Si no
+   aparece, contacte al administrador (flujo X, subflujo Y, tarea Z)." quando a marca veio, ou "Es posible que la tarea haya quedado
+   asignada al usuario de integración (flujo X, subflujo Y, tarea Z); contacte al administrador." quando o pedido falhou ou veio sem
+   a marca. Durante o pedido o texto de estado é "Devolviendo la tarea...".
+   O flag `reasignadoSinAcuerdo` é ligado **antes** de `reasignar()` (se o resultado dela for ambíguo, a tarefa pode ter mudado de
+   usuário; devolver a quem já a tem não faz nada). Se o segundo `/start` falhar de forma **ambígua** (erro de rede, ou HTTP
+   502/503/504 sem `code` no corpo), a página repete `/auth` + `/start` **uma vez** antes de decidir: se der certo, o acordo
+   existia (`existing: true`) e segue o caminho de sucesso, sem devolver; `START_IN_PROGRESS` não devolve; qualquer outro resultado
+   devolve como antes.
+   Não devolve se já existe acordo (`state.acuerdoId`; no fluxo puro o acordo nasce **antes** da reatribuição) nem quando o erro é
+   `START_IN_PROGRESS` (outra requisição está criando o acordo agora). O estado `reasignadoSinAcuerdo` persiste: num Reintentar
+   posterior, se o envio falhar de novo com o flag ainda ligado (devolução anterior falhou), tenta devolver outra vez.
 
 Na página de cancelamento o `/cancel` não devolve `handoff` quando dá certo (ele já faz o SendOn da tarefa), então não há o passo
 de confirmação do item 3: só vale o item 2 (reatribuir e repetir `/auth` + `/cancel` uma vez).
@@ -138,6 +157,32 @@ existe só nesse ramo. O ramo é **idêntico** nas três páginas (só muda o co
 **O destino não vem da URL.** O usuário de integração fica fixo no ramo, na linha `WFTASKACTION:REASSIGN:11742766`, com um
 comentário logo acima. A URL leva só a tarefa (`workid`, `subworkid`, `taskid`), e a página valida que são dígitos antes de
 pedir. Por isso o `integrationUserId` do `handoff` é informativo: a página não o usa.
+
+### Ramo `accion=devolver` (só `firma-flujo-puro`)
+
+```
+[LL_REPTAG_{'[LL_REPTAG_&WORKID /]','[LL_REPTAG_&SUBWORKID /]','[LL_REPTAG_&TASKID /]'} WFTASKACTION:REASSIGN:[LL_REPTAG_ACTUALUSERID /] /]
+```
+
+e responde só com `DEVUELTO_OK`. Devolve a tarefa ao **usuário que executa o WebReport** (o mesmo que a tinha antes de a página
+reatribuí-la), sem ID fixo; a URL não escolhe o destino. A marca (`DEVUELTO` + `_OK` montado em JS, como a do `reasignar`) é impressa
+**incondicionalmente** depois do `WFTASKACTION`: **não está validado** que o ramo deixe de imprimi-la quando o OTCS recusa a
+reatribuição, e ela pode aparecer mesmo com a falha. Por isso a marca só diz "o pedido foi feito", nunca "a tarefa voltou", e a página
+sempre mostra os IDs. Best effort: nunca bloqueia a mensagem de erro.
+
+**Não validado no OTCS de QA (validar antes de publicar):**
+- que `[LL_REPTAG_ACTUALUSERID /]` (sem `&`: quem abriu a página, mesmo com RunAs; o `USERID` devolveria o usuário do RunAs) resolve para o ID numérico de quem executa o
+  WebReport. Se não resolver, o `REASSIGN` recebe o texto da tag e a devolução falha;
+- que um usuário comum pode reatribuir uma tarefa que **já não está atribuída a ele** (agora é do usuário de integração). Se o
+  OTCS não permitir, a marca pode sair mesmo assim (ver acima); se o ramo precisar de certeza, deve ler o responsável da tarefa
+  depois do `WFTASKACTION` e só então imprimir a marca (pós-condição).
+
+**Superfície de segurança dos ramos `reasignar` e `devolver`.** São `GET` com os IDs da tarefa na URL, executados com a sessão de
+quem os chama: qualquer usuário que consiga executar o WebReport pode puxar para o usuário de integração (ou para si) qualquer tarefa
+sobre a qual tenha permissão no OTCS, bastando montar a URL; e, sendo `GET` com cookie de sessão, o pedido também pode ser disparado
+por outro site (CSRF) com um link ou imagem enquanto a pessoa está logada. O destino fixo (`reasignar`) e o usuário da sessão
+(`devolver`) limitam o estrago, mas não impedem isso. Recomenda-se **restringir as permissões do WebReport** (só os grupos que
+realmente enviam documentos a firma) e não publicá-lo para usuários que não precisam dele.
 
 ### Incidente de QA (workflow 12333200)
 
