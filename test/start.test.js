@@ -1472,7 +1472,7 @@ test('repo.consumeNonce: uso único, purga dos expirados a cada inserção', () 
 });
 
 test('db: banco no schema v2 recebe a migração v3 (start_nonces) preservando os dados', () => {
-  assert.equal(MIGRATIONS.length, 6); // v4: cancelamento de fluxos (test/cancellation.test.js); v5: caducidad (test/workflow.test.js); v6: expires_at
+  assert.equal(MIGRATIONS.length, 7); // v4: cancelamento de fluxos (test/cancellation.test.js); v5: caducidad (test/workflow.test.js); v6: expires_at; v7: cancel_pending_at
   const file = path.join(tmpDir(), 'v2.db');
   const raw = new Database(file);
   raw.exec(MIGRATIONS[0]);

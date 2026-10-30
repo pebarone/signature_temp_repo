@@ -469,7 +469,7 @@ test('poller: falha ao ler os eventos de um CANCELLED não finaliza (warn) e o p
   assert.equal(rec.state, 'pending');
   assert.equal(rec.finalKind, null);
   assert.equal(rec.adobeStatus, null, 'nada gravado');
-  assert.equal(rec.lastPolledAt, null);
+  assert.ok(rec.lastPolledAt, 'só a tentativa, que conta para a ordem do polling');
   assert.equal(world.repo.listEvents('AG-1').length, 0);
   assert.equal(world.otcs.sendons.length, 0);
   assert.ok(world.logger.has('warn', /events down/));
@@ -502,6 +502,24 @@ test('poller: erro ao consultar um acordo não interrompe os demais', async () =
   assert.equal(s.errors, 1);
   assert.equal(world.repo.get('AG-OK').state, 'completed');
   assert.equal(world.repo.get('AG-MISSING').state, 'pending');
+  await world.close();
+});
+
+test('poller: acordos cuja consulta sempre falha não monopolizam o ciclo (a tentativa conta para a ordem)', async () => {
+  const world = await buildWorld({ env: { POLL_MAX_PER_TICK: '2' } });
+  for (const id of ['AG-1', 'AG-2', 'AG-3']) seedAgreement(world, id);
+  // AG-1 e AG-2 não existem no Adobe (404 permanente); AG-3 está assinado
+  world.adobe.agreements['AG-3'] = { id: 'AG-3', status: 'SIGNED' };
+
+  const first = await world.poller.tick();
+  assert.deepEqual([first.polled, first.errors], [0, 2], 'primeiro ciclo: os dois mais antigos');
+  assert.equal(world.repo.get('AG-3').state, 'pending');
+  assert.ok(world.repo.get('AG-1').lastPolledAt && world.repo.get('AG-2').lastPolledAt);
+
+  world.clock.advance(60 * 1000);
+  const second = await world.poller.tick();
+  assert.equal(second.finalized, 1);
+  assert.equal(world.repo.get('AG-3').state, 'completed');
   await world.close();
 });
 

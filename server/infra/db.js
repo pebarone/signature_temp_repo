@@ -98,6 +98,13 @@ const MIGRATIONS = [
   // mais velho que POLL_MAX_AGE_DAYS depois de expires_at + 1 dia (DUE_DATE vai até 365 dias). NULL = sem prazo conhecido.
   `
   ALTER TABLE agreements ADD COLUMN expires_at TEXT;
+  `,
+  // v7: cancelamento "em curso/incerto". cancel_pending_at é gravado ANTES do PUT de cancelamento ao Adobe (cancellationService).
+  // Enquanto presente sem cancel_requested_at, um RECALLED confirmado no Adobe é o NOSSO cancelamento (PUT com resposta perdida e
+  // reconsulta que também falhou, ou processo que caiu entre o PUT e a marca): o pipeline fecha o acordo como cancelamento,
+  // sem Rechazado. Limpa quando o acordo é fechado ou quando se sabe que o PUT não foi aplicado.
+  `
+  ALTER TABLE agreements ADD COLUMN cancel_pending_at TEXT;
   `
 ];
 

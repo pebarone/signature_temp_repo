@@ -61,7 +61,8 @@ Campos que acompanham: `start_sendon_done` (pedido de firma enviado), `pdf_deliv
 recebeu), `sendon_done`/`disposition` (tarefa concluída pela integração), `completed_externally` (tarefa já concluída
 fora da integração), `sign_subprocess_id`/`sign_task_id` (tarefa de firma resolvida), `attention_kind`, `adopted`,
 `expires_at` (migração v6; prazo do acordo no Adobe, ISO; `NULL` = desconhecido, seção 4.5), `cancel_requested_at`/`cancel_source`
-(acordo encerrado por pedido de cancelamento, seção 10).
+(acordo encerrado por pedido de cancelamento, seção 10), `cancel_pending_at` (migração v7; gravado antes do PUT de cancelamento ao Adobe:
+enquanto presente sem `cancel_requested_at`, um RECALLED confirmado é o nosso cancelamento e fecha o acordo sem `Rechazado`).
 
 ## 4. Etapas
 

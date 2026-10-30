@@ -765,6 +765,26 @@ function createReconciliationService({
       }
       return doReconcile(id, { ...opts, rerun: true });
     }
+    // RECALLED confirmado no Adobe de um acordo com cancelamento NOSSO em curso/incerto (cancel_pending_at gravado antes do PUT,
+    // sem cancel_requested_at): é o nosso cancelamento, cuja resposta se perdeu ou cujo processo caiu antes do fechamento.
+    // Fecha como o markClosed do cancellationService (sem SendOn/Rechazado); repetir o cancelamento cai em CANCELLED e faz o stop.
+    if (step.rec.finalKind === KINDS.FINAL_RECALLED && step.rec.cancelPendingAt && !step.rec.cancelRequestedAt) {
+      const ts = nowIso();
+      const adobeStatus = step.rec.adobeStatus || 'CANCELLED';
+      logger.warn(
+        `[${id}] RECALLED de una cancelación propia sin confirmar (cancel_pending_at); se cierra como cancelación, sin disposición`
+      );
+      const recorded = repo.recordEvent(id, {
+        event: 'CANCEL_REQUESTED',
+        canonical: 'CANCEL_REQUESTED',
+        kind: 'cancel_requested',
+        source: 'cancel',
+        receivedAt: ts,
+        summary: { source: 'cancel_pending', recovered: true, adobeStatus }
+      }, { ...state.cancelRequestedPatch(step.rec, ts, { source: 'cancel_pending', adobeStatus }), cancelPendingAt: null });
+      clearTimeout_(id);
+      return { status: 'cancelled', record: recorded?.record || repo.get(id) };
+    }
     step = await deliverSignedPdf(id, plan, step.rec);
     if (step.result) return step.result;
     step = await executeDisposition(id, plan, step.rec);

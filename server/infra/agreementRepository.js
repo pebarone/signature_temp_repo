@@ -39,6 +39,7 @@ const COLUMNS = [
   ['completedExternally', 'completed_externally', 'bool'],
   ['wfAttrsFingerprint', 'wf_attrs_fingerprint', 'text'],
   ['adopted', 'adopted', 'bool'],
+  ['cancelPendingAt', 'cancel_pending_at', 'text'],
   ['cancelRequestedAt', 'cancel_requested_at', 'text'],
   ['cancelSource', 'cancel_source', 'text'],
   ['workflowStopPending', 'workflow_stop_pending', 'bool'],

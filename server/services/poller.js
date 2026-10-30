@@ -11,6 +11,16 @@ function createPoller({ repo, adobe, processor, config, logger, now = () => new 
   let interval = null;
   let first = null;
 
+  // Tentativa sem resultado (a consulta ou o histórico falhou) também conta para a ordem: senão um acordo que falha sempre
+  // (404/403 permanente) fica no topo e, com maxPerTick deles, os demais nunca são consultados
+  function markAttempt(id) {
+    try {
+      repo.upsert(id, { lastPolledAt: now().toISOString() });
+    } catch (e) {
+      logger.warn(`[poll] ${id}: no se pudo registrar el intento de consulta: ${describeError(e)}`);
+    }
+  }
+
   async function runTick() {
     const summary = { polled: 0, finalized: 0, errors: 0, retried: 0, reopened: 0 };
     const t = now().getTime();
@@ -30,6 +40,7 @@ function createPoller({ repo, adobe, processor, config, logger, now = () => new 
         const ag = await adobe.getAgreement(rec.id);
         summary.polled++;
         const kind = await processor.handleStatus(rec.id, ag.status);
+        if (kind === null) markAttempt(rec.id); // histórico ilegível: nada foi gravado
         if (isFinalKind(kind)) {
           summary.finalized++;
           logger.info(`[poll] ${rec.id}: estado Adobe ${ag.status} -> ${kind}`);
@@ -37,6 +48,7 @@ function createPoller({ repo, adobe, processor, config, logger, now = () => new 
       } catch (e) {
         summary.errors++;
         logger.warn(`[poll] ${rec.id}: ${describeError(e)}`);
+        markAttempt(rec.id);
       }
     }
 

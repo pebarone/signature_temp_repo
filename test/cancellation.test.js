@@ -305,7 +305,7 @@ test('otcs: getTaskForm entrega o valor multivalor (array) do atributo intacto, 
 /* ---------- banco e repositório ---------- */
 
 test('db: banco no schema v3 recebe a migração v4 (cancelamento) preservando os dados', () => {
-  assert.equal(MIGRATIONS.length, 6);
+  assert.equal(MIGRATIONS.length, 7);
   const file = path.join(tmpDir(), 'v3.db');
   const raw = new Database(file);
   for (let i = 0; i < 3; i++) raw.exec(MIGRATIONS[i]);
@@ -319,12 +319,14 @@ test('db: banco no schema v3 recebe a migração v4 (cancelamento) preservando o
   assert.ok(cols.includes('cancel_requested_at') && cols.includes('cancel_source'));
   assert.ok(cols.includes('workflow_stop_pending') && cols.includes('workflow_stopped_at'), 'v5 (caducidad) aplicada em seguida');
   assert.ok(cols.includes('expires_at'), 'v6 (prazo do acordo) aplicada em seguida');
+  assert.ok(cols.includes('cancel_pending_at'), 'v7 (cancelamento em curso) aplicada em seguida');
   assert.ok(db.prepare('PRAGMA index_list(agreements)').all().some((i) => i.name === 'idx_agreements_workflow'));
   const repo = createAgreementRepository(db);
   const old = repo.get('OLD');
   assert.equal(old.nodeId, '1');
   assert.equal(old.cancelRequestedAt, null);
   assert.equal(old.cancelSource, null);
+  assert.equal(old.cancelPendingAt, null);
   assert.deepEqual(repo.upsert('OLD', { cancelRequestedAt: '2026-06-22T12:00:00.000Z', cancelSource: 'admin' })
     .cancelRequestedAt, '2026-06-22T12:00:00.000Z');
   db.close();
@@ -597,6 +599,7 @@ test('erro no cancelamento e a reconsulta também falha => 503 e nada é marcado
   assert.ok(world.logger.has('error', /tampoco se pudo reconsultar el estado en Adobe/));
   let rec = world.repo.get('AG-1');
   assert.deepEqual([rec.state, rec.sendonDone, rec.cancelRequestedAt], ['pending', false, null]);
+  assert.ok(rec.cancelPendingAt, 'incerto: a marca gravada antes do PUT fica');
   assert.notEqual((await world.reconciliation.reconcile('AG-1')).status, 'held', 'o hold foi liberado');
 
   // repetir: o Adobe já está CANCELLED => idempotente, e o acordo é fechado
@@ -604,7 +607,183 @@ test('erro no cancelamento e a reconsulta também falha => 503 e nada é marcado
   const retry = await world.cancellation.cancelWorkflow('3003');
   assert.deepEqual([retry.cancelled, retry.alreadyCancelled, retry.marked], [true, true, true]);
   rec = world.repo.get('AG-1');
-  assert.deepEqual([rec.state, rec.sendonDone], ['cancelled', true]);
+  assert.deepEqual([rec.state, rec.sendonDone, rec.cancelPendingAt], ['cancelled', true, null]);
+  await world.close();
+});
+
+// Reconsulta do PUT ilegível (resposta perdida): o RECALLED confirmado depois é o NOSSO cancelamento (cancel_pending_at)
+const readFailsAfterFirst = (world) => {
+  const realGet = world.adobe.getAgreement;
+  let reads = 0;
+  world.adobe.getAgreement = async (id) => {
+    if (++reads > 1) throw httpError(500, 'adobe down'); // só a consulta inicial funciona
+    return realGet(id);
+  };
+  return () => { world.adobe.getAgreement = realGet; };
+};
+
+test('PUT aplicado com resposta perdida e reconsulta falha: o RECALLED fecha como cancelamento (sem Rechazado) e repetir faz o stop do original', async () => {
+  const world = await stopWorld(['3101']);
+  world.adobe.cancelLostResponses = 1;
+  const restore = readFailsAfterFirst(world);
+
+  const err = await failure(world.cancellation.cancelWorkflow('3101'));
+  assert.deepEqual([err.status, err.body.code], [503, 'ADOBE_UNAVAILABLE']);
+  assert.ok(world.repo.get('AG-3101').cancelPendingAt);
+  restore();
+
+  // o eco do nosso cancelamento chega (webhook) e o Adobe o confirma
+  const echo = recalled(world, 'AG-3101');
+  assert.equal((await echo.processing).status, 'cancelled');
+  assert.deepEqual(world.otcs.dispositionCalls(), []);
+  assert.equal(world.otcs.sendons.length, 0);
+  const rec = world.repo.get('AG-3101');
+  assert.deepEqual(
+    [rec.state, rec.sendonDone, rec.disposition, rec.cancelPendingAt, rec.cancelSource, rec.finalKind],
+    ['cancelled', true, null, null, 'cancel_pending', 'final_recalled']
+  );
+  assert.ok(rec.cancelRequestedAt);
+  assert.deepEqual(world.repo.listEvents('AG-3101').map((e) => e.event), ['CANCEL_REQUESTED', 'AGREEMENT_RECALLED']); // mais recente primeiro
+  assert.ok(world.logger.has('warn', /RECALLED de una cancelación propia sin confirmar/));
+  assert.equal((await world.reconciliation.reconcile('AG-3101')).status, 'done');
+  assert.deepEqual(world.otcs.stopped, [], 'o stop do original ainda não aconteceu');
+
+  // o operador repete: o alvo é CANCELLED (não AGREEMENT_CLOSED), o Adobe é idempotente e o original é parado
+  assert.equal(world.repo.get('AG-3101').cancelSource, 'cancel_pending');
+  const body = await (await authThenCancel(world)).json();
+  const [item] = body.items;
+  assert.deepEqual([item.outcome, item.alreadyCancelled, item.contentStop], ['cancelled', true, 'stopped']);
+  assert.deepEqual(world.otcs.stopped, [3101]);
+  assert.equal(world.adobe.cancelled.length, 1, 'o Adobe não é cancelado de novo');
+  assert.equal(world.repo.get('AG-3101').cancelSource, 'workflow:9001/9001', 'a origem real do pedido substitui cancel_pending (auditoria)');
+  await world.close();
+});
+
+test('timeout do PUT (erro sem resposta HTTP) e a reconsulta lê o acordo em andamento: 503 e a marca FICA (o Adobe pode aplicar depois)', async () => {
+  const world = await buildWorld();
+  open(world, 'AG-1');
+  world.adobe.cancelAgreement = async () => { throw new Error('ETIMEDOUT'); }; // sem e.response: não se sabe se o Adobe recebeu
+
+  const err = await failure(world.cancellation.cancelWorkflow('3003'));
+  assert.deepEqual([err.status, err.body.code], [503, 'ADOBE_UNAVAILABLE']);
+  const rec = world.repo.get('AG-1');
+  assert.deepEqual([rec.state, rec.sendonDone, rec.cancelRequestedAt], ['pending', false, null]);
+  assert.ok(rec.cancelPendingAt, 'sem resposta do Adobe a marca não prova que o PUT não foi aplicado');
+  await world.close();
+});
+
+test('RECALLED durante o hold (PUT aplicado, resposta perdida, reconsulta falha): reconcile devolve held e, depois do 503, a fila fecha como cancelamento', async () => {
+  const world = await buildWorld();
+  open(world, 'AG-1');
+  world.adobe.cancelLostResponses = 1;
+  let during;
+  world.adobe.onCancel = async (id) => { during = await recalled(world, id).processing; }; // o eco chega antes da resposta do PUT
+  const restore = readFailsAfterFirst(world);
+
+  const err = await failure(world.cancellation.cancelWorkflow('3003'));
+  assert.deepEqual([err.status, err.body.code], [503, 'ADOBE_UNAVAILABLE']);
+  assert.equal(during?.status, 'held');
+  assert.deepEqual(world.otcs.dispositionCalls(), []);
+  restore();
+
+  world.clock.advance(60_000);
+  assert.deepEqual(await world.reconciliation.runQueue(), ['AG-1']);
+  assert.deepEqual(world.otcs.dispositionCalls(), []);
+  assert.equal(world.otcs.sendons.length, 0);
+  const rec = world.repo.get('AG-1');
+  assert.deepEqual([rec.state, rec.sendonDone, rec.cancelPendingAt, rec.disposition], ['cancelled', true, null, null]);
+  assert.ok(rec.cancelRequestedAt);
+  await world.close();
+});
+
+test('PUT recusado pelo Adobe (4xx) e a reconsulta lê o acordo em andamento: 503 e a marca sai; um RECALLED externo gera a disposição de recall', async () => {
+  const world = await buildWorld();
+  open(world, 'AG-1');
+  world.adobe.cancelFailures = 1;
+  world.adobe.cancelFailStatus = 409;
+
+  const err = await failure(world.cancellation.cancelWorkflow('3003'));
+  assert.deepEqual([err.status, err.body.code], [503, 'ADOBE_UNAVAILABLE']);
+  assert.equal(world.repo.get('AG-1').cancelPendingAt, null);
+
+  // cancelado por fora no Adobe: não é o nosso cancelamento
+  world.adobe.agreements['AG-1'].status = 'CANCELLED';
+  world.adobe.events['AG-1'] = [{ type: 'RECALLED' }];
+  await recalled(world, 'AG-1').processing;
+  assert.deepEqual(world.otcs.dispositionCalls().map((s) => [s.workflowId, s.disposition]), [[3003, 'Rechazado']]);
+  assert.equal(world.repo.get('AG-1').cancelRequestedAt, null);
+  await world.close();
+});
+
+test('PUT com 5xx (inclusive do proxy) e a reconsulta lê o acordo em andamento: 503 e a marca fica (o PUT pode estar em curso)', async () => {
+  for (const status of [502, 503, 504]) {
+    const world = await buildWorld();
+    open(world, 'AG-1');
+    world.adobe.cancelFailures = 1;
+    world.adobe.cancelFailStatus = status;
+    const err = await failure(world.cancellation.cancelWorkflow('3003'));
+    assert.deepEqual([err.status, err.body.code], [503, 'ADOBE_UNAVAILABLE']);
+    assert.ok(world.repo.get('AG-1').cancelPendingAt, `HTTP ${status}: a marca fica`);
+    await world.close();
+  }
+});
+
+test('queda entre o PUT e o fechamento (marca gravada, Adobe CANCELLED por recall): o RECALLED fecha como cancelamento, sem disposição nem PDF', async () => {
+  const world = await buildWorld();
+  open(world, 'AG-1');
+  world.repo.upsert('AG-1', { cancelPendingAt: '2026-06-22T12:00:00.000Z' });
+  world.adobe.agreements['AG-1'].status = 'CANCELLED';
+  world.adobe.events['AG-1'] = [{ type: 'RECALLED' }];
+
+  const out = await recalled(world, 'AG-1').processing;
+  assert.equal(out.status, 'cancelled');
+  assert.deepEqual(world.otcs.dispositionCalls(), []);
+  assert.equal(world.calls.filter((c) => c[0] === 'adobe.download').length, 0);
+  const rec = world.repo.get('AG-1');
+  assert.deepEqual([rec.state, rec.sendonDone, rec.cancelPendingAt, rec.disposition], ['cancelled', true, null, null]);
+  assert.ok(rec.cancelRequestedAt);
+  const ev = world.repo.listEvents('AG-1').find((e) => e.event === 'CANCEL_REQUESTED');
+  assert.deepEqual([ev.summary.source, ev.summary.recovered, ev.summary.adobeStatus], ['cancel_pending', true, 'CANCELLED']);
+
+  // repetir o cancelamento é idempotente (e não cai em AGREEMENT_CLOSED)
+  const retry = await world.cancellation.cancelWorkflow('3003');
+  assert.deepEqual([retry.cancelled, retry.alreadyCancelled, retry.marked], [true, true, false]);
+  await world.close();
+});
+
+test('com a marca gravada, a RECUSA do signatário continua entregando o Rechazado (a marca só afeta o RECALLED)', async () => {
+  const world = await buildWorld();
+  open(world, 'AG-1', { startSendonDone: true, cancelPendingAt: '2026-06-22T12:00:00.000Z' });
+  rejectedInAdobe(world);
+
+  const r = world.reconciliation.handleEvent(parseWebhookPayload(webhookPayload('AGREEMENT_REJECTED', 'AG-1')));
+  await r.processing;
+  assert.deepEqual(world.otcs.dispositionCalls().map((s) => [s.workflowId, s.disposition]), [[3003, 'Rechazado']]);
+  const rec = world.repo.get('AG-1');
+  assert.deepEqual([rec.finalKind, rec.sendonDone, rec.cancelRequestedAt], ['final_rejected', true, null]);
+  await world.close();
+});
+
+test('recusa entre o GET e o PUT limpa a marca; cancelamento bem-sucedido não deixa marca', async () => {
+  const rejected = await buildWorld();
+  open(rejected, 'AG-1', { startSendonDone: true });
+  rejected.adobe.cancelFailures = 1;
+  const realCancel = rejected.adobe.cancelAgreement;
+  rejected.adobe.cancelAgreement = async (id, o) => {
+    rejectedInAdobe(rejected, id);
+    return realCancel(id, o);
+  };
+  assert.equal((await failure(rejected.cancellation.cancelWorkflow('3003'))).body.code, 'ALREADY_REJECTED');
+  assert.equal(rejected.repo.get('AG-1').cancelPendingAt, null);
+  await rejected.close();
+
+  const world = await buildWorld();
+  open(world, 'AG-1');
+  const out = await world.cancellation.cancelWorkflow('3003');
+  assert.deepEqual([out.cancelled, out.marked], [true, true]);
+  const rec = world.repo.get('AG-1');
+  assert.deepEqual([rec.state, rec.cancelPendingAt], ['cancelled', null]);
+  assert.ok(rec.cancelRequestedAt);
   await world.close();
 });
 

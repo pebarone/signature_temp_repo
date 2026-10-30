@@ -94,10 +94,18 @@ function createCancellationService({
   const inflight = new Set(); // acordos com cancelamento em curso (anti-corrida de dois pedidos iguais)
 
   // Marca o acordo como encerrado por pedido de cancelamento, junto com o evento no histórico (mesma transação).
-  // Repetição (já marcado) ou pipeline que já havia concluído um acordo já cancelado no Adobe: nada a gravar.
+  // Repetição (já marcado) ou pipeline que já havia concluído um acordo já cancelado no Adobe: nada de novo a gravar (só a
+  // marca cancel_pending_at, se sobrou, é limpa: um acordo fechado por nós não fica com cancelamento "em curso").
+  // Se o pipeline já o fechou pela marca (cancelSource 'cancel_pending'), a origem real deste pedido substitui a genérica
+  // (auditoria), no mesmo upsert. No caso normal o patch também limpa a marca, na mesma transação do evento.
   function markClosed(id, { source, comment, adobeStatus, alreadyCancelled }) {
     const current = repo.get(id);
-    if (current.cancelRequestedAt || (alreadyCancelled && current.sendonDone)) return { record: current, marked: false };
+    if (current.cancelRequestedAt || (alreadyCancelled && current.sendonDone)) {
+      const patch = {};
+      if (current.cancelPendingAt) patch.cancelPendingAt = null;
+      if (current.cancelSource === 'cancel_pending') patch.cancelSource = source;
+      return { record: Object.keys(patch).length ? repo.upsert(id, patch) : current, marked: false };
+    }
     const ts = now().toISOString();
     const recorded = repo.recordEvent(id, {
       event: 'CANCEL_REQUESTED',
@@ -106,19 +114,20 @@ function createCancellationService({
       source: 'cancel',
       receivedAt: ts,
       summary: { source, comment, adobeStatus, alreadyCancelled }
-    }, cancelRequestedPatch(current, ts, { source, adobeStatus }));
+    }, { ...cancelRequestedPatch(current, ts, { source, adobeStatus }), cancelPendingAt: null });
     return { record: recorded?.record || repo.get(id), marked: true };
   }
 
-  // Depois de um erro no PUT: o Adobe já aplicou o cancelamento? Devolve o estado lido (CANCELLED/ABORTED) ou null
-  // (outro estado, ou a própria reconsulta falhou). Nunca lança.
+  // Depois de um erro no PUT: o Adobe já aplicou o cancelamento? Devolve { status, readable }: status = estado lido
+  // (CANCELLED/ABORTED) ou null; readable = a reconsulta respondeu (status null + readable = outro estado, o PUT não foi
+  // aplicado; status null + !readable = não há como saber). Nunca lança.
   async function cancelledAfterError(id) {
     try {
       const status = clean((await adobe.getAgreement(id))?.status).toUpperCase();
-      return classifyCancelState(status) === CANCEL_STATES.ALREADY_CANCELLED ? status : null;
+      return { status: classifyCancelState(status) === CANCEL_STATES.ALREADY_CANCELLED ? status : null, readable: true };
     } catch (e) {
       logger.error(`[${id}] cancelación: tampoco se pudo reconsultar el estado en Adobe: ${describeError(e)}`);
-      return null;
+      return { status: null, readable: false };
     }
   }
 
@@ -143,6 +152,9 @@ function createCancellationService({
     afterPutError: o CANCELLED veio da reconsulta depois de um PUT nosso que falhou; o mais provável é que o NOSSO PUT
     tenha sido aplicado (resposta perdida). Devolver 503 reabriria o eco (o RECALLED depois do release do hold geraria
     Rechazado), então, com o histórico ilegível, vale a cancelação própria, salvo recusa já gravada no registro (webhook).
+    Rede de segurança para o que o 503 não cobre (reconsulta do PUT também falha, ou o processo cai entre o PUT e o
+    markClosed): a marca cancel_pending_at, gravada antes do PUT; o RECALLED confirmado depois fecha o acordo como
+    cancelamento nosso (reconciliationService.doReconcile), sem Rechazado.
   */
   async function assertNotRejected(id, status, { afterPutError = false } = {}) {
     if (status !== 'CANCELLED' || repo.get(id)?.cancelRequestedAt) return;
@@ -194,15 +206,31 @@ function createCancellationService({
     if (alreadyCancelled) await assertNotRejected(id, status);
     let adobeStatus = alreadyCancelled ? status : 'CANCELLED';
     if (!alreadyCancelled) {
+      // Marca ANTES do PUT: se a resposta se perder e a reconsulta também falhar (ou o processo cair antes do markClosed), o
+      // RECALLED que o Adobe emitir é o nosso cancelamento e o pipeline o fecha como tal (sem Rechazado). Só vale enquanto
+      // não houver cancel_requested_at; markClosed a limpa.
+      repo.upsert(id, { cancelPendingAt: now().toISOString() });
       try {
         await adobe.cancelAgreement(id, { comment, notifyOthers: !!config.cancel?.notifySigners });
       } catch (e) {
         logger.error(`[${id}] cancelación: Adobe no confirmó la cancelación: ${describeError(e)}`);
         // A resposta pode ter se perdido (timeout, 5xx do proxy) com o Adobe já tendo cancelado: reconsulta antes de desistir.
-        // Sem a confirmação (reconsulta falha ou estado diferente) é transitório: nada é marcado; repetir reconsulta o estado.
-        const confirmed = await cancelledAfterError(id);
-        if (!confirmed) throw adobeUnavailable();
-        await assertNotRejected(id, confirmed, { afterPutError: true }); // o signatário pode ter recusado entre a consulta e o PUT
+        // Sem a confirmação (reconsulta falha ou estado diferente) é transitório: nada é fechado; repetir reconsulta o estado.
+        // Estado lido diferente de cancelado só prova que o PUT não foi aplicado se o Adobe RECUSOU o PUT (4xx); timeout, erro
+        // de rede ou 5xx (inclusive 502/503/504 do proxy) pode ter o PUT ainda em curso no Adobe, então a marca fica.
+        // Reconsulta falha = incerto: a marca fica.
+        const { status: confirmed, readable } = await cancelledAfterError(id);
+        if (!confirmed) {
+          const putStatus = httpStatus(e);
+          if (readable && putStatus >= 400 && putStatus < 500) repo.upsert(id, { cancelPendingAt: null });
+          throw adobeUnavailable();
+        }
+        try {
+          await assertNotRejected(id, confirmed, { afterPutError: true }); // o signatário pode ter recusado entre a consulta e o PUT
+        } catch (rejection) {
+          repo.upsert(id, { cancelPendingAt: null }); // recusa do signatário, não o nosso cancelamento: o pipeline entrega o Rechazado
+          throw rejection;
+        }
         adobeStatus = confirmed;
         logger.warn(
           `[${id}] cancelación: la respuesta de Adobe se perdió, pero Adobe confirma la cancelación (estado ${confirmed}); `
@@ -229,7 +257,9 @@ function createCancellationService({
 
   /*
     Cancela UM acordo conhecido pelo orquestrador. Antes de pedir ao Adobe, consulta o estado:
-      - em andamento: pede o cancelamento (falha do Adobe => 503 e nada é marcado);
+      - em andamento: grava cancel_pending_at e pede o cancelamento (falha do Adobe => 503 e o acordo não é fechado; a marca
+        só é limpa se a reconsulta leu um estado não cancelado depois de um 4xx do PUT, ou uma recusa; ver
+        assertNotRejected; o markClosed também a limpa);
       - já CANCELLED (recall)/ABORTED: idempotente, não chama o cancelamento (e fecha o registro, se ainda aberto);
       - CANCELLED por recusa do signatário (histórico): 409 ALREADY_REJECTED, registro intacto;
       - SIGNED ou outro estado final: 409.

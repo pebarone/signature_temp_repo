@@ -284,7 +284,7 @@ test('adobe.createAgreement: envia externalId { id } só quando informado', asyn
 /* ---------- banco: migração v1 -> v2 ---------- */
 
 test('db: arquivo criado no schema v1 recebe as migrações seguintes (v2, v3) preservando os dados', () => {
-  assert.equal(MIGRATIONS.length, 6); // v4: cancelamento de fluxos (test/cancellation.test.js); v5: caducidad (test/workflow.test.js); v6: expires_at
+  assert.equal(MIGRATIONS.length, 7); // v4: cancelamento de fluxos (test/cancellation.test.js); v5: caducidad (test/workflow.test.js); v6: expires_at; v7: cancel_pending_at
   const file = path.join(tmpDir(), 'v1.db');
 
   // banco "antigo": só a migração 1
