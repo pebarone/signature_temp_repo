@@ -7,9 +7,9 @@
 #    o SQLite em modo WAL exige locks POSIX e memória compartilhada no mesmo host;
 #  - um único pod (Deployment com replicas: 1 e strategy: Recreate).
 #
-# storageClassName: escolha uma classe de bloco da tabela do README (ex.: ocs-storagecluster-ceph-rbd,
-# gp3-csi, managed-csi, thin-csi, standard-csi). Listar com: oc get storageclass
-# Se a linha ficar comentada, o cluster usa a classe marcada como (default): ela também precisa ser de bloco.
+# storageClassName e tamanho são definidos por ambiente: em PROD, STORAGE_CLASS e STORAGE_SIZE de prod/params.env
+# (classe de bloco, ex.: ocs-storagecluster-ceph-rbd, gp3-csi, managed-csi, thin-csi, standard-csi; listar com: oc get storageclass).
+# Sem overlay que defina a classe, o cluster usa a classe marcada como (default), que também precisa ser de bloco.
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -22,4 +22,3 @@ spec:
   resources:
     requests:
       storage: 2Gi
-  # storageClassName: <classe-de-bloco>   # ex.: ocs-storagecluster-ceph-rbd (AWS: gp3-csi); ver README

@@ -1,5 +1,5 @@
-# Route pública do orquestrador (roteador do OpenShift). O host e o TLS mudam por ambiente: ../prod/route-env.yaml e
-# ../qa/kustomization.yaml. O host deve ser o mesmo de PUBLIC_URL.
+# Route pública do orquestrador (roteador do OpenShift). O host e o TLS mudam por ambiente: em PROD, o host vem de
+# PUBLIC_URL (prod/params.env) e o TLS de prod/route-env.yaml; em QA, qa/kustomization.yaml. O host deve ser o mesmo de PUBLIC_URL.
 apiVersion: route.openshift.io/v1
 kind: Route
 metadata:

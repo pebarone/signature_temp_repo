@@ -1,0 +1,2 @@
+# Scripts POSIX precisam de LF (o sh falha com CRLF em clones no Windows com core.autocrlf=true)
+*.sh text eol=lf

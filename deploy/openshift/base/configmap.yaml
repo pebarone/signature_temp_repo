@@ -1,6 +1,7 @@
-# Configuração NÃO sensível do orquestrador, comum a QA e PROD. Segredos ficam no Secret signature-orchestrator-env
-# (ver ../secret.example.yaml). O que muda por ambiente (PUBLIC_URL, OTCS_BASE, Adobe e CORS_ORIGINS) fica em
-# ../prod/configmap-env.yaml e ../qa/configmap-env.yaml. Defaults: server/config/index.js.
+# Configuração NÃO sensível do orquestrador, comum a QA e PROD. Segredos ficam no Secret signature-orchestrator-env:
+# em PROD, prod/secret.env (modelo: prod/secret.env.example); em QA, criado por qa/deploy-local.ps1.
+# O que muda por ambiente (PUBLIC_URL, OTCS_BASE, Adobe, CORS_ORIGINS e CANCEL_*) vem de prod/params.env (PROD)
+# e de qa/configmap-env.yaml (QA). Defaults: server/config/index.js.
 apiVersion: v1
 kind: ConfigMap
 metadata:

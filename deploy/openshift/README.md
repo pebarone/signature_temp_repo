@@ -3,10 +3,11 @@
 Este diretório traz os artefatos para rodar o orquestrador no OpenShift:
 
 - `base/`: `pvc.yaml`, `configmap.yaml`, `deployment.yaml`, `service.yaml` e `route.yaml`, comuns a QA e PROD. Não se aplica sozinho;
-- `prod/`: valores de PROD (`configmap-env.yaml`, `route-env.yaml` e a imagem em `kustomization.yaml`). Aplicar com `oc apply -k deploy/openshift/prod`;
+- `prod/`: valores de PROD. **O único arquivo a editar é `params.env`** (valores não secretos). As credenciais ficam em `secret.env`, criado a partir de `secret.env.example` (ignorado pelo Git). `route-env.yaml` tem só o TLS, e `kustomization.yaml` não se edita. Aplicar com `oc apply -k deploy/openshift/prod`;
+- `check.sh`: confere `prod/params.env` e `prod/secret.env` e renderiza o overlay, antes do apply: `sh deploy/openshift/check.sh`;
 - `qa/`: valores de QA, para o cluster local (kind) publicado pelo ngrok. `qa/deploy-local.ps1` faz build, carga no kind, Secret e apply;
   `start.ps1`, na raiz, sobe o cluster e o ngrok;
-- `secret.example.yaml`: modelo do Secret. **Não** é aplicado por nenhum `kustomization.yaml`;
+- `REQUISITOS.md`: o mesmo assunto em espanhol, para entregar ao time de OpenShift;
 - `Containerfile`: imagem do orquestrador.
 
 O que muda entre os ambientes fica só nas pastas `prod/` e `qa/`: `PUBLIC_URL`, `OTCS_BASE`, Adobe (`ADOBE_API_BASE`,
@@ -21,18 +22,16 @@ Já vem preenchido para PROD (confira, mas não precisa trocar):
 
 | Item | Valor | Onde |
 |---|---|---|
-| Host público | `co-saphcm-ms-md-co-sign-empcontract-prod.apps.osftd4.colsanitas.com`, o host do orquestrador atual, para onde já apontam o webhook do Adobe e o WebReport de envio | `PUBLIC_URL` (`prod/configmap-env.yaml`) e `host` (`prod/route-env.yaml`) |
-| Content Server | `https://otcs.g115.opentext.cloud/cs/cs/api`; CORS para `https://otcs.g115.opentext.cloud` | `prod/configmap-env.yaml` |
-| Adobe Sign | região NA4 (`api.na4` / `secure.na4`); o padrão do código é EU1 | `prod/configmap-env.yaml` |
+| Host público | `co-saphcm-ms-md-co-sign-empcontract-prod.apps.osftd4.colsanitas.com`, o host do orquestrador atual, para onde já apontam o webhook do Adobe e o WebReport de envio | `PUBLIC_URL` em `prod/params.env` (o host da Route sai dele) |
+| Content Server | `https://otcs.g115.opentext.cloud/cs/cs/api`; CORS para `https://otcs.g115.opentext.cloud` | `prod/params.env` |
+| Adobe Sign | região NA4 (`api.na4` / `secure.na4`); o padrão do código é EU1 | `prod/params.env` |
 | Transição dos WebReports | `START_LEGACY_SIGNATURE` e `START_LEGACY_GET_ENABLED` **desligadas** (passo 4 da ordem de rollout de `webreports/README.md` concluído: os WebReports de PROD já estão na v2) | `base/configmap.yaml` |
 | Storage, réplicas e probes | PVC RWO de 2Gi, 1 réplica, `Recreate`, `/health` | `base/pvc.yaml`, `base/deployment.yaml` |
 
-Falta llenar (os valores `<...>` não são válidos como host ou imagem):
+Falta preencher (os valores `<...>` não são válidos como namespace, host ou imagem; `check.sh` aponta cada um):
 
-- [ ] **Secret** `signature-orchestrator-env`: credenciais do Adobe, do OTCS, do Basic Auth e o segredo HMAC (passo 2.2).
-- [ ] **Imagem**: `<registry>/<namespace>` e `<tag>` em `prod/kustomization.yaml` (`images:`), o único lugar da imagem (passo 2.5).
-- [ ] **Namespace**: `oc project <namespace>` antes de aplicar (passo 2.1).
-- [ ] **`storageClassName`** em `base/pvc.yaml`: opcional. Comentado, vale a classe `(default)` do cluster, que também precisa ser de bloco (seção 1.4).
+- [ ] **`prod/params.env`**: `NAMESPACE`, `IMAGE` e `STORAGE_CLASS` (passos 2.1 e 2.5 e seção 1.4). `STORAGE_CLASS` é obrigatória: não há fallback para a classe `(default)` do cluster.
+- [ ] **`prod/secret.env`**: copiado de `prod/secret.env.example`, com as credenciais do Adobe, do OTCS, do Basic Auth e o segredo HMAC (passo 2.2).
 - [ ] **Troca do orquestrador antigo**: Route que hoje tem o host e acordos em andamento no serviço antigo (passo 2.7).
 
 ## Resumo do storage (leia antes do restante)
@@ -100,7 +99,7 @@ oc get storageclass <nome> -o jsonpath='{.allowVolumeExpansion}'
 | `file.csi.azure.com` | evitar (Azure Files, SMB) |
 | `nfs.csi.k8s.io` ou qualquer provisioner NFS | evitar |
 
-Se o `storageClassName` estiver comentado no `pvc.yaml`, vale a classe marcada como `(default)`: confirme que ela aparece como "usar".
+`STORAGE_CLASS` em `prod/params.env` é obrigatória, e não há fallback para a classe marcada como `(default)`: confirme que a classe escolhida aparece como "usar" na tabela acima.
 Depois de aplicar, o PVC deve estar `Bound` com `ACCESS MODES` `RWO`:
 
 ```bash
@@ -109,7 +108,7 @@ oc get pvc signature-orchestrator-data
 
 ### 1.5 Capacidade
 
-O PVC começa com **2Gi**. O que ocupa espaço:
+O PVC começa com **2Gi** (`STORAGE_SIZE` em `prod/params.env`). O que ocupa espaço:
 
 - **Logs**: a parcela que cresce. Há um `audit` e um `error` por dia, mantidos por `LOG_RETENTION_DAYS` dias (15 por padrão). O tamanho depende do volume de eventos e **não foi medido** neste repositório.
 - **SQLite**: metadados e histórico de até 50 eventos por acordo. Cresce com o número de acordos. O arquivo `-wal` cresce entre os checkpoints.
@@ -196,7 +195,7 @@ Guarde o arquivo em local restrito: ele contém dados pessoais.
      restartPolicy: Never
      containers:
        - name: restore
-         image: <registry>/<namespace>/signature-orchestrator:<tag>
+         image: <IMAGE de prod/params.env>
          command: ["sleep", "3600"]
          volumeMounts:
            - name: data
@@ -231,33 +230,49 @@ Para restaurar a partir de um VolumeSnapshot, crie um PVC com `dataSource` apont
 oc new-project <namespace>      # ou: oc project <namespace>, se já existir
 ```
 
+O `<namespace>` deve ser o `NAMESPACE` de `prod/params.env`. Os manifestos já levam o namespace, mas os demais comandos deste README usam o projeto atual (`oc project`).
+
 ### 2.2 Secret
 
-Os valores reais são informados pelo responsável da integração e não ficam neste repositório:
+Os valores reais são informados pelo responsável da integração e não ficam neste repositório. Há duas opções.
+
+**Opção A (padrão): `prod/secret.env`.** O arquivo fica ao lado de `params.env`, é ignorado pelo Git e pelo build da imagem, e o `oc apply -k` gera o Secret a partir dele.
 
 ```bash
-oc create secret generic signature-orchestrator-env \
-  --from-literal=CLIENT_ID='<llenar>' \
-  --from-literal=CLIENT_SECRET='<llenar>' \
-  --from-literal=SIGNATURE_SECRET='<llenar>' \
-  --from-literal=LOG_USER='<llenar>' \
-  --from-literal=LOG_PASS='<llenar>' \
-  --from-literal=OTCS_USER='<llenar>' \
-  --from-literal=OTCS_PASS='<llenar>'
+cp deploy/openshift/prod/secret.env.example deploy/openshift/prod/secret.env
+# preencha os valores (sem aspas: as aspas entram no valor)
 ```
 
-- Para não deixar senhas no histórico do shell, prefira `--from-env-file=<arquivo-fora-do-repo>` (linhas `CHAVE=valor`) e apague o arquivo depois.
+- Chaves: as de `prod/secret.env.example`. Obrigatórias: `CLIENT_ID`, `CLIENT_SECRET`, `SIGNATURE_SECRET`, `LOG_USER`, `LOG_PASS`, `OTCS_USER` e `OTCS_PASS`.
 - `START_AUTH_USER` e `START_AUTH_PASS` são opcionais (as duas ou nenhuma): Basic Auth próprio do `POST /auth`, a credencial
-  embutida no WebReport (ver `webreports/README.md` e o README da pasta de cada WebReport). Sem elas vale `LOG_USER`/`LOG_PASS`. Acrescente-as com `--from-literal`.
-- `ADOBE_REFRESH_TOKEN` é opcional: acrescente `--from-literal=ADOBE_REFRESH_TOKEN='<...>'` somente se for semear o token (ver seção 3).
-- Se o Secret já existir, atualize-o com `oc create secret generic ... --dry-run=client -o yaml | oc apply -f -`.
+  embutida no WebReport (ver `webreports/README.md`). Sem elas vale `LOG_USER`/`LOG_PASS`.
+- `CANCEL_DIRECT_AUTH_USER` e `CANCEL_DIRECT_AUTH_PASS` são opcionais (as duas ou nenhuma): Basic Auth próprio do modo direto do cancelamento. Sem elas vale a credencial do `/auth` (ver `webreports/cancelacion/README.md`).
+- `ADOBE_REFRESH_TOKEN` fica vazio: autorize em `<PUBLIC_URL>/admin/login` (seção 3). Preencha só para semear o token.
+- Trocar um valor: edite o `secret.env` e rode `oc apply -k deploy/openshift/prod`. O Secret ganha outro nome (sufixo com hash) e o Deployment reinicia sozinho.
+- `sh deploy/openshift/check.sh` confere as chaves obrigatórias e se o arquivo está fora do Git. Nunca use `git add` nele.
+
+**Opção B: Secret criado fora do repositório** (Vault, External Secrets ou criação manual). Crie o Secret `signature-orchestrator-env` com as mesmas chaves e remova o bloco `secretGenerator` de `prod/kustomization.yaml`. Com um arquivo local, fora do repositório e apagado depois:
+
+```bash
+oc create secret generic signature-orchestrator-env --from-env-file=<arquivo-fora-do-repo>
+```
+
+Se o Secret já existir, atualize-o com `oc create secret generic ... --dry-run=client -o yaml | oc apply -f -`. Na opção B, a troca de valores não reinicia o pod: rode `oc rollout restart deploy/signature-orchestrator`.
 
 ### 2.3 Ajustar os arquivos antes de aplicar
 
-- `prod/kustomization.yaml`: `images:` com o registry, o namespace e a tag da imagem (ver passo 2.5).
-- `base/pvc.yaml`: `storageClassName`, conforme as seções 1.2 e 1.4 (opcional).
-- Só se o host público mudar: `PUBLIC_URL` (`prod/configmap-env.yaml`) e `host` (`prod/route-env.yaml`) precisam ser o mesmo host
-  (`PUBLIC_URL` = `https://` + host).
+Só dois arquivos são editados: `prod/params.env` (valores não secretos) e `prod/secret.env` (credenciais, seção 2.2). Não edite `prod/kustomization.yaml`, `prod/route-env.yaml` nem `base/`: os valores entram por substituição.
+
+- `NAMESPACE`, `IMAGE` e `STORAGE_CLASS`: troque os placeholders `<...>` (passos 2.1 e 2.5 e seção 1.4).
+- Só se o host público mudar: `PUBLIC_URL`. É a origem (`https://host`, sem caminho e sem barra no fim), e o host da Route sai dela.
+
+Depois de editar, rode a checagem:
+
+```bash
+sh deploy/openshift/check.sh
+```
+
+Ela confere as chaves e os formatos de `params.env` e `secret.env` (sem mostrar valores), renderiza o overlay com `oc kustomize` e, com sessão no `oc`, lê o namespace, a StorageClass e a Route (somente leitura). Sai com código 1 se houver `ERROR`. Sem `ERROR`, mostra o comando de aplicação.
 
 ### 2.4 Aplicar
 
@@ -265,8 +280,8 @@ oc create secret generic signature-orchestrator-env \
 oc apply -k deploy/openshift/prod
 ```
 
-Cria o PVC, o ConfigMap, o Deployment, o Service e a Route. O Secret não entra nessa aplicação.
-**Não use `oc apply -f` nas pastas de `deploy/openshift/`**: ele também aplicaria `secret.example.yaml` e sobrescreveria o Secret real com os placeholders.
+Cria no `NAMESPACE` o PVC, o ConfigMap, o Secret (opção A da seção 2.2), o Deployment, o Service e a Route.
+**Use sempre `oc apply -k`.** `oc apply -f` não passa pelo kustomize: os valores de `params.env` não entram e o Secret de `secret.env` não é gerado.
 
 ### 2.5 Build e envio da imagem
 
@@ -277,14 +292,14 @@ podman build -f deploy/openshift/Containerfile -t <registry>/<namespace>/signatu
 podman push <registry>/<namespace>/signature-orchestrator:<tag>
 ```
 
-Depois, registre a mesma imagem no `prod/kustomization.yaml` (`newName` e `newTag` em `images:`), à mão ou com:
+Depois, grave a mesma referência em `IMAGE` de `prod/params.env`:
 
-```bash
-cd deploy/openshift/prod && kustomize edit set image signature-orchestrator=<registry>/<namespace>/signature-orchestrator:<tag>
+```
+IMAGE=<registry>/<namespace>/signature-orchestrator:<tag>
 ```
 
-Com o registry interno do OpenShift, o push usa a rota externa do registry, e o `newName` do kustomization usa
-`image-registry.openshift-image-registry.svc:5000/<namespace>/signature-orchestrator`. Sugestão de tag: o hash curto do commit
+Com o registry interno do OpenShift, o push usa a rota externa do registry, e o `IMAGE` usa
+`image-registry.openshift-image-registry.svc:5000/<namespace>/signature-orchestrator:<tag>`. Sugestão de tag: o hash curto do commit
 (`git rev-parse --short HEAD`), para saber qual código está no ar.
 
 Use `docker` no lugar de `podman` se preferir. A imagem usa `ubi9/nodejs-22` no build e `ubi9/nodejs-22-minimal` no runtime, ambos com Node 22
@@ -303,12 +318,12 @@ Depois do push, `oc rollout restart deploy/signature-orchestrator` acelera a nov
 ### 2.6 Verificação
 
 ```bash
-oc get pvc signature-orchestrator-data                       # STATUS: Bound; ACCESS MODES: RWO
-oc rollout status deploy/signature-orchestrator
-oc logs deploy/signature-orchestrator | grep -E "SQLite ready|Server started"
-oc logs deploy/signature-orchestrator | grep "\[STORAGE\]"   # não deve retornar nenhuma linha
-oc get route signature-orchestrator                          # HOST/PORT preenchido; sem HostAlreadyClaimed
-curl -s https://co-saphcm-ms-md-co-sign-empcontract-prod.apps.osftd4.colsanitas.com/health   # {"status":"ok"}
+oc get pvc signature-orchestrator-data -n <namespace>                       # STATUS: Bound; ACCESS MODES: RWO
+oc rollout status deploy/signature-orchestrator -n <namespace>
+oc logs deploy/signature-orchestrator -n <namespace> | grep -E "SQLite ready|Server started"
+oc logs deploy/signature-orchestrator -n <namespace> | grep "\[STORAGE\]"   # não deve retornar nenhuma linha
+oc get route signature-orchestrator -n <namespace>                          # HOST/PORT preenchido; sem HostAlreadyClaimed
+curl -s <PUBLIC_URL>/health   # {"status":"ok"}
 ```
 
 Esperado: `SQLite ready: /data/state/orchestrator.db (schema vN)` e `Server started successfully`. Não deve aparecer nenhuma linha com `[STORAGE]`.
@@ -381,15 +396,24 @@ o `externalId` assinado que permite a adoção automática pelo webhook. Sem aç
 - **Janela de indisponibilidade:** `Recreate` derruba o pod atual antes de subir o novo. São poucos segundos (start do Node e readiness).
   Nesse intervalo o orquestrador não responde 2xx ao Adobe. O Adobe reenvia as notificações não confirmadas, e o poller revisa os acordos sem
   resultado final quando o serviço volta. Essa indisponibilidade é aceitável para o fluxo.
-- **Atualizar:** gere uma nova tag, envie a imagem e troque o `newTag` em `prod/kustomization.yaml` (mantendo o repositório
-  sincronizado com o cluster), depois rode `oc apply -k deploy/openshift/prod`. Alternativa sem editar o arquivo:
+- **Atualizar:** gere uma nova tag, envie a imagem e troque `IMAGE` em `prod/params.env` (mantendo o repositório
+  sincronizado com o cluster). Depois rode `sh deploy/openshift/check.sh` e `oc apply -k deploy/openshift/prod`. Alternativa sem editar o arquivo:
   `oc set image deploy/signature-orchestrator signature-orchestrator=<registry>/<namespace>/signature-orchestrator:<nova-tag>`.
-- **Mudou só ConfigMap ou Secret** (por exemplo, ao desligar as flags `START_LEGACY_*`): o pod não relê variáveis sozinho.
-  Rode `oc apply -k deploy/openshift/prod` (ou atualize o Secret) e depois `oc rollout restart deploy/signature-orchestrator`.
+- **Mudou o ConfigMap** (valor não secreto de `params.env`, ou `base/configmap.yaml`; por exemplo, ao desligar as flags `START_LEGACY_*`): o pod não relê variáveis sozinho.
+  Rode `oc apply -k deploy/openshift/prod` e depois `oc rollout restart deploy/signature-orchestrator`.
+- **Mudou o Secret** (`secret.env`, opção A): o `oc apply -k` cria um Secret com outro nome (sufixo com hash), e o Deployment é atualizado e reinicia sozinho. Na opção B, rode `oc rollout restart` depois de atualizar o Secret.
+- **Secrets antigos:** cada mudança em `secret.env` cria um Secret `signature-orchestrator-env-<hash>` novo. Não os apague às cegas: `oc rollout undo` volta para um ReplicaSet anterior, que usa o Secret com o hash dele, e `revisionHistoryLimit: 5` mantém os cinco últimos ReplicaSets. Antes de apagar, liste os Secrets que ainda são referenciados (somente leitura):
+
+  ```bash
+  oc get rs -n <namespace> -l app=signature-orchestrator -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.spec.template.spec.containers[0].envFrom[*].secretRef.name}{"\n"}{end}'
+  oc get secret -n <namespace> -o name | grep 'signature-orchestrator-env-'
+  ```
+
+  Só apague um `signature-orchestrator-env-<hash>` que não aparece na primeira lista. Um Secret criado à mão com o nome `signature-orchestrator-env` (sem hash) não entra nesta limpeza: se o orquestrador anterior estiver no mesmo namespace e usar esse Secret, mantenha-o até desativar esse serviço.
 - **Antes de atualizar**, faça o backup da seção 1.8 se a versão nova acrescentar uma migração de schema. O log de start mostra `schema vN`: compare o número com o da versão anterior.
-- **Rollback:** `oc rollout undo deploy/signature-orchestrator` volta para a réplica anterior (imagem e configuração do pod). Os dados do PVC permanecem.
+- **Rollback:** `oc rollout undo deploy/signature-orchestrator -n <namespace>` volta para a réplica anterior (imagem e configuração do pod). Na opção A, o Secret dessa réplica volta junto, desde que ainda exista (por isso a limpeza acima não apaga o que é referenciado). O ConfigMap não é versionado: o rollback usa o conteúdo atual dele. Os dados do PVC permanecem.
   O rollback **não desfaz migração de banco**. As migrações só são acrescentadas ao final (`PRAGMA user_version`), mas uma imagem antiga sobre
-  um banco já migrado não é garantida. Por isso o backup vem antes. `ConfigMap` e `Secret` também não voltam sozinhos.
+  um banco já migrado não é garantida. Por isso o backup vem antes.
 
 ---
 

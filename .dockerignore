@@ -1,6 +1,8 @@
 # Contexto de build da imagem (deploy/openshift/Containerfile): nada sensível ou local vai para o builder
 .env
 .env.*
+# Secret do deploy de PROD (deploy/openshift/prod/secret.env): nunca entra na imagem
+**/secret.env
 .git
 node_modules
 data

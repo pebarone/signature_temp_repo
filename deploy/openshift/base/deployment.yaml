@@ -1,5 +1,5 @@
 # Deployment do orquestrador. Requisitos de storage em README.md: um pod, PVC RWO, estratégia Recreate.
-# A imagem é definida no kustomization.yaml de cada ambiente (images:), não aqui: aplique com `oc apply -k deploy/openshift/prod`
+# A imagem vem de IMAGE em prod/params.env (QA: images: em qa/kustomization.yaml), não daqui: aplique com `oc apply -k deploy/openshift/prod`
 # (ou `.../qa`).
 apiVersion: apps/v1
 kind: Deployment
@@ -28,7 +28,7 @@ spec:
       automountServiceAccountToken: false
       containers:
         - name: signature-orchestrator
-          # Nome lógico: o kustomization.yaml (images:) troca pelo registry/tag reais
+          # Nome lógico: IMAGE (prod/params.env) ou images: (qa/kustomization.yaml) troca pelo registry/tag reais
           image: signature-orchestrator
           command: ["node", "server/index.js"]
           ports:
@@ -46,7 +46,8 @@ spec:
             - name: PORT
               value: "3000"
           envFrom:
-            # Segredos: criados no cluster, fora do repositório (ver README, passo 2.2)
+            # Segredos: em PROD, gerados de prod/secret.env pelo secretGenerator (nome com sufixo hash); no QA, criados pelo
+            # qa/deploy-local.ps1. Ver README, passo 2.2
             - secretRef:
                 name: signature-orchestrator-env
             # Variáveis não sensíveis (ver configmap.yaml)

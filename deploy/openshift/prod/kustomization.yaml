@@ -1,16 +1,241 @@
 # PROD: oc apply -k deploy/openshift/prod
-# O Secret NÃO entra aqui: é criado separadamente com oc create secret (ver README, passo 2.2).
+# Não edite este arquivo para um deploy. Os valores vêm de params.env (não secretos) e de secret.env (credenciais),
+# que são os dois arquivos desta pasta a editar (README, seção 2). Eles entram por substituição (replacements), abaixo.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
   - ../base
 patches:
-  - path: configmap-env.yaml
+  # TLS da Route de PROD. O host não fica aqui: vem de PUBLIC_URL, em params.env
   - path: route-env.yaml
-# Único lugar da imagem (ver README, passo 2.5). Registry interno do OpenShift:
-#   image-registry.openshift-image-registry.svc:5000/<namespace>/signature-orchestrator
-# Para trocar sem editar: cd deploy/openshift/prod && kustomize edit set image signature-orchestrator=<registry>/<namespace>/signature-orchestrator:<tag>
-images:
-  - name: signature-orchestrator
-    newName: <registry>/<namespace>/signature-orchestrator
-    newTag: <tag>
+  # As chaves CANCEL_* são declaradas como texto, entre aspas. A substituição de params.env (abaixo) mantém o tipo
+  # quando a chave já existe: sem isso, "false" sairia como booleano no ConfigMap, e o cluster rejeita o objeto.
+  - patch: |-
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: signature-orchestrator-config
+      data:
+        CANCEL_ENABLED: "false"
+        CANCEL_DIRECT_ENABLED: "false"
+# params.env: valores de PROD. O ConfigMap deploy-params é só a fonte das substituições. Com local-config, o kustomize
+# não o inclui na saída, e ele não é criado no cluster. disableNameSuffixHash mantém o nome fixo, sem hash.
+configMapGenerator:
+  - name: deploy-params
+    envs:
+      - params.env
+    options:
+      disableNameSuffixHash: true
+      annotations:
+        config.kubernetes.io/local-config: "true"
+# secret.env: credenciais de PROD. Gera o Secret signature-orchestrator-env-<hash>, que o Deployment referencia.
+# Opção B (Secret criado fora do repositório, README, passo 2.2): remova este bloco inteiro.
+secretGenerator:
+  - name: signature-orchestrator-env
+    envs:
+      - secret.env
+    options:
+      labels:
+        app: signature-orchestrator
+# Substituições: cada chave de params.env vai para o campo indicado. create: true cria o campo quando ele não existe na base.
+replacements:
+  # NAMESPACE -> metadata.namespace de cada recurso do ambiente
+  - source:
+      kind: ConfigMap
+      name: deploy-params
+      fieldPath: data.NAMESPACE
+    targets:
+      - select:
+          kind: PersistentVolumeClaim
+          name: signature-orchestrator-data
+        fieldPaths:
+          - metadata.namespace
+        options:
+          create: true
+      - select:
+          kind: ConfigMap
+          name: signature-orchestrator-config
+        fieldPaths:
+          - metadata.namespace
+        options:
+          create: true
+      - select:
+          kind: Secret
+        fieldPaths:
+          - metadata.namespace
+        options:
+          create: true
+      - select:
+          kind: Deployment
+          name: signature-orchestrator
+        fieldPaths:
+          - metadata.namespace
+        options:
+          create: true
+      - select:
+          kind: Service
+          name: signature-orchestrator
+        fieldPaths:
+          - metadata.namespace
+        options:
+          create: true
+      - select:
+          kind: Route
+          name: signature-orchestrator
+        fieldPaths:
+          - metadata.namespace
+        options:
+          create: true
+
+  # PUBLIC_URL -> data.PUBLIC_URL do ConfigMap (usado pelo orquestrador: redirect OAuth e webhook)
+  - source:
+      kind: ConfigMap
+      name: deploy-params
+      fieldPath: data.PUBLIC_URL
+    targets:
+      - select:
+          kind: ConfigMap
+          name: signature-orchestrator-config
+        fieldPaths:
+          - data.PUBLIC_URL
+        options:
+          create: true
+
+  # PUBLIC_URL -> host da Route. Com delimiter "/" e index 2, "https://host" vira "host"
+  - source:
+      kind: ConfigMap
+      name: deploy-params
+      fieldPath: data.PUBLIC_URL
+      options:
+        delimiter: "/"
+        index: 2
+    targets:
+      - select:
+          kind: Route
+          name: signature-orchestrator
+        fieldPaths:
+          - spec.host
+        options:
+          create: true
+
+  # IMAGE -> imagem do contêiner do Deployment
+  - source:
+      kind: ConfigMap
+      name: deploy-params
+      fieldPath: data.IMAGE
+    targets:
+      - select:
+          kind: Deployment
+          name: signature-orchestrator
+        fieldPaths:
+          - spec.template.spec.containers.[name=signature-orchestrator].image
+
+  # STORAGE_CLASS -> classe do PVC (de bloco RWO; não existe fallback para a classe default)
+  - source:
+      kind: ConfigMap
+      name: deploy-params
+      fieldPath: data.STORAGE_CLASS
+    targets:
+      - select:
+          kind: PersistentVolumeClaim
+          name: signature-orchestrator-data
+        fieldPaths:
+          - spec.storageClassName
+        options:
+          create: true
+
+  # STORAGE_SIZE -> tamanho do PVC
+  - source:
+      kind: ConfigMap
+      name: deploy-params
+      fieldPath: data.STORAGE_SIZE
+    targets:
+      - select:
+          kind: PersistentVolumeClaim
+          name: signature-orchestrator-data
+        fieldPaths:
+          - spec.resources.requests.storage
+
+  # OTCS_BASE -> data.OTCS_BASE do ConfigMap
+  - source:
+      kind: ConfigMap
+      name: deploy-params
+      fieldPath: data.OTCS_BASE
+    targets:
+      - select:
+          kind: ConfigMap
+          name: signature-orchestrator-config
+        fieldPaths:
+          - data.OTCS_BASE
+        options:
+          create: true
+
+  # ADOBE_API_BASE -> data.ADOBE_API_BASE do ConfigMap
+  - source:
+      kind: ConfigMap
+      name: deploy-params
+      fieldPath: data.ADOBE_API_BASE
+    targets:
+      - select:
+          kind: ConfigMap
+          name: signature-orchestrator-config
+        fieldPaths:
+          - data.ADOBE_API_BASE
+        options:
+          create: true
+
+  # ADOBE_AUTH_BASE -> data.ADOBE_AUTH_BASE do ConfigMap
+  - source:
+      kind: ConfigMap
+      name: deploy-params
+      fieldPath: data.ADOBE_AUTH_BASE
+    targets:
+      - select:
+          kind: ConfigMap
+          name: signature-orchestrator-config
+        fieldPaths:
+          - data.ADOBE_AUTH_BASE
+        options:
+          create: true
+
+  # CORS_ORIGINS -> data.CORS_ORIGINS do ConfigMap
+  - source:
+      kind: ConfigMap
+      name: deploy-params
+      fieldPath: data.CORS_ORIGINS
+    targets:
+      - select:
+          kind: ConfigMap
+          name: signature-orchestrator-config
+        fieldPaths:
+          - data.CORS_ORIGINS
+        options:
+          create: true
+
+  # CANCEL_ENABLED -> data.CANCEL_ENABLED do ConfigMap ("false" é o padrão do código)
+  - source:
+      kind: ConfigMap
+      name: deploy-params
+      fieldPath: data.CANCEL_ENABLED
+    targets:
+      - select:
+          kind: ConfigMap
+          name: signature-orchestrator-config
+        fieldPaths:
+          - data.CANCEL_ENABLED
+        options:
+          create: true
+
+  # CANCEL_DIRECT_ENABLED -> data.CANCEL_DIRECT_ENABLED do ConfigMap ("false" é o padrão do código)
+  - source:
+      kind: ConfigMap
+      name: deploy-params
+      fieldPath: data.CANCEL_DIRECT_ENABLED
+    targets:
+      - select:
+          kind: ConfigMap
+          name: signature-orchestrator-config
+        fieldPaths:
+          - data.CANCEL_DIRECT_ENABLED
+        options:
+          create: true

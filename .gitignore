@@ -3,6 +3,8 @@ node_modules/
 
 # arquivos sensíveis
 .env
+# Secret do deploy de PROD (ver deploy/openshift/README.md, seção 2.2)
+secret.env
 tokens.json
 server/serverModules/agreements.json
 
