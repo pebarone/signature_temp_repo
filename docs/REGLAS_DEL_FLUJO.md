@@ -156,6 +156,17 @@ enquanto presente sem `cancel_requested_at`, um RECALLED confirmado é o nosso c
   Adobe. O `/start` registra o ID no log (`info`, com workflow/subprocesso/nó) **antes** de gravar; se a gravação falhar, loga um
   `error` em espanhol com o ID ("El acuerdo <id> se creó en Adobe pero no se pudo registrar ... Adóptelo con POST /admin/adopt/<id>")
   e responde o 500 genérico. Recuperação: `POST /admin/adopt/:id`.
+- **Resposta perdida do `createAgreement` (04/11/2026).** Uma chamada que dá timeout pode ter criado o acordo no Adobe. Antes de
+  criar (só com a validação do workflow e dentro da trava), o `/start` procura no Adobe um acordo com o mesmo `externalId`
+  (`GET /agreements?externalId=`; filtro exato, validado no QA em 04/11).
+  - Candidatos: os 3 mais recentes que não estão no banco. Vale o primeiro com `externalId` idêntico no `GET /agreements/{id}`,
+    estado em andamento e o mesmo conjunto de e-mails.
+  - Achado: o acordo é registrado (`adopted=true`) em vez de criar outro. O PDF não é baixado de novo, e a resposta é a de uma
+    criação normal.
+  - Falha transitória da busca (rede, timeout, 5xx, 408/429): 503 "Adobe Sign no disponible", e nada é criado; a página repete.
+  - Falha permanente (outro 4xx): cria normalmente, para um problema de configuração não travar todos os envios.
+  - **Risco residual:** se a lista do Adobe demorar a mostrar um acordo recém-criado, a repetição imediata não o vê e cria outro.
+    Não foi medido.
 - Repetir o `/start` (`existing: true`) com a etapa start ainda pendente retoma a reconciliação do acordo na hora
   (`resumeStart`: ignora o backoff e reabre um `needs_attention` `retries_exhausted`), então o SendOn sai logo após o
   REASSIGN da página. A reconciliação é serializada por acordo; repetir é seguro.
@@ -347,17 +358,32 @@ checagem do remetente/conta no Adobe fecharia isso).
 - **Webhook de acordo desconhecido** (banco efêmero perdido, deploy novo) com `ADOPT_UNKNOWN_AGREEMENTS=true`: consulta o
   Adobe, faz o parse do `externalId`; se for nosso **e tiver o `sig` válido** cria o registro (`adopted=true`,
   `start_sendon_done=false`, `fileName` = nome do acordo sem o prefixo `Documento `, `expires_at` = `expirationTime`
-  do Adobe, quando presente) e reaplica o evento; senão log warn. O webhook **espera a adoção por até 8 s** e responde
-  conforme o resultado:
+  do Adobe, quando presente) e reaplica o evento; senão log warn. O webhook **espera a adoção por até 3 s** e responde
+  conforme o resultado. O limite vem do Adobe: ele dá **5 s** para a resposta e entrega as notificações do webhook de
+  conta **uma de cada vez**, então uma resposta lenta segura a fila inteira de entregas (o defeito do integrador antigo,
+  que só respondia depois do PDF e do SendOn). Fora da adoção, o webhook responde na hora:
   - acordo conhecido: 200 na hora (sem espera);
   - recusa (sem `externalId` nosso, sem `sig` válido, fluxo já registrado, 4xx do Adobe): 200, como antes;
     o evento não é gravado. Se o **payload do webhook já traz o `externalId`** (`agreement.externalId`, quando o Adobe o inclui) e ele
     não é nosso (formato inválido ou `sig` que não confere), a recusa é imediata, sem consultar o Adobe: um Adobe fora do ar (ex.:
     `REFRESH_TOKEN_MISSING`) não gera 503 para um acordo que não é nosso;
-  - falha transitória ao ler o acordo no Adobe (rede, 5xx, 401/408/429) ou demora acima de 8 s: **503**, para o
+  - falha transitória ao ler o acordo no Adobe (rede, 5xx, 401/408/429) ou demora acima de 3 s: **503**, para o
     Adobe reenviar. Nada foi persistido; se a adoção terminar em segundo plano, o reenvio é deduplicado por
     `notificationId`;
   - erro ao persistir o evento: 500.
+
+  **Corte para produção:** os acordos em curso do integrador antigo não estão no SQLite novo e não têm o `sig` no
+  `externalId`. Sem importação, cada evento deles cai na adoção: consulta o Adobe (até 3 s, com o Adobe lento; a recusa fica
+  lembrada por 10 min), é recusado e o evento se perde (200 sem gravar). Por isso, **antes de virar o tráfego**, importe o `agreements.json` do
+  pod antigo com `server/infra/legacyImport.js` (copiado para `<DATA_DIR>/state/agreements.json`, é importado no start;
+  passo a passo em `deploy/openshift/README.md`, "Acordos em andamento no orquestrador antigo"). Acordos importados são
+  conhecidos: o webhook responde 200 na hora e o polling também os acompanha.
+
+  *Alternativa avaliada e não adotada:* responder 200 sempre e adotar em segundo plano. Exigiria gravar o evento cru de
+  acordo desconhecido numa tabela própria e um worker para retentar a adoção, porque o polling só percorre acordos já
+  registrados e não acharia esses eventos. Hoje o reenvio do Adobe após o 503 faz esse papel sem estado novo. Vale
+  rever se o log de produção mostrar 503 frequentes de adoção, porque o Adobe também segura a fila enquanto retenta
+  uma notificação que falhou.
   A fila confirma a etapa start no OTCS: envia apenas se a tarefa de início ainda estiver ativa; se já
   avançou, só marca como concluída. Isso recupera também um restart entre criar o acordo e enviar o início, mesmo com
   `POLL_ENABLED=false`. Acordos de outras integrações da mesma conta são lembrados por 10 min (sem nova consulta por evento).
@@ -404,7 +430,9 @@ incluídos nos formulários dessas tarefas:
 | `START_FIELD_DUE_DATE` | `DUE_DATE` | rótulo do atributo oculto com o prazo em dias (1 a 365) enviado ao Adobe como `expirationTime`; vazio desliga (seção 4.5) |
 | `POLL_MAX_AGE_DAYS` | `90` | idade (desde a criação) além da qual o polling deixa de consultar um acordo sem resultado final; com `expires_at`, só depois de `expires_at` + 1 dia (seção 4.5) |
 | `ATTENTION_RETRY_HOURS` | `6` | reabertura automática de `retries_exhausted` (0 desliga) |
-| `ADOPT_UNKNOWN_AGREEMENTS` | `true` | adoção de acordo desconhecido pelo `externalId` assinado; o webhook espera até 8 s e responde 503 na falha transitória (seção 7) |
+| `ATTENTION_MAX_REOPENS` | `3` | máximo de reaberturas automáticas por acordo; depois fica em `needs_attention` até o `/admin/reconcile` manual (0 = sem limite) |
+| `RECONCILE_CONCURRENCY` | `4` | pipelines simultâneos (acordos diferentes) contra o OTCS e o Adobe; um 429/503 com `Retry-After` adia o retry por esse tempo, até 60 min |
+| `ADOPT_UNKNOWN_AGREEMENTS` | `true` | adoção de acordo desconhecido pelo `externalId` assinado; o webhook espera até 3 s (o Adobe dá 5 s) e responde 503 na falha transitória (seção 7) |
 | `WEBHOOK_CLIENT_IDS` | vazio | ClientIds extras aceitos no webhook além do `CLIENT_ID` |
 | `WF_ATTRIBUTES_ENABLED` | `false` | grava dados do Adobe nos atributos do workflow |
 | `WF_ATTR_AGREEMENT_ID`, `WF_ATTR_STATUS`, `WF_ATTR_LAST_EVENT`, `WF_ATTR_UPDATED_AT`, `WF_ATTR_INTEGRATION_STATE` | ver seção 8 | rótulos dos atributos (vazio desliga) |

@@ -13,6 +13,8 @@ data:
   ADOBE_AUTH_BASE: "https://secure.na4.adobesign.com"
   # Origens com CORS em /auth e /start: a do OTCS de QA
   CORS_ORIGINS: "https://otcs.g115-test.opentext.cloud"
+  # ClientId do app que criou o webhook na UI do Adobe (vem no X-AdobeSign-ClientId; não é segredo)
+  WEBHOOK_CLIENT_IDS: "UB7E5BXCXY"
   # Cancelamento: /cancel e /cancel/preview (WebReport na tarefa) e o modo direto /cancel/direct* (WebReport sozinho).
   # O modo direto usa a mesma credencial Basic do /auth (LOG_*/START_AUTH_*, no Secret), a menos que CANCEL_DIRECT_AUTH_USER/PASS estejam definidos.
   CANCEL_ENABLED: "true"

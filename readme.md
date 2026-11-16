@@ -149,7 +149,9 @@ LOG_RETENTION_DAYS=15                 # 0 disables the purge
 OTCS_TIMEOUT_MS=60000
 ADOBE_TIMEOUT_MS=60000                # timeout of every Adobe call (REST and OAuth token refresh/exchange)
 WEBHOOK_REQUIRE_CLIENT_ID=false       # true => POST /webhook without X-AdobeSign-ClientId in {CLIENT_ID} + WEBHOOK_CLIENT_IDS gets 401
-KEEPALIVE_INTERVAL_MS=600000          # self-ping of /health, only on Render (RENDER=true) with PUBLIC_URL (0 disables)
+RENDER=false                          # feature flag: true = Render deploy, false/unset = OpenShift (default)
+RENDER_DATA_DIR=                      # Render only: data dir (e.g. a Render disk); empty = /tmp (ephemeral)
+KEEPALIVE_INTERVAL_MS=600000          # self-ping of /health, only with RENDER=true, to PUBLIC_URL or RENDER_EXTERNAL_URL (0 disables, max 14 min)
 PORT=3000
 ```
 
@@ -158,8 +160,9 @@ PORT=3000
 `state/orchestrator.db` (SQLite: agreement -> workflow map, state, event history), `state/tokens.json` and `logs/`
 live under one data directory, chosen in this order:
 
+0. With `RENDER=true`: `RENDER_DATA_DIR` or `/tmp/signature-orchestrator`; `DATA_DIR` and `REQUIRE_PERSISTENT_STORAGE` are ignored.
 1. `DATA_DIR` when set (OpenShift: mount a PVC and point `DATA_DIR` to it).
-2. Render (`RENDER=true`) or `NODE_ENV=production` without `DATA_DIR`: `/tmp/signature-orchestrator` (**ephemeral**, accepted in QA).
+2. `NODE_ENV=production` without `DATA_DIR`: `/tmp/signature-orchestrator` (**ephemeral**, accepted in QA).
 3. Otherwise `./data` in the project root (git-ignored).
 
 Kubernetes/OpenShift (`KUBERNETES_SERVICE_HOST`) without `DATA_DIR` logs an error at startup;

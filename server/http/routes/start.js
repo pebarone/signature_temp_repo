@@ -4,7 +4,7 @@
 const express = require('express');
 const { sign, signStart, newNonce } = require('../middleware/hmac');
 const { ServiceError, START_ERROR_MESSAGE } = require('../../services/signatureService');
-const { oneLine, describeError } = require('../../infra/util');
+const { oneLine, describeError, maskEmail } = require('../../infra/util');
 
 function startRoutes({ config, logger, signatureService, startBasicAuth, verifySignature, now = () => Date.now() }) {
   const router = express.Router();
@@ -19,7 +19,7 @@ function startRoutes({ config, logger, signatureService, startBasicAuth, verifyS
       `  → Document: ${oneLine(doc)}\n` +
       `  → Node ID: ${oneLine(nodeId)}\n` +
       `  → Target Folder ID: ${oneLine(attachId)}\n` +
-      `  → Recipients: ${oneLine([userEmail1, userEmail2].filter(Boolean).join(', '))}`
+      `  → Recipients: ${oneLine([userEmail1, userEmail2].filter(Boolean).map((e) => maskEmail(e)).join(', '))}`
     );
   }
 

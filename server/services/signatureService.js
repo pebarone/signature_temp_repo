@@ -1,12 +1,13 @@
 // services/signatureService.js
 // Caso de uso do POST /start: valida o pedido contra o workflow do OTCS, baixa o PDF (e confere que é um PDF), cria o acordo
 // no Adobe e registra o mapeamento.
-const { describeError } = require('../infra/util');
+const { describeError, maskEmail } = require('../infra/util');
 const { buildExternalId } = require('../domain/externalId');
 const { locate, normalizeName } = require('../domain/workflowSteps');
 const { isPdf, sniffType, TYPE_LABELS } = require('../domain/documentType');
-const { finalNotice } = require('../domain/agreementState');
+const { finalNotice, isPermanentHttpError } = require('../domain/agreementState');
 const { parseDueDays, expirationFrom } = require('../domain/dueDate');
+const { KINDS, classifyAgreementStatus } = require('../domain/eventPolicy');
 
 class ServiceError extends Error {
   constructor(status, body) {
@@ -47,6 +48,9 @@ const attachIdMissingError = () =>
 const flowNotFound = () => new ServiceError(409, { error: 'Flujo no encontrado.' });
 const otcsUnavailable = () =>
   new ServiceError(503, { error: 'Content Server no disponible; intente nuevamente.' });
+// Adobe lento/fora do ar na busca do acordo órfão: sem `code`, a página trata como ambíguo e repete o /start
+const adobeUnavailable = () =>
+  new ServiceError(503, { error: 'Adobe Sign no disponible; intente nuevamente.' });
 // Adobe sem sessão (tokens ausentes ou refresh falhou): o administrador precisa entrar em /admin/login
 const loginRequiredError = () => new ServiceError(401, { error: 'LOGIN_REQUIRED' });
 
@@ -63,8 +67,27 @@ const dedupeEmails = (emails) => {
   });
 };
 const emailKey = (emails) => [...new Set(emails.map((e) => e.toLowerCase()))].sort().join(',');
+// Mesma forma de emailKey, com cada e-mail mascarado (só para log: o valor gravado e o comparado não mudam)
+const emailKeyForLog = (emails) => emailKey(emails).split(',').filter(Boolean).map((e) => maskEmail(e)).join(',');
+// E-mails dos participantes de um acordo do Adobe (GET /agreements/{id}), sem repetição
+const agreementEmails = (ag) => [...new Set(
+  (Array.isArray(ag?.participantSetsInfo) ? ag.participantSetsInfo : [])
+    .flatMap((set) => (Array.isArray(set?.memberInfos) ? set.memberInfos : []))
+    .map((m) => m?.email)
+    .filter(Boolean)
+)];
+// Quantos acordos do mesmo externalId (os mais recentes) são lidos ao procurar um acordo órfão
+const ORPHAN_MAX_CANDIDATES = 3;
+// ISO válido de um campo de data do Adobe, ou null
+const isoOrNull = (v) => {
+  const ms = Date.parse(v || '');
+  return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
+};
 const clean = (v) => (v === undefined || v === null ? '' : String(v).trim());
 const httpStatus = (e) => e?.response?.status;
+// Sessão do Adobe perdida de vez: sem refresh token (REFRESH_TOKEN_MISSING) ou o endpoint de token recusou o refresh (400/401,
+// p.ex. invalid_grant). Qualquer outra falha do login (rede, timeout, 5xx, 429) é transitória: 503, sem pedir novo login.
+const adobeSessionLost = (e) => e?.message === 'REFRESH_TOKEN_MISSING' || [400, 401].includes(httpStatus(e));
 
 // Valor de um atributo do formulário pelo rótulo (exato; senão ignorando acentos/caixa)
 function fieldValue(fields, label) {
@@ -175,6 +198,10 @@ function createSignatureService({ repo, adobe, otcs, logger, config, now = () =>
     try {
       await adobe.checkAuth();
     } catch (e) {
+      if (!adobeSessionLost(e)) {
+        logger.warn(`[START] Workflow ${handoff.workflowId}/${handoff.subworkflowId}: Adobe Sign no respondió al renovar la sesión; no se pide la reasignación: ${describeError(e)}`);
+        throw adobeUnavailable();
+      }
       logger.warn(`[START] Workflow ${handoff.workflowId}/${handoff.subworkflowId}: Adobe sin sesión; no se pide la reasignación: ${describeError(e)}`);
       throw loginRequiredError();
     }
@@ -354,7 +381,7 @@ function createSignatureService({ repo, adobe, otcs, logger, config, now = () =>
     }
     const payloadEmails = parseEmails(input.userEmail1, input.userEmail2);
     if (payloadEmails.length && emailKey(payloadEmails) !== emailKey(emails)) {
-      diffs.push(`emails payload=[${emailKey(payloadEmails)}] otcs=[${emailKey(emails)}]`);
+      diffs.push(`emails payload=[${emailKeyForLog(payloadEmails)}] otcs=[${emailKeyForLog(emails)}]`);
     }
     if (diffs.length) {
       logger.warn(`[START] Workflow ${workflowId}: los datos enviados no coinciden con el flujo (${diffs.join('; ')})`);
@@ -398,6 +425,68 @@ function createSignatureService({ repo, adobe, otcs, logger, config, now = () =>
   }
 
   /*
+    Procura no Adobe um acordo "órfão" deste fluxo: criado por um /start anterior cuja resposta se perdeu (timeout), então
+    nunca chegou ao repositório. O externalId é determinístico (HMAC do workflow + subprocesso + documento + pasta), e o filtro
+    GET /agreements?externalId= devolve só os que batem exatamente. Reaproveita o primeiro que, lido do Adobe, (a) tem o
+    externalId idêntico (protege contra um filtro ignorado), (b) está em andamento (final ou desconhecido nunca é reaproveitado)
+    e (c) tem os mesmos e-mails (sem ordem nem caixa). Ignora os que o repositório já conhece. Devolve o acordo do Adobe
+    ({ id, ... }) ou null.
+    Falha da busca (lista ou leitura de um candidato): TRANSITÓRIA (rede, timeout, 5xx, 401/408/429; a mesma classificação da
+    reconciliação) => 503 sem criar nada, porque o Adobe lento é justamente quando a resposta anterior se perdeu e criar outro
+    duplicaria o acordo; PERMANENTE (outros 4xx, ex.: 403 sem escopo) => aviso e segue sem órfão (candidato 404: só é pulado),
+    para um problema de configuração nunca travar todos os envios.
+  */
+  async function findOrphanAgreement(externalId, emails, label) {
+    // Transitório = falha de rede/HTTP que pode ter escondido o acordo (sem resposta com `code` do axios/Node, ou 5xx/401/408/429).
+    // Outro erro (4xx permanente ou bug local, ex. TypeError) não bloqueia todos os envios: segue sem acordo prévio.
+    const transient = (e) => (e?.response ? !isPermanentHttpError(e) : Boolean(e?.isAxiosError || e?.request || typeof e?.code === 'string'));
+    const failed = (e, what) => {
+      if (!transient(e)) {
+        logger.warn(`[START] Workflow ${label}: no se pudo ${what} (${describeError(e)}); se continúa sin acuerdo previo`);
+        return;
+      }
+      logger.warn(
+        `[START] Workflow ${label}: no se pudo ${what} (${describeError(e)}); `
+        + 'no se crea ningún acuerdo para no duplicar el envío, se reintenta'
+      );
+      throw adobeUnavailable();
+    };
+
+    let listed;
+    try {
+      listed = await adobe.findAgreementsByExternalId(externalId);
+    } catch (e) {
+      failed(e, 'buscar en Adobe un acuerdo previo de este flujo');
+      return null;
+    }
+    listed = (Array.isArray(listed) ? listed : [])
+      .filter((item) => item?.id && !repo.has(String(item.id)))
+      .sort((a, b) => (Date.parse(b.displayDate || '') || 0) - (Date.parse(a.displayDate || '') || 0))
+      .slice(0, ORPHAN_MAX_CANDIDATES);
+
+    for (const item of listed) {
+      let ag;
+      try {
+        ag = await adobe.getAgreement(item.id);
+      } catch (e) {
+        failed(e, `leer en Adobe el acuerdo previo ${item.id} de este flujo`); // transitório lança; permanente: pula o candidato
+        continue;
+      }
+      if (ag?.externalId?.id !== externalId) continue;
+      if (classifyAgreementStatus(ag.status) !== KINDS.PROGRESS) {
+        logger.info(`[START] Workflow ${label}: el acuerdo ${item.id} del mismo flujo está en estado ${ag.status} (no vigente); no se reutiliza`);
+        continue;
+      }
+      if (emailKey(agreementEmails(ag)) !== emailKey(emails)) {
+        logger.warn(`[START] Workflow ${label}: el acuerdo ${item.id} del mismo flujo tiene otros destinatarios [${emailKeyForLog(agreementEmails(ag))}] (se esperaba [${emailKeyForLog(emails)}]); no se reutiliza`);
+        continue;
+      }
+      return { ...ag, id: item.id };
+    }
+    return null;
+  }
+
+  /*
     options.forceVerify: valida contra o OTCS mesmo com START_VERIFY_WORKFLOW=false (autenticação legada que não
     vincula o payload: assinatura v1 e GET /start).
     Devolve { id, sendOn, handoff? } ou, se este fluxo já tem acordo do documento (mesmo workflow + subprocesso + documento,
@@ -415,6 +504,10 @@ function createSignatureService({ repo, adobe, otcs, logger, config, now = () =>
     Ordem: o acordo existe antes da reatribuição e do SendOn (a página só reatribui com acordo gerado).
     NOT_PDF (422): o documento baixado não é um PDF; nada é criado no Adobe. DUPLICATE_OPEN (409): o mesmo documento e
     destinatários já têm um acordo ABERTO, criado há menos de 15 min, em OUTRO fluxo (final ou concluído nunca bloqueia).
+    Idempotência contra o Adobe: se uma tentativa anterior criou o acordo mas perdeu a resposta (timeout), ele não está no repo;
+    antes de criar, procura-se pelo externalId (só com a validação do OTCS e workflowId) um acordo em andamento, desconhecido
+    do repo e com os mesmos e-mails, e ele é registrado no lugar de criar outro (o PDF não é baixado de novo nesse caminho).
+    Falha TRANSITÓRIA da busca (rede, timeout, 5xx) => 503 sem criar nada; PERMANENTE (ex.: 403) => cria normal.
   */
   async function start(input, { forceVerify = false } = {}) {
     input = input || {};
@@ -425,6 +518,7 @@ function createSignatureService({ repo, adobe, otcs, logger, config, now = () =>
     // Prazo em dias. Só START_VERIFY_WORKFLOW=false não lê nada do OTCS e deixa o acordo sem expiração; o caminho legado
     // (GET /start e assinatura v1, forceVerify) passa por resolveFromWorkflow e lê o DUE_DATE como o normal.
     let readDueDays = null;
+    let stepsReadAt = null; // instante da leitura do step_list (só no caminho verificado; ver sentDuringRequest)
     const verified = config.startVerifyWorkflow || forceVerify;
     if (verified) {
       const resolved = await resolveFromWorkflow(input);
@@ -443,7 +537,7 @@ function createSignatureService({ repo, adobe, otcs, logger, config, now = () =>
         assertNotPreviousCycle(cycle);
         return existingResult(cycle, handoff);
       }
-      ({ workflowId, subworkflowId, taskId, nodeId, attachId, docName, emails, readDueDays } = resolved);
+      ({ workflowId, subworkflowId, taskId, nodeId, attachId, docName, emails, readDueDays, stepsReadAt } = resolved);
     } else {
       emails = parseEmails(input.userEmail1, input.userEmail2);
       if (!emails.length || !nodeId) throw new ServiceError(400, { error: 'Node ID and Email are mandatory.' });
@@ -463,31 +557,67 @@ function createSignatureService({ repo, adobe, otcs, logger, config, now = () =>
     try {
       try {
         await adobe.checkAuth();
-      } catch {
+      } catch (e) {
+        if (!adobeSessionLost(e)) {
+          logger.warn(`[START] Adobe Sign no respondió al renovar la sesión (${describeError(e)}); no se crea ningún acuerdo, se reintenta`);
+          throw adobeUnavailable();
+        }
         throw loginRequiredError();
       }
 
       try {
-        // Antes de qualquer coisa no Adobe: o conteúdo precisa ser um PDF (senão 422 NOT_PDF)
-        const content = await fetchPdf(nodeId);
+        const subId = String(subworkflowId || workflowId || '');
+        const externalId = buildExternalId({ workflowId, subworkflowId: subId, nodeId, attachId }, config.signatureSecret);
         const fileName = String(docName || '').trim() || `node_${nodeId}.pdf`;
 
-        const transientDocumentId = await adobe.createTransientDocument(content, fileName);
-        const subId = String(subworkflowId || workflowId || '');
-        const dueDays = readDueDays ? await readDueDays() : null;
-        const expirationTime = dueDays ? expirationFrom(now(), dueDays) : undefined;
-        const ag = await adobe.createAgreement({
-          name: `Documento ${fileName}`,
-          transientDocumentId,
-          emails,
-          externalId: buildExternalId({ workflowId, subworkflowId: subId, nodeId, attachId }, config.signatureSecret),
-          ...(expirationTime ? { expirationTime } : {})
-        });
-        if (expirationTime) logger.info(`[START] Acuerdo ${ag.id}: vence en ${dueDays} días (${expirationTime})`);
+        // Tentativa anterior sem resposta: o acordo pode já existir no Adobe (só no caminho verificado e com identidade de fluxo)
+        const orphan = verified && workflowId ? await findOrphanAgreement(externalId, emails, `${workflowId}/${subId}`) : null;
 
-        // Janela do acordo órfão: o acordo já existe no Adobe e ainda não está no repositório. O id vai para o log ANTES de gravar,
-        // para que uma falha da gravação deixe o rastro de que ele precisa ser adotado.
-        logger.info(`[START] Acuerdo ${ag.id} creado en Adobe (workflow ${workflowId || '-'}/${subId || '-'}, nodo ${nodeId}); se registra a continuación`);
+        let ag;
+        let timing;
+        if (orphan) {
+          // Uma adoção por webhook pode ter registrado o acordo enquanto a busca lia o acordo (await acima): não sobrescreve o registro
+          if (repo.has(orphan.id)) {
+            const known = repo.get(orphan.id);
+            // Como no ramo do ciclo: SendOn de início já feito durante este pedido => nada a reatribuir
+            return existingResult(known, sentDuringRequest(known, stepsReadAt) ? undefined : handoff);
+          }
+          ag = orphan;
+          logger.warn(
+            `[START] Workflow ${workflowId}/${subId}: el acuerdo ${orphan.id} ya existía en Adobe para este flujo (intento anterior sin respuesta); `
+            + 'se registra en lugar de crear otro'
+          );
+          timing = {
+            // Origem Adobe, não criado por este pedido: só rastreabilidade (nenhum fluxo lê a flag `adopted` do registro)
+            adopted: true,
+            expiresAt: isoOrNull(orphan.expirationTime),
+            createdAt: isoOrNull(orphan.createdDate) || now().toISOString()
+          };
+        } else {
+          // Antes de qualquer coisa no Adobe: o conteúdo precisa ser um PDF (senão 422 NOT_PDF)
+          const content = await fetchPdf(nodeId);
+
+          const transientDocumentId = await adobe.createTransientDocument(content, fileName);
+          const dueDays = readDueDays ? await readDueDays() : null;
+          const expirationTime = dueDays ? expirationFrom(now(), dueDays) : undefined;
+          ag = await adobe.createAgreement({
+            name: `Documento ${fileName}`,
+            transientDocumentId,
+            emails,
+            externalId,
+            ...(expirationTime ? { expirationTime } : {})
+          });
+          if (expirationTime) logger.info(`[START] Acuerdo ${ag.id}: vence en ${dueDays} días (${expirationTime})`);
+
+          // Janela do acordo órfão: o acordo já existe no Adobe e ainda não está no repositório. O id vai para o log ANTES de gravar,
+          // para que uma falha da gravação deixe o rastro de que ele precisa ser adotado.
+          logger.info(`[START] Acuerdo ${ag.id} creado en Adobe (workflow ${workflowId || '-'}/${subId || '-'}, nodo ${nodeId}); se registra a continuación`);
+          timing = {
+            // Mesmo instante enviado ao Adobe: o polling segue consultando o acordo até o prazo (mais a margem)
+            expiresAt: expirationTime || null,
+            createdAt: now().toISOString()
+          };
+        }
 
         // Mapeamento persistido ANTES do SendOn: um webhook imediato já encontra o acordo
         try {
@@ -502,9 +632,7 @@ function createSignatureService({ repo, adobe, otcs, logger, config, now = () =>
             state: 'pending',
             // O SendOn da tarefa de início é uma etapa persistida da reconciliação (com retry), não mais um fire-and-forget
             startSendonDone: !workflowId,
-            // Mesmo instante enviado ao Adobe: o polling segue consultando o acordo até o prazo (mais a margem)
-            expiresAt: expirationTime || null,
-            createdAt: now().toISOString()
+            ...timing
           });
         } catch (e) {
           logger.error(

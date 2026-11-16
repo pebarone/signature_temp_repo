@@ -34,6 +34,32 @@ const DISPOSITION_COMMENTS = {
 // do processo vem em seguida; no subfluxo só a firma é cancelada e o fluxo pai segue pelo próprio ramo Rechazado
 const EXPIRED_COMMENT = (id) => `Firma cancelada por caducidad: el acuerdo ${id} expiró en Adobe Sign sin ser firmado`;
 
+/*
+  Semáforo FIFO em processo: no máximo `max` execuções de `run(fn)` ao mesmo tempo; as demais esperam a vez na ordem de
+  chegada. O espaço é passado direto ao próximo da fila (sem janela em que um recém-chegado o roube). `fn` que lança ou
+  rejeita também libera o espaço.
+*/
+function createLimiter(max) {
+  let active = 0;
+  const waiters = [];
+  const release = () => {
+    const next = waiters.shift();
+    if (next) next(); // o espaço continua ocupado: passa para o próximo
+    else active--;
+  };
+  return {
+    async run(fn) {
+      if (active < max) active++;
+      else await new Promise((resolve) => waiters.push(resolve));
+      try {
+        return await fn();
+      } finally {
+        release();
+      }
+    }
+  };
+}
+
 // Erro de negócio da adoção manual (status HTTP sugerido para o /admin/adopt)
 class AdoptError extends Error {
   constructor(status, message, extra = {}) {
@@ -58,10 +84,15 @@ function createReconciliationService({
   const signNames = () => config.signTaskNames || ['Aguardar Firma'];
   const startNames = () => config.startTaskNames || ['Enviar solicitud de firma'];
   const wfAttrs = config.wfAttributes || { enabled: false, labels: {} };
+  const maxReopens = Number(config.attentionMaxReopens) > 0 ? Number(config.attentionMaxReopens) : 0; // 0 = sem limite
+  // Limite global de reconciliações simultâneas (acordos distintos): uma rajada de webhooks não abre N pipelines de uma vez
+  // contra OTCS/Adobe. A serialização por acordo (enqueue) vem antes; o espaço só é ocupado durante o doReconcile.
+  const limiter = createLimiter(Math.max(1, Math.floor(Number(config.reconcileConcurrency)) || 4));
 
   const queued = new Map();     // id -> Promise da próxima execução (coalescida)
   const queuedOpts = new Map(); // id -> opções mescladas
-  const running = new Map();    // id -> Promise da execução em curso
+  const running = new Map();    // id -> Promise da execução em curso (inclui a que ainda espera vaga no limite)
+  const inPipeline = new Map(); // id -> Promise do doReconcile que já passou da checagem do hold (executando de fato)
   const timers = new Map();     // id -> timer de retry
   const attrChains = new Map(); // id -> Promise da última gravação de atributos (serializa por acordo)
   const attrMissingLogged = new Set(); // `${id}|${rótulo}` já logados (rótulo inexistente no mapa)
@@ -88,13 +119,14 @@ function createReconciliationService({
   }
 
   /*
-    Espera a reconciliação do acordo que já está em curso (e a enfileirada atrás dela) terminar. O cancelamento a usa
-    logo depois do hold: uma execução que passou da checagem do hold continua e poderia adotar o RECALLED do próprio
-    cancelamento. As que começarem depois do hold devolvem 'held'. Nunca rejeita.
+    Espera a reconciliação do acordo que já está executando (passou da checagem do hold dentro do limite) terminar. O
+    cancelamento a usa logo depois do hold: uma execução que passou da checagem continua e poderia adotar o RECALLED do
+    próprio cancelamento. As que ainda esperam vaga no limite ou na fila do acordo não são esperadas: ao ganhar a vaga
+    conferem o hold de novo e devolvem 'held' na hora, sem tocar OTCS/Adobe. Nunca rejeita.
   */
   function settle(id) {
     id = String(id);
-    return Promise.all([running.get(id), queued.get(id)].filter(Boolean)).then(() => {}, () => {});
+    return Promise.resolve(inPipeline.get(id)).then(() => {}, () => {});
   }
 
   /* ---------- helpers de estado ---------- */
@@ -117,8 +149,10 @@ function createReconciliationService({
   function registerFailure(id, stage, err, { permanent = false } = {}) {
     const rec = repo.get(id);
     const message = describeError(err);
+    const nowMs = now().getTime();
+    // 429/503 com Retry-After: o próximo retry não é antes do que o servidor pediu (limitado a RETRY_MAX_MS)
     const { patch, delayMs, attention, attentionKind } = state.failurePatch(
-      rec, stage, message, now().getTime(), backoff, { permanent }
+      rec, stage, message, nowMs, backoff, { permanent, retryAfterMs: state.retryAfterMs(err, nowMs), maxReopens }
     );
     repo.upsert(id, patch);
     if (attention) {
@@ -267,7 +301,9 @@ function createReconciliationService({
 
   // Espera transitória (sem log de erro a cada tentativa): conta como tentativa da etapa, com backoff e limite normais
   function waitTransient(id, rec, stage, message, status) {
-    const { patch, delayMs, attention, attentionKind } = state.failurePatch(rec, stage, message, now().getTime(), backoff);
+    const { patch, delayMs, attention, attentionKind } = state.failurePatch(
+      rec, stage, message, now().getTime(), backoff, { maxReopens }
+    );
     repo.upsert(id, patch);
     if (attention) return markAttention(id, attention, attentionKind);
     logger.info(`[${id}] ${message} (intento ${patch.attempts}); próximo intento: ${patch.nextAttemptAt}`);
@@ -744,7 +780,8 @@ function createReconciliationService({
     const plan = state.planFor(rec.finalKind);
     if (rec.sendonDone) return { status: 'done', record: rec };
     // reconcile manual (POST /admin/reconcile): tira de needs_attention e zera as tentativas (rodada nova)
-    if (opts.manual && (rec.state === state.STATES.NEEDS_ATTENTION || rec.attempts)) {
+    // (e zera o contador de reaberturas automáticas, ATTENTION_MAX_REOPENS)
+    if (opts.manual && (rec.state === state.STATES.NEEDS_ATTENTION || rec.attempts || rec.reopenCount)) {
       rec = repo.upsert(id, state.reopenPatch(rec));
     }
     if (!plan && !state.isStartPending(rec)) return { status: 'no_final', record: rec };
@@ -825,7 +862,23 @@ function createReconciliationService({
       queued.delete(id);
       const runOpts = queuedOpts.get(id);
       queuedOpts.delete(id);
-      const run = doReconcile(id, runOpts).catch((e) => {
+      // Acordo em hold (cancelamento em curso) não ocupa espaço do limite: devolve 'held' sem entrar na fila do semáforo.
+      // Se o hold começar depois de a execução entrar na fila, o doReconcile confere de novo e devolve 'held' na sua vez.
+      const guarded = held.has(id)
+        ? Promise.resolve({ status: 'held', record: repo.get(id) })
+        : limiter.run(async () => {
+          // Reconfere o hold ao ganhar a vaga (síncrono com o registro em inPipeline: sem janela entre os dois)
+          if (held.has(id)) return { status: 'held', record: repo.get(id) };
+          const exec = doReconcile(id, runOpts);
+          const done = exec.then(() => {}, () => {});
+          inPipeline.set(id, done);
+          try {
+            return await exec;
+          } finally {
+            if (inPipeline.get(id) === done) inPipeline.delete(id);
+          }
+        });
+      const run = guarded.catch((e) => {
         logger.error(`[${id}] error inesperado en la reconciliación: ${describeError(e)}`);
         failUnexpected(id, e);
         return { status: 'error', error: describeError(e) };
@@ -1150,7 +1203,8 @@ function createReconciliationService({
 
   /*
     Reabre needs_attention por "reintentos agotados" cuja última falha é mais antiga que ATTENTION_RETRY_HOURS
-    (zera as tentativas, como o reconcile manual). Outros tipos de atenção não reabrem sozinhos.
+    (zera as tentativas, como o reconcile manual, mas conta a reabertura: com ATTENTION_MAX_REOPENS > 0 o acordo que já foi
+    reaberto esse número de vezes fica em needs_attention até intervenção manual). Outros tipos de atenção não reabrem sozinhos.
     O reprocessamento fica por conta do runQueue.
   */
   async function reopenStale() {
@@ -1158,9 +1212,12 @@ function createReconciliationService({
     if (!hours || hours <= 0) return [];
     const cutoff = new Date(now().getTime() - hours * 60 * 60 * 1000).toISOString();
     const ids = [];
-    for (const rec of repo.listAttentionToReopen(cutoff)) {
-      repo.upsert(rec.id, state.reopenPatch(rec));
-      logger.warn(`[${rec.id}] needs_attention reabierto automáticamente (reintentos agotados hace más de ${hours} h): ${rec.attentionReason}`);
+    for (const rec of repo.listAttentionToReopen(cutoff, maxReopens)) {
+      const reopened = repo.upsert(rec.id, state.reopenPatch(rec, { auto: true }));
+      logger.warn(
+        `[${rec.id}] needs_attention reabierto automáticamente (reintentos agotados hace más de ${hours} h; `
+        + `reapertura ${reopened.reopenCount}${maxReopens ? `/${maxReopens}` : ''}): ${rec.attentionReason}`
+      );
       ids.push(rec.id);
     }
     return ids;

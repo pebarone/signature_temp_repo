@@ -64,6 +64,9 @@ function makeAdobe(calls = []) {
     onCancel: null,          // async (id) => ...: roda DENTRO do cancelAgreement, depois de o Adobe aplicar (webhook antes da resposta)
     pdf: PDF,
     created: [],
+    findError: null,         // se definido, findAgreementsByExternalId lança (busca de acordo órfão do /start)
+    findOverride: null,      // se definido (lista), findAgreementsByExternalId devolve ela (simula o filtro ignorado)
+    createLostResponses: 0,  // próximas N chamadas de createAgreement: o Adobe CRIA o acordo, mas a resposta se perde (timeout)
     authOk: true,
     async checkAuth() {
       if (!adobe.authOk) throw new Error('REFRESH_TOKEN_MISSING');
@@ -76,9 +79,28 @@ function makeAdobe(calls = []) {
     async createAgreement({ name, transientDocumentId, emails, externalId, expirationTime }) {
       const id = `AG-${adobe.created.length + 1}`;
       adobe.created.push({ id, name, transientDocumentId, emails, externalId, ...(expirationTime ? { expirationTime } : {}) });
-      adobe.agreements[id] = { id, name, status: 'OUT_FOR_SIGNATURE', ...(externalId ? { externalId: { id: externalId } } : {}) };
+      adobe.agreements[id] = {
+        id, name, status: 'OUT_FOR_SIGNATURE',
+        createdDate: new Date(Date.now()).toISOString(),
+        participantSetsInfo: (emails || []).map((email) => ({ role: 'SIGNER', order: 1, memberInfos: [{ email }] })),
+        ...(externalId ? { externalId: { id: externalId } } : {}),
+        ...(expirationTime ? { expirationTime } : {})
+      };
       calls.push(['adobe.createAgreement', id]);
+      if (adobe.createLostResponses > 0) {
+        adobe.createLostResponses--;
+        throw new Error('timeout of 60000ms exceeded'); // criado no Adobe, mas o chamador só vê o erro
+      }
       return { id };
+    },
+    // GET /agreements?externalId=: itens como a lista real (sem externalId), só os acordos com exatamente este externalId
+    async findAgreementsByExternalId(externalId) {
+      calls.push(['adobe.findByExternalId', externalId]);
+      if (adobe.findError) throw adobe.findError;
+      if (adobe.findOverride) return adobe.findOverride;
+      return Object.values(adobe.agreements)
+        .filter((a) => a.externalId?.id === externalId)
+        .map((a) => ({ id: a.id, status: a.status, displayDate: a.createdDate, name: a.name }));
     },
     async getAgreement(id) {
       calls.push(['adobe.getAgreement', id]);

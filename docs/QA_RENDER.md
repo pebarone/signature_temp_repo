@@ -5,8 +5,8 @@ O ambiente de QA do orquestrador roda no Render, com **storage efêmero e sem PV
 
 ## Storage efêmero
 
-- O código só detecta o Render pela variável `RENDER=true`. Confirme que ela está definida no serviço.
-- Sem `DATA_DIR`, com `RENDER=true` (ou `NODE_ENV=production`), o estado vai para `/tmp/signature-orchestrator`
+- A feature flag `RENDER` (.env) escolhe o alvo: `true` = Render, `false`/ausente = OpenShift. O Render já define `RENDER=true` nos serviços dele.
+- Com `RENDER=true`, `DATA_DIR` e `REQUIRE_PERSISTENT_STORAGE` são ignorados; sem `RENDER_DATA_DIR`, o estado vai para `/tmp/signature-orchestrator`
   (`TMP_DATA_DIR`). Ver `computeConfig` em `server/config/index.js`.
 - Esse diretório guarda `state/orchestrator.db`, `state/tokens.json`, `logs/` e `inprocess/`.
 - Na inicialização, o log traz um aviso `[STORAGE] Storage efímero (...)`. É o esperado no QA.

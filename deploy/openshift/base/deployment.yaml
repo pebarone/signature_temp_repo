@@ -8,7 +8,7 @@ metadata:
   labels:
     app: signature-orchestrator
 spec:
-  # PVC RWO + SQLite: exatamente uma réplica. Não aumentar sem rever o storage.
+  # PVC RWO + SQLite: exatamente uma réplica. Não aumentar sem rever o storage e as travas em memória (README.md, "Resumo do storage").
   replicas: 1
   revisionHistoryLimit: 5
   strategy:

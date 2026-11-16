@@ -26,22 +26,28 @@ const list = (v, def = []) => {
 
 /*
   === Config a partir de um objeto env (testável) ===
-  Storage: DATA_DIR > Render/NODE_ENV=production (/tmp, efêmero) > ./data local.
-  Kubernetes/OpenShift sem DATA_DIR => storage efêmero (problem); fatal se REQUIRE_PERSISTENT_STORAGE=true
-  (que também recusa o /tmp efêmero do Render/production).
+  Feature flag RENDER (.env): true = deploy no Render; false/ausente = OpenShift (padrão). O Render também define
+  RENDER=true sozinho nos serviços dele.
+  Storage no Render: RENDER_DATA_DIR (ex.: disco do Render) ou /tmp (efêmero). DATA_DIR e REQUIRE_PERSISTENT_STORAGE
+  são do OpenShift e ficam ignorados, para o mesmo .env servir aos dois alvos trocando só a flag.
+  Storage no OpenShift/local: DATA_DIR > NODE_ENV=production (/tmp, efêmero) > ./data local.
+  Kubernetes/OpenShift sem DATA_DIR => storage efêmero (problem); fatal se REQUIRE_PERSISTENT_STORAGE=true.
 */
 function computeConfig(env = process.env, { projectRoot = PROJECT_ROOT } = {}) {
   const isRender = bool(env.RENDER, false);
   const isProduction = env.NODE_ENV === 'production';
   const isKubernetes = !!env.KUBERNETES_SERVICE_HOST;
-  const requirePersistent = bool(env.REQUIRE_PERSISTENT_STORAGE, false);
+  const requirePersistent = !isRender && bool(env.REQUIRE_PERSISTENT_STORAGE, false);
 
   let dataDir;
   let source;
-  if (str(env.DATA_DIR)) {
+  if (isRender) {
+    dataDir = str(env.RENDER_DATA_DIR) ? path.resolve(str(env.RENDER_DATA_DIR)) : TMP_DATA_DIR;
+    source = str(env.RENDER_DATA_DIR) ? 'RENDER_DATA_DIR' : 'tmp';
+  } else if (str(env.DATA_DIR)) {
     dataDir = path.resolve(str(env.DATA_DIR));
     source = 'DATA_DIR';
-  } else if (isRender || isProduction) {
+  } else if (isProduction) {
     dataDir = TMP_DATA_DIR;
     source = 'tmp';
   } else {
@@ -50,9 +56,9 @@ function computeConfig(env = process.env, { projectRoot = PROJECT_ROOT } = {}) {
   }
 
   const noDataDir = source !== 'DATA_DIR';
-  const ephemeral = source === 'tmp' || (isKubernetes && noDataDir);
+  const ephemeral = source === 'tmp' || (!isRender && isKubernetes && noDataDir);
   let problem = null;
-  if (isKubernetes && noDataDir) {
+  if (!isRender && isKubernetes && noDataDir) {
     problem = 'Kubernetes/OpenShift detectado sin DATA_DIR: el estado (base SQLite, tokens, logs) se perderá al reiniciar el pod. ' +
       'Monte un PVC y defina DATA_DIR (ej. /data).';
   } else if (ephemeral && requirePersistent) {
@@ -61,6 +67,8 @@ function computeConfig(env = process.env, { projectRoot = PROJECT_ROOT } = {}) {
 
   const stateDir = path.join(dataDir, 'state');
   const publicUrl = str(env.PUBLIC_URL);
+  // Alvo do self-ping no Render: PUBLIC_URL ou, se vazio, RENDER_EXTERNAL_URL (definida pelo próprio Render)
+  const keepaliveUrl = isRender ? noSlash(publicUrl || str(env.RENDER_EXTERNAL_URL)) : '';
 
   /*
     Basic Auth do /auth (POST /auth e POST /start, WebReport): START_AUTH_USER+START_AUTH_PASS (as duas) ou, se ausentes,
@@ -78,7 +86,7 @@ function computeConfig(env = process.env, { projectRoot = PROJECT_ROOT } = {}) {
     : { user: startAuth.user ?? '', pass: startAuth.pass ?? '' };
 
   return {
-    platform: { isRender, isProduction, isKubernetes },
+    platform: { isRender, isProduction, isKubernetes, target: isRender ? 'render' : 'openshift' },
     storage: {
       source,
       ephemeral,
@@ -153,8 +161,9 @@ function computeConfig(env = process.env, { projectRoot = PROJECT_ROOT } = {}) {
       timeoutMs: Math.max(1000, int(env.OTCS_TIMEOUT_MS, 60 * 1000))
     },
 
-    // Self-ping (Render): intervalo em ms; 0 desativa
-    keepaliveMs: int(env.KEEPALIVE_INTERVAL_MS, 10 * 60 * 1000),
+    // Self-ping (Render): intervalo em ms; 0 desativa. Limitado a 14 min: o Render free hiberna após 15 min sem tráfego
+    keepaliveMs: Math.min(int(env.KEEPALIVE_INTERVAL_MS, 10 * 60 * 1000), 14 * 60 * 1000),
+    keepaliveUrl,
 
     poll: {
       enabled: bool(env.POLL_ENABLED, true),
@@ -175,6 +184,15 @@ function computeConfig(env = process.env, { projectRoot = PROJECT_ROOT } = {}) {
 
     // 0 desativa. needs_attention por "reintentos agotados" é reaberto sozinho após N horas
     attentionRetryHours: int(env.ATTENTION_RETRY_HOURS, 6),
+    // Máximo de reaberturas automáticas por acordo (ATTENTION_RETRY_HOURS); depois fica em needs_attention até alguém intervir
+    // (reconcile manual ou novo evento final zeram o contador). 0 = sem limite
+    attentionMaxReopens: int(env.ATTENTION_MAX_REOPENS, 3),
+    // Reconciliações simultâneas (cada uma fala com OTCS/Adobe) entre acordos distintos; as demais esperam na fila (FIFO).
+    // Inteiro >= 1; inválido, vazio, 0 ou negativo => 4
+    reconcileConcurrency: (() => {
+      const n = parseInt(env.RECONCILE_CONCURRENCY, 10);
+      return Number.isFinite(n) && n >= 1 ? n : 4;
+    })(),
     // Acordo desconhecido no webhook (banco perdido/deploy novo): adota se o externalId for nosso
     adoptUnknownAgreements: bool(env.ADOPT_UNKNOWN_AGREEMENTS, true),
 
@@ -255,9 +273,9 @@ function computeConfig(env = process.env, { projectRoot = PROJECT_ROOT } = {}) {
   };
 }
 
-// Self-ping só no Render (evita hibernar); precisa de PUBLIC_URL e KEEPALIVE_INTERVAL_MS > 0
+// Self-ping só no Render (evita hibernar); precisa de PUBLIC_URL/RENDER_EXTERNAL_URL e KEEPALIVE_INTERVAL_MS > 0
 const shouldKeepalive = (config) =>
-  !!(config.platform.isRender && config.publicUrl && config.keepaliveMs > 0);
+  !!(config.platform.isRender && config.keepaliveUrl && config.keepaliveMs > 0);
 
 /*
   Valida o storage no startup: loga o erro e, se REQUIRE_PERSISTENT_STORAGE=true, encerra o processo.

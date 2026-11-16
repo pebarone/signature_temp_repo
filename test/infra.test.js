@@ -6,7 +6,7 @@ const { openDatabase, MIGRATIONS } = require('../server/infra/db');
 const { createAdobeClient } = require('../server/infra/adobeClient');
 const { createTokenStore } = require('../server/infra/tokenStore');
 const { createOtcsClient } = require('../server/infra/otcsClient');
-const { atomicWriteFileSync, describeError } = require('../server/infra/util');
+const { atomicWriteFileSync, describeError, maskEmail } = require('../server/infra/util');
 const { computeConfig } = require('../server/config');
 const { PDF, makeLogger, tmpDir, httpError } = require('./support/fakes');
 
@@ -38,6 +38,70 @@ test('util: escrita atômica não deixa temporários e describeError não vaza c
   const text = describeError(e);
   assert.match(text, /HTTP 403/);
   assert.doesNotMatch(text, /SECRET/);
+});
+
+// Estes casos ficam fora do teste acima de propósito: nesta máquina (Windows) ele falha na checagem do modo 600 antes daqui.
+test('util: describeError diz qual requisição falhou (método + host/caminho), sem query, hash, cabeçalhos ou credenciais', () => {
+  const timeout = Object.assign(new Error('timeout of 60000ms exceeded'), {
+    code: 'ECONNABORTED',
+    config: { method: 'post', url: 'https://api.na4.adobesign.com/api/rest/v6/transientDocuments?x=SEGREDO#frag', headers: { Authorization: 'Bearer TOKEN' }, data: 'CORPO' }
+  });
+  const text = describeError(timeout);
+  assert.equal(text, 'timeout of 60000ms exceeded | POST api.na4.adobesign.com/api/rest/v6/transientDocuments');
+  assert.doesNotMatch(text, /SEGREDO|frag|TOKEN|CORPO/);
+
+  // url relativa junta com baseURL como o axios: o caminho do baseURL é mantido
+  const rel = Object.assign(new Error('boom'), { config: { url: '/transientDocuments', baseURL: 'https://adobe.invalid/api/rest/v6/' } });
+  assert.equal(describeError(rel), 'boom | GET adobe.invalid/api/rest/v6/transientDocuments');
+  const relNoSlash = Object.assign(new Error('boom'), { config: { method: 'get', url: 'agreements/AG-1', baseURL: 'https://adobe.invalid/api/rest/v6' } });
+  assert.equal(describeError(relNoSlash), 'boom | GET adobe.invalid/api/rest/v6/agreements/AG-1');
+
+  const cred = Object.assign(new Error('boom'), { config: { method: 'get', url: 'https://user:pa55@api.example.com/x?y=1' } });
+  assert.equal(describeError(cred), 'boom | GET api.example.com/x');
+});
+
+test('util: describeError mantém HTTP <status> | <data> no fim e limita o corpo a 500 caracteres', () => {
+  const e = Object.assign(new Error('Request failed with status code 500'), {
+    config: { method: 'post', url: 'https://otcs.invalid/api/v2/processes?x=1', headers: { OTCSTicket: 'SECRETO' } },
+    response: { status: 500, data: { error: 'boom' } }
+  });
+  const text = describeError(e);
+  assert.equal(text, 'Request failed with status code 500 | POST otcs.invalid/api/v2/processes | HTTP 500 | {"error":"boom"}');
+  assert.doesNotMatch(text, /SECRETO/);
+
+  const longBody = Object.assign(new Error('x'), { config: { url: 'https://h.invalid/a' }, response: { status: 502, data: 'y'.repeat(600) } });
+  assert.equal(describeError(longBody), `x | GET h.invalid/a | HTTP 502 | ${'y'.repeat(500)}`);
+});
+
+test('util: describeError com URL que não parseia corta ?/# e tira credenciais', () => {
+  const e = Object.assign(new Error('falhou'), { config: { method: 'get', url: 'https://user:pa?ss@api.example.com:99999/p?token=abc#h' } });
+  assert.equal(describeError(e), 'falhou | GET https://api.example.com:99999/p');
+  // senha com "/" e quebra de linha (forjaria uma linha de log) também não passam
+  const barra = Object.assign(new Error('falhou'), { config: { url: 'https://user:pa/ss@host:99999/x?t=1' } });
+  assert.equal(describeError(barra), 'falhou | GET https://host:99999/x');
+  const quebra = Object.assign(new Error('falhou'), { config: { url: 'https://h:99999/a\nFAKE LINE?q=1' } });
+  assert.doesNotMatch(describeError(quebra), /[\r\n]/);
+  // valor que não vira string: describeError não lança
+  const ruim = Object.assign(new Error('m'), { config: { url: { toString() { throw new Error('x'); } } } });
+  assert.equal(describeError(ruim), 'm');
+});
+
+test('util: describeError de erro comum, string ou erro sem config.url sai como antes', () => {
+  assert.equal(describeError(new Error('falha simples')), 'falha simples');
+  assert.equal(describeError('texto solto'), 'texto solto');
+  assert.equal(describeError(null), 'unknown error');
+  const semUrl = Object.assign(new Error('sem url'), { config: { method: 'post', headers: { A: 'b' } } });
+  assert.equal(describeError(semUrl), 'sem url');
+});
+
+test('util: maskEmail mantém as 2 primeiras letras do nome e o domínio; o que não é e-mail vira "?"', () => {
+  assert.equal(maskEmail('ab.cdef@example.com'), 'ab***@example.com');
+  assert.equal(maskEmail('a@x.com'), 'a***@x.com');
+  assert.equal(maskEmail('  Maria@Example.com '), 'Ma***@Example.com');
+  for (const v of ['', '   ', null, undefined, 42, 'sem-arroba', '@example.com', 'maria@']) {
+    assert.equal(maskEmail(v), '?', String(v));
+  }
+  assert.doesNotMatch(maskEmail('segredo.longo@example.com'), /segredo|longo/);
 });
 
 /* ---------- Adobe: retry de 403 aguardado ---------- */
@@ -224,6 +288,46 @@ test('tokenStore: refresh rejeitado/travado (timeout) limpa o inflight e o próx
   assert.equal(pending.length, 2);
   pending[1].resolve({ data: { access_token: 'fresh', expires_in: 3600 } });
   assert.equal(await c, 'fresh');
+});
+
+test('tokenStore: 10 ensureToken() concorrentes com token expirado => um único refresh e o mesmo token para todos', async () => {
+  let posts = 0;
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const http = {
+    post: async () => {
+      posts++;
+      await gate; // as 10 chamadas entram antes de o refresh terminar
+      return { data: { access_token: 'fresh', refresh_token: 'r2', expires_in: 3600 } };
+    }
+  };
+  const store = createTokenStore({ config: tokenConfig(tmpDir()), logger: makeLogger(), http });
+  store.setToken('old', -10, 'r1');
+
+  const calls = Array.from({ length: 10 }, () => store.ensureToken());
+  release();
+  const tokens = await Promise.all(calls);
+  assert.equal(posts, 1);
+  assert.deepEqual(tokens, Array(10).fill('fresh'));
+  assert.equal(await store.ensureToken(), 'fresh', 'token válido: não refaz o refresh');
+  assert.equal(posts, 1);
+});
+
+test('tokenStore: refresh cujo tokens.json não pode ser gravado loga erro (sem valores de token) e o token segue válido', async () => {
+  // o "diretório" de state é um arquivo: a gravação falha (simula volume sem permissão)
+  const blocker = path.join(tmpDir(), 'not-a-dir');
+  fs.writeFileSync(blocker, '');
+  const config = tokenConfig(tmpDir(), { tokensFile: path.join(blocker, 'tokens.json'), adobeRefreshToken: 'seed-refresh' });
+  const http = {
+    post: async () => ({ data: { access_token: 'access-valor-secreto', refresh_token: 'refresh-valor-secreto', expires_in: 3600 } })
+  };
+  const logger = makeLogger();
+  const store = createTokenStore({ config, logger, http });
+
+  assert.equal(await store.ensureToken(), 'access-valor-secreto');
+  assert.ok(logger.has('error', /Token renovado pero no se pudo guardar en tokens\.json/));
+  assert.ok(logger.lines.error.every((l) => !/valor-secreto/.test(l)), 'nenhum valor de token no log');
+  assert.equal(await store.ensureToken(), 'access-valor-secreto', 'segue em memória');
 });
 
 /* ---------- OTCS: 401 => novo login e uma repetição ---------- */

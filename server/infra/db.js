@@ -105,6 +105,12 @@ const MIGRATIONS = [
   // sem Rechazado. Limpa quando o acordo é fechado ou quando se sabe que o PUT não foi aplicado.
   `
   ALTER TABLE agreements ADD COLUMN cancel_pending_at TEXT;
+  `,
+  // v8: reaberturas automáticas de needs_attention (retries_exhausted). reopen_count conta as feitas por reopenStale; com
+  // ATTENTION_MAX_REOPENS > 0, o acordo que já chegou ao limite deixa de ser reaberto sozinho (erro permanente que parece transitório).
+  // Reconcile manual e novo evento final zeram.
+  `
+  ALTER TABLE agreements ADD COLUMN reopen_count INTEGER NOT NULL DEFAULT 0;
   `
 ];
 

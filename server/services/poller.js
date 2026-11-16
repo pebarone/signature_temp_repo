@@ -21,6 +21,19 @@ function createPoller({ repo, adobe, processor, config, logger, now = () => new 
     }
   }
 
+  // O polling achou o resultado final e o acordo nunca recebeu um webhook (de nenhum tipo): sinal de webhook inativo ou mal
+  // configurado no Adobe. Um aviso só por acordo (depois do final ele deixa de ser consultado); consulta barata, só um EXISTS.
+  function warnIfNoWebhook(id) {
+    try {
+      if (typeof repo.hasEventFrom !== 'function' || repo.hasEventFrom(id, 'webhook')) return;
+      logger.warn(
+        `[${id}] resultado final detectado sólo por polling: ningún webhook recibido para este acuerdo (¿webhook inactivo en Adobe?)`
+      );
+    } catch (e) {
+      logger.warn(`[poll] ${id}: no se pudo comprobar si hubo webhook: ${describeError(e)}`);
+    }
+  }
+
   async function runTick() {
     const summary = { polled: 0, finalized: 0, errors: 0, retried: 0, reopened: 0 };
     const t = now().getTime();
@@ -44,6 +57,7 @@ function createPoller({ repo, adobe, processor, config, logger, now = () => new 
         if (isFinalKind(kind)) {
           summary.finalized++;
           logger.info(`[poll] ${rec.id}: estado Adobe ${ag.status} -> ${kind}`);
+          warnIfNoWebhook(rec.id);
         }
       } catch (e) {
         summary.errors++;

@@ -67,10 +67,44 @@ Os itens comuns (`SERVER_URL`, usuário de integração, Basic, CORS) estão em
       entre as duas chamadas ou derrubar o servidor). Esperado: o erro original mais "Se intentó devolver la tarea a su bandeja. Si no aparece, contacte al
       administrador (flujo X, subflujo Y, tarea Z)." e a tarefa de volta ao usuário (conferir na caixa dele: a nota é cautelosa
       de propósito); com o ramo devolver quebrado, a nota "Es posible que la tarea haya quedado asignada al usuario de integración".
-      Derrubar a rede **uma única vez** no segundo `/start` não devolve a tarefa: a página repete e mostra o sucesso (`existing`, ou o acordo recém-criado). Com `START_IN_PROGRESS` ou com acordo
+      Derrubar a rede **uma ou duas vezes** no segundo `/start` não devolve a tarefa: a página repete (5 s, 15 s) e mostra o sucesso (`existing`, ou o acordo recém-criado). Com `START_IN_PROGRESS` ou com acordo
       existente a tarefa **não** é devolvida.
+- [ ] Recarga no meio do envio (o caso de 04/11/2026): num sub-fluxo, depois da reatribuição, recarregar a página enquanto o segundo
+      `/start` ainda roda (para forçar, deixe o servidor lento, por exemplo com o OTCS ou o Adobe inacessível por um minuto).
+      Esperado:
+      - a página recarregada mostra "Hay un envío en curso para este flujo. Esperando a que termine...";
+      - quando o primeiro termina, ela mostra o sucesso com um único acordo (conferir no Adobe que não há dois com o mesmo `externalId`);
+      - a tarefa segue o fluxo;
+      - o passo "Enviando a Adobe Sign" nunca fica verde antes do ID do acordo.
+- [ ] Após 15 s de `/start`, a linha "Esto puede tardar unos minutos. No cierre ni recargue la página." aparece e some no fim.
+- [ ] Recarga com a tarefa já reatribuída e o primeiro `/start` já encerrado com erro: a página recarregada cria o acordo sem
+      pedir nova reatribuição.
 - [ ] `PREVIOUS_CYCLE_OPEN`: com o acordo de um envio anterior ainda aberto e a tarefa de envio de novo ativa, a página mostra a
       mensagem do servidor com o ID, sem reatribuir (a tarefa não sai do usuário).
+
+## Ramo recalcular (sub-fluxo de firma único)
+
+O botão **Contrato adjuntado** / **Documento adjuntado** só aparece num sub-fluxo (`WORKID ≠ SUBWORKID`) com DocID que não é
+número.
+- Ele chama `accion=recalcular`, que refaz o DocID com a regra do Set Attributes do sub-fluxo
+  (`../firma-subflujo-unico/Set Attributes Firma.html`, 11962123 no QA) e grava com `WFACTION:SETATTR`.
+- Depois a página recarrega.
+- A regra está nos dois arquivos: mudar nos dois.
+- Como nos ramos `reasignar` e `devolver`, a URL não prova que `workid` e `subworkid` são pai e filho. Quem monta a URL à
+  mão age com as próprias permissões no `WFACTION`, e só um DocID não numérico é regravado. Restrinja o WebReport a quem
+  precisa dele.
+
+- [ ] Sub-fluxo de Contratación sem contrato: aparece "Contrato adjuntado". Anexar o contrato ao pai, clicar: a página
+      recarrega e envia.
+- [ ] Dois contratos nos anexos: depois do clique, a mensagem começa com "Todavía no hay un único contrato...".
+- [ ] Documental sem anexo: aparece "Documento adjuntado". Anexar e clicar: envia.
+- [ ] O usuário que tem a tarefa 2, e não só um admin, consegue gravar com `WFACTION:SETATTR` no sub-fluxo. Se o
+      `REMOVEATTR` passar e o `SETATTR` falhar, o DocID fica vazio e a Contratación passa a mostrar "Documento adjuntado".
+- [ ] `PATFIND:"%[0-9]+$"`: com DocID numérico, `accion=recalcular` aberto à mão não muda o DocID.
+- [ ] Nome com dois-pontos (ex.: `Contrato: Juan.pdf`): o Nombre del Documento é gravado inteiro. Se cortar, acrescentar
+      `REPLACE:":":"-"` na limpeza do nome.
+- [ ] Sem `RECALCULADO_OK` na página normal.
+- [ ] Fluxo puro com DocID inválido: o erro de antes, sem botão.
 
 Os itens do checklist comum (NOT_PDF, acordo final, DUPLICATE_OPEN, CORS, logs) também valem aqui: ver
 [`../README.md`](../README.md#checklist-comum-de-qa-servidor-e-protocolo).

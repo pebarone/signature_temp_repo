@@ -6,7 +6,7 @@ const cors = require('cors');
 
 const { createBasicAuth } = require('./http/middleware/basicAuth');
 const { createVerifySignature, deriveKey, DIRECT_SCOPE } = require('./http/middleware/hmac');
-const { webhookRoutes } = require('./http/routes/webhook');
+const { webhookRoutes, webhookEchoClientId } = require('./http/routes/webhook');
 const { startRoutes } = require('./http/routes/start');
 const { cancelRoutes } = require('./http/routes/cancel');
 const { adminRoutes } = require('./http/routes/admin');
@@ -75,6 +75,8 @@ function createApp({
   const startCors = (req, res, next) =>
     (!cancelDirectEnabled && /^\/cancel\/direct(\/|$)/i.test(req.baseUrl + req.path) ? next() : baseCors(req, res, next));
   app.use(cancelEnabled ? ['/auth', '/start', '/cancel'] : ['/auth', '/start'], startCors);
+  // Eco do X-AdobeSign-ClientId antes do parser: o JSON inválido ou acima de 10 MB (400/413) também sai com o header
+  app.use('/webhook', webhookEchoClientId(config));
   app.use(express.json({ limit: '10mb' }));
   app.use(express.urlencoded({ extended: true }));
   app.use(express.static(path.join(__dirname, '../static')));

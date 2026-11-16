@@ -305,7 +305,7 @@ test('otcs: getTaskForm entrega o valor multivalor (array) do atributo intacto, 
 /* ---------- banco e repositório ---------- */
 
 test('db: banco no schema v3 recebe a migração v4 (cancelamento) preservando os dados', () => {
-  assert.equal(MIGRATIONS.length, 7);
+  assert.equal(MIGRATIONS.length, 8);
   const file = path.join(tmpDir(), 'v3.db');
   const raw = new Database(file);
   for (let i = 0; i < 3; i++) raw.exec(MIGRATIONS[i]);

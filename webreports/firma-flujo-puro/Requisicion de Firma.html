@@ -15,6 +15,67 @@ REASIGNADO_OK
 [LL_REPTAG_{'[LL_REPTAG_&WORKID /]','[LL_REPTAG_&SUBWORKID /]','[LL_REPTAG_&TASKID /]'} WFTASKACTION:REASSIGN:[LL_REPTAG_ACTUALUSERID /] /]
 DEVUELTO_OK
 [LL_WEBREPORT_ELSE /]
+[// Ramo recalcular: la pagina lo pide cuando el DocID del sub-flujo no es un numero (no habia un unico contrato u otrosi en los adjuntos) y el usuario ya adjunto el documento. /]
+[// Repite la regla del Set Attributes del sub-flujo (11962123 en QA, webreports/firma-subflujo-unico/Set Attributes Firma.html): si una cambia, cambiar la otra. La unica diferencia es que aqui se lee el padre por WORKID y se escribe con WFACTION:SETATTR en vez de SETWFATTR. /]
+[// Por que WFACTION:SETATTR y no SETWFATTR: este reporte se abre por URL, fuera de un paso del workflow. Ahi SETWFATTR no escribe (QA 23/10, ver webreports/cancelacion/README.md); REMOVEATTR y luego SETATTR si escriben los atributos de un workflow existente. /]
+[// Solo reescribe si el DocID actual no es un numero y solo en sub-flujos (WORKID distinto de SUBWORKID: el flujo puro usa otro Set Attributes). /]
+[// El nombre del nodo viene del usuario y los tags anidados se expanden antes de leer el tag externo: se le quitan corchetes y comillas dobles antes de ir como parametro. /]
+[// La marca se imprime siempre que el ramo corre, tambien si las guardas omitieron la escritura: la pagina recarga y vuelve a leer los atributos. Igual que en devolver, la marca no prueba que el OTCS haya escrito. /]
+[LL_WEBREPORT_IF "[LL_REPTAG_&ACCION /]" == "recalcular" /]
+[LL_WEBREPORT_IF "[LL_REPTAG_&WORKID /]" != "[LL_REPTAG_&SUBWORKID /]" /]
+[LL_REPTAG_&SUBWORKID WFATTR:"DocID":DISPLAY PATFIND:"%[0-9]+$" SETVAR:docIdValido /]
+[LL_WEBREPORT_IF "[LL_REPTAG_!docIdValido /]" != "TRUE" /]
+[LL_REPTAG_&WORKID WFINFO:ATTACHFOLDER NODEINFO:CHILDREN SETVAR:AttachmentArray /]
+[LL_REPTAG_&WORKID WFINFO:TITLE PATFIND:"documental" SETVAR:esDocumental /]
+[LL_WEBREPORT_IF "[LL_REPTAG_!esDocumental /]" == "TRUE" /]
+[// Documental: el ultimo anexo (sin filtrar SubType) /]
+[LL_REPTAG_"SIN_DOCUMENTO" SETVAR:DOCID /]
+[LL_REPTAG_"Sin documento en los adjuntos" SETVAR:DOCNAME /]
+[LL_WEBREPORT_FOR DATA:[LL_REPTAG_!AttachmentArray /] VAR:"value" /]
+[LL_REPTAG_&WORKID WFINFO:ATTACHFOLDER NODEINFO:CHILDREN RECARRAY:[LL_REPTAG_!value_index /]:DataID SETVAR:DOCID /]
+[LL_REPTAG_&WORKID WFINFO:ATTACHFOLDER NODEINFO:CHILDREN RECARRAY:[LL_REPTAG_!value_index /]:Name SETVAR:DOCNAME /]
+[LL_WEBREPORT_ENDFOR /]
+[LL_WEBREPORT_ELSE /]
+[// Contratacion y demas: el unico anexo SubType 144 con contrato u otrosi en el nombre /]
+[LL_REPTAG_"NINGUNO" SETVAR:docContrato /]
+[LL_REPTAG_"NO" SETVAR:masDeUno /]
+[LL_WEBREPORT_FOR DATA:[LL_REPTAG_!AttachmentArray /] VAR:"value" /]
+[LL_REPTAG_&WORKID WFINFO:ATTACHFOLDER NODEINFO:CHILDREN RECARRAY:[LL_REPTAG_!value_index /]:Name SETVAR:nombreAnexo /]
+[LL_REPTAG_&WORKID WFINFO:ATTACHFOLDER NODEINFO:CHILDREN RECARRAY:[LL_REPTAG_!value_index /]:SubType SETVAR:tipoAnexo /]
+[LL_REPTAG_"FALSE" SETVAR:esContrato /]
+[LL_WEBREPORT_IF "[LL_REPTAG_!tipoAnexo /]" == "144" /]
+[LL_REPTAG_!nombreAnexo PATFIND:"contrato" SETVAR:esContrato /]
+[LL_WEBREPORT_IF "[LL_REPTAG_!esContrato /]" != "TRUE" /]
+[LL_REPTAG_!nombreAnexo PATFIND:"otros[iíÍ]" SETVAR:esContrato /]
+[LL_WEBREPORT_ENDIF /]
+[LL_WEBREPORT_ENDIF /]
+[LL_WEBREPORT_IF "[LL_REPTAG_!esContrato /]" == "TRUE" /]
+[LL_WEBREPORT_IF "[LL_REPTAG_!docContrato /]" == "NINGUNO" /]
+[LL_REPTAG_&WORKID WFINFO:ATTACHFOLDER NODEINFO:CHILDREN RECARRAY:[LL_REPTAG_!value_index /]:DataID SETVAR:docContrato /]
+[LL_REPTAG_!nombreAnexo SETVAR:nombreContrato /]
+[LL_WEBREPORT_ELSE /]
+[LL_REPTAG_"SI" SETVAR:masDeUno /]
+[LL_WEBREPORT_ENDIF /]
+[LL_WEBREPORT_ENDIF /]
+[LL_WEBREPORT_ENDFOR /]
+[LL_REPTAG_"SIN_CONTRATO_UNICO" SETVAR:DOCID /]
+[LL_REPTAG_"Ninguno o mas de un contrato u otrosi en los adjuntos" SETVAR:DOCNAME /]
+[LL_WEBREPORT_IF "[LL_REPTAG_!masDeUno /]" == "NO" /]
+[LL_WEBREPORT_IF "[LL_REPTAG_!docContrato /]" != "NINGUNO" /]
+[LL_REPTAG_!docContrato SETVAR:DOCID /]
+[LL_REPTAG_!nombreContrato SETVAR:DOCNAME /]
+[LL_WEBREPORT_ENDIF /]
+[LL_WEBREPORT_ENDIF /]
+[LL_WEBREPORT_ENDIF /]
+[LL_REPTAG_!DOCNAME REPLACE:"[":"(" REPLACE:"]":")" REPLACE:'"':"'" SETVAR:nombreSeguro /]
+[LL_REPTAG_&SUBWORKID WFACTION:REMOVEATTR:"DocID":ALL /]
+[LL_REPTAG_&SUBWORKID WFACTION:SETATTR:MV:"DocID":1:[LL_REPTAG_!DOCID /] /]
+[LL_REPTAG_&SUBWORKID WFACTION:REMOVEATTR:"Nombre del Documento":ALL /]
+[LL_REPTAG_&SUBWORKID WFACTION:SETATTR:MV:"Nombre del Documento":1:"[LL_REPTAG_!nombreSeguro /]" /]
+[LL_WEBREPORT_ENDIF /]
+[LL_WEBREPORT_ENDIF /]
+RECALCULADO_OK
+[LL_WEBREPORT_ELSE /]
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -350,6 +411,7 @@ DEVUELTO_OK
         <p class="acuerdo" id="acuerdo" hidden></p>
 
         <div class="acciones">
+          <button class="btn" type="button" id="btn-recalcular" hidden></button>
           <button class="btn" type="button" id="btn-reintentar" hidden>Reintentar</button>
           <button class="btn" type="button" id="btn-volver" hidden>Volver a SuccessFactors</button>
         </div>
@@ -400,9 +462,32 @@ DEVUELTO_OK
   const EMAIL_1 = valorEmail(valorDe('dato-email1'));
   const EMAIL_2 = valorEmail(valorDe('dato-email2'));
 
-  /* Marcas que devuelven los ramos reasignar y devolver. Se arman en JS para no aparecer en la pagina normal. */
+  /* Sub-flujo: el WORKID es el flujo padre y el SUBWORKID el sub-flujo. En el flujo puro son iguales. */
+  const esSubflujo = esDigitos(WORKFLOW_ID) && esDigitos(SUBWORKFLOW_ID) && WORKFLOW_ID !== SUBWORKFLOW_ID;
+
+  /* Marcas que devuelven los ramos reasignar, devolver y recalcular. Se arman en JS para no aparecer en la pagina normal. */
   const MARCA_REASIGNADO = 'REASIGNADO' + '_OK';
   const MARCA_DEVUELTO = 'DEVUELTO' + '_OK';
+  const MARCA_RECALCULADO = 'RECALCULADO' + '_OK';
+  /* DocID que escribe el Set Attributes del sub-flujo cuando no hay un unico contrato u otrosi en los anexos. */
+  const SIN_CONTRATO = 'SIN_CONTRATO_UNICO';
+  /* Marca de sessionStorage: la pagina se recargo justo despues de recalcular el DocID. */
+  const CLAVE_RECALCULADO = 'firma-recalculado-' + SUBWORKFLOW_ID;
+  /* Marca de sessionStorage: esta pagina reasigno la tarea al usuario de integracion y aun no hay acuerdo. Sobrevive a una recarga
+     para que un fallo posterior igual pueda devolver la tarea. Valor: JSON { workflowId, subworkflowId, taskId }. */
+  const CLAVE_REASIGNADO = 'firma-reasignado-' + SUBWORKFLOW_ID;
+  /* Si un /start sigue pendiente pasado este tiempo, se avisa en la linea secundaria que puede tardar y que no se recargue. */
+  const ESPERA_AVISO_MS = 15000;
+  const AVISO_LENTO = 'Esto puede tardar unos minutos. No cierre ni recargue la página.';
+  /* START_IN_PROGRESS: otra peticion (p. ej. la de una carga anterior de la pagina) esta creando el acuerdo. Se espera a que termine
+     y se repite /start cada ESPERA_EN_CURSO_MS, hasta TOPE_EN_CURSO_MS en total. */
+  const ESPERA_EN_CURSO_MS = 10000;
+  const TOPE_EN_CURSO_MS = 300000;
+  const TEXTO_EN_CURSO = 'Hay un envío en curso para este flujo. Esperando a que termine...';
+  const DETALLE_EN_CURSO = 'No cierre ni recargue la página.';
+  /* Esperas antes de repetir el 2.o /start tras un fallo ambiguo (una por repeticion). */
+  const ESPERAS_REINTENTO_MS = [5000, 15000];
+  const DETALLE_REINTENTO = 'Reintentando el envío...';
   const MSG_ASIGNAR = 'No fue posible asignar la tarea. Intente de nuevo.';
   const CABECERAS = { 'Content-Type': 'application/json', 'ngrok-skip-browser-warning': 'true' };
   const ORDEN_PASOS = ['envio', 'asignar', 'listo'];
@@ -410,9 +495,13 @@ DEVUELTO_OK
 
   /* Unico estado de la pagina.
      reasignadoSinAcuerdo: ESTA pagina reasigno la tarea al usuario de integracion y todavia no hay acuerdo (sub-flujo).
-     Si el envio falla en ese punto la tarea debe volver al usuario (devolver); se limpia al devolverla o al existir el acuerdo. */
+     Si el envio falla en ese punto la tarea debe volver al usuario (devolver); se limpia al devolverla o al existir el acuerdo.
+     Se cambia solo con marcarReasignado(), que lo guarda en sessionStorage (CLAVE_REASIGNADO) para sobrevivir a una recarga.
+     recalculado: esta carga viene de recalcular el DocID (cambia el texto del error si el DocID sigue sin ser valido).
+     vioEnCurso: en este envio el servidor ya respondio START_IN_PROGRESS (otro /start puede seguir creando el acuerdo). */
   const state = {
-    ocupado: false, paso: 'envio', acuerdoId: null, existente: false, handoff: null, final: null, reasignadoSinAcuerdo: false
+    ocupado: false, paso: 'envio', acuerdoId: null, existente: false, handoff: null, final: null, reasignadoSinAcuerdo: false,
+    recalculado: false, vioEnCurso: false
   };
 
   /* ---------- Utilidades ---------- */
@@ -461,6 +550,41 @@ DEVUELTO_OK
     return err;
   }
 
+  /* Cambia reasignadoSinAcuerdo y su copia en sessionStorage a la vez (con handoff ya cargado al marcar). El almacenamiento puede fallar. */
+  function marcarReasignado(valor) {
+    state.reasignadoSinAcuerdo = valor;
+    try {
+      if (valor) {
+        const h = state.handoff || {};
+        sessionStorage.setItem(CLAVE_REASIGNADO, JSON.stringify({
+          workflowId: String(h.workflowId), subworkflowId: String(h.subworkflowId), taskId: String(h.taskId)
+        }));
+      } else {
+        sessionStorage.removeItem(CLAVE_REASIGNADO);
+      }
+    } catch (_) { /* sin almacenamiento: se pierde la recuperacion tras recargar */ }
+  }
+
+  /* Al cargar: si una carga anterior reasigno la tarea y no llego a haber acuerdo, recupera el estado para poder devolverla si el envio falla.
+     Solo acepta IDs numericos de ESTE flujo; cualquier otra cosa se descarta. */
+  function restaurarReasignado() {
+    try {
+      const crudo = sessionStorage.getItem(CLAVE_REASIGNADO);
+      if (crudo === null) return;
+      let h = null;
+      try {
+        h = JSON.parse(crudo);
+      } catch (_) { /* valor corrupto: se descarta */ }
+      if (h && typeof h === 'object' && [h.workflowId, h.subworkflowId, h.taskId].every(esDigitos) &&
+          h.workflowId === WORKFLOW_ID && h.subworkflowId === SUBWORKFLOW_ID) {
+        state.reasignadoSinAcuerdo = true;
+        state.handoff = { workflowId: h.workflowId, subworkflowId: h.subworkflowId, taskId: h.taskId };
+      } else {
+        sessionStorage.removeItem(CLAVE_REASIGNADO);
+      }
+    } catch (_) { /* sin almacenamiento: queda el comportamiento normal */ }
+  }
+
   /* ---------- Interfaz ---------- */
 
   function setEstado(texto, tipo) {
@@ -494,6 +618,7 @@ DEVUELTO_OK
     mostrarInsignia(null);
     document.getElementById('acuerdo').hidden = true;
     document.getElementById('btn-reintentar').hidden = true;
+    document.getElementById('btn-recalcular').hidden = true;
     document.getElementById('btn-volver').hidden = true;
     setEstado('', '');
   }
@@ -550,7 +675,8 @@ DEVUELTO_OK
   }
 
   /* Los errores de datos no se reintentan: repetir la misma validacion no cambia nada.
-     NOT_PDF y DUPLICATE_OPEN si dejan Reintentar: el usuario puede subir un PDF o cerrar la otra solicitud. */
+     NOT_PDF y DUPLICATE_OPEN si dejan Reintentar: el usuario puede subir un PDF o cerrar la otra solicitud.
+     err.recalculable (DocID no valido en un sub-flujo): muestra el boton que recalcula el DocID, con la etiqueta de err.etiqueta. */
   function mostrarError(err) {
     console.error('[firma]', err);
     if (!err.sinReintento) pintarPaso(state.paso, 'error');
@@ -558,6 +684,13 @@ DEVUELTO_OK
     setEstado(err.message || 'No se pudo completar el envío.', 'error');
     if (err.detalle) mostrarDetalle(err.detalle);
     document.getElementById('btn-reintentar').hidden = Boolean(err.sinReintento);
+    const btnRecalcular = document.getElementById('btn-recalcular');
+    btnRecalcular.hidden = !err.recalculable;
+    if (err.recalculable) {
+      btnRecalcular.textContent = err.etiqueta;
+      btnRecalcular.disabled = false;
+      btnRecalcular.removeAttribute('aria-busy');
+    }
   }
 
   /* ---------- Red ---------- */
@@ -592,16 +725,67 @@ DEVUELTO_OK
     const cabeceras = { ...CABECERAS, Authorization: 'Basic ' + btoa(BASIC_USER + ':' + BASIC_PASS) };
     const r = await postJson(SERVER_URL + '/auth', campos, cabeceras);
     if (!r.ok || !r.data.signature) {
-      throw new Error('No se pudieron obtener las credenciales de autenticación.');
+      const err = new Error('No se pudieron obtener las credenciales de autenticación.');
+      // 5xx (servidor reiniciando, proxy): transitorio, iniciarTrasReasignar lo repite como un fallo de red
+      if (!r.ok && r.status >= 500) err.ambiguo = true;
+      throw err;
     }
     return { timestamp: r.data.timestamp, nonce: r.data.nonce, signature: r.data.signature };
   }
 
-  /* /auth + /start. Devuelve la respuesta de /start tal cual (ok, status, data). */
+  const esperar = (ms) => new Promise((resolver) => setTimeout(resolver, ms));
+
+  /* Oculta la linea secundaria solo si sigue mostrando `texto` (nunca borra un error o exito escrito despues). */
+  function quitarDetalle(texto) {
+    const detalle = document.getElementById('acuerdo');
+    if (!detalle.hidden && detalle.textContent === texto) detalle.hidden = true;
+  }
+
+  /* /auth + /start. Devuelve la respuesta de /start tal cual (ok, status, data).
+     Si /start tarda, avisa en la linea secundaria; al terminar quita el aviso solo si sigue siendo el que se ve (no pisa un error o exito). */
   async function iniciar() {
     const campos = camposEnvio();
     const firma = await obtenerFirma(campos);
-    return postJson(SERVER_URL + '/start', { ...campos, ...firma }, CABECERAS);
+    const temporizador = setTimeout(() => mostrarDetalle(AVISO_LENTO), ESPERA_AVISO_MS);
+    try {
+      return await postJson(SERVER_URL + '/start', { ...campos, ...firma }, CABECERAS);
+    } finally {
+      clearTimeout(temporizador);
+      quitarDetalle(AVISO_LENTO);
+    }
+  }
+
+  /* iniciar() que espera mientras el servidor responde START_IN_PROGRESS (otro /start esta creando el acuerdo): repite /start cada
+     ESPERA_EN_CURSO_MS (cada llamada hace su propio /auth: el nonce es de un solo uso) hasta TOPE_EN_CURSO_MS en total. Pasado el tope
+     devuelve la ultima respuesta y enviar() la trata como siempre (START_IN_PROGRESS nunca devuelve la tarea). */
+  async function iniciarEsperando() {
+    const inicio = Date.now();
+    let esperando = false;
+    try {
+      for (;;) {
+        let r;
+        try {
+          r = await iniciar();
+        } catch (err) {
+          // Tras un START_IN_PROGRESS (en este envio, aun en un reintento anterior) el otro /start puede seguir creando el acuerdo:
+          // un error sin respuesta del servidor no debe devolver la tarea
+          if (state.vioEnCurso && !err.codigo) err.codigo = 'START_IN_PROGRESS';
+          throw err;
+        }
+        const enCurso = !r.ok && r.data.code === 'START_IN_PROGRESS';
+        if (enCurso) state.vioEnCurso = true;
+        if (!enCurso || Date.now() - inicio >= TOPE_EN_CURSO_MS) return r;
+        esperando = true;
+        setEstado(TEXTO_EN_CURSO, '');
+        mostrarDetalle(DETALLE_EN_CURSO);
+        await esperar(ESPERA_EN_CURSO_MS);
+      }
+    } finally {
+      if (esperando) {
+        setEstado(TEXTO_PASO[state.paso], '');
+        quitarDetalle(DETALLE_EN_CURSO);
+      }
+    }
   }
 
   /* URL de un ramo del WebReport (reasignar o devolver) para la tarea del handoff. Solo lleva los IDs de la tarea y la accion:
@@ -654,6 +838,51 @@ DEVUELTO_OK
     }
   }
 
+  /* Pide al ramo recalcular que vuelva a calcular el DocID y el nombre del documento del sub-flujo (misma regla que el Set Attributes).
+     La URL solo lleva los IDs del flujo y la accion. Si responde con la marca, recarga la pagina: al cargar, el DocID nuevo se lee solo
+     y el envio sigue normal. La marca no prueba que el OTCS haya escrito; si el DocID sigue sin ser valido, la recarga lo muestra. */
+  async function recalcular() {
+    if (state.ocupado) return;
+    state.ocupado = true;
+    const btn = document.getElementById('btn-recalcular');
+    const etiqueta = btn.textContent;
+    const fallo = (msg) => Object.assign(new Error(msg), { sinReintento: true, recalculable: true, etiqueta });
+    try {
+      btn.disabled = true;
+      btn.setAttribute('aria-busy', 'true');
+      mostrarInsignia(null);
+      document.getElementById('acuerdo').hidden = true;
+      setEstado('Actualizando el documento...', '');
+      if (![WORKFLOW_ID, SUBWORKFLOW_ID, REPORT_ID].every(esDigitos) || !esSubflujo) throw fallo('Datos de actualización inválidos.');
+      const params = new URLSearchParams({
+        func: 'll',
+        objAction: 'RunReport',
+        objId: REPORT_ID,
+        workid: WORKFLOW_ID,
+        subworkid: SUBWORKFLOW_ID,
+        accion: 'recalcular'
+      });
+      let resp;
+      try {
+        resp = await fetch(OTCS_URL + '?' + params.toString(), { credentials: 'same-origin', cache: 'no-store' });
+      } catch (_) {
+        throw fallo('No se pudo actualizar el documento: sin conexión con OpenText.');
+      }
+      const texto = await resp.text().catch(() => '');
+      if (!resp.ok || !texto.includes(MARCA_RECALCULADO)) {
+        throw fallo('No se pudo actualizar el documento. Verifique su sesión en OpenText y reintente.');
+      }
+      // Los datos se leen al cargar la pagina: recargar es la forma de leer el DocID nuevo. El almacenamiento puede fallar.
+      try {
+        sessionStorage.setItem(CLAVE_RECALCULADO, '1');
+      } catch (_) { /* solo se pierde el texto "Todavía" del siguiente error */ }
+      window.location.reload();
+    } catch (err) {
+      mostrarError(err);
+      state.ocupado = false;
+    }
+  }
+
   /* Un envio fallo con la tarea ya (o posiblemente) en el usuario de integracion y sin acuerdo: intenta devolverla y deja una nota en
      el error. La nota es siempre cautelosa y lleva los IDs de la tarea: la pagina no puede comprobar que la tarea volvio.
      No devuelve si hay acuerdo ni si otra peticion esta creando el acuerdo ahora mismo (START_IN_PROGRESS): la tarea la necesita. */
@@ -664,8 +893,8 @@ DEVUELTO_OK
     setEstado(TEXTO_PASO.devolver, '');
     let nota;
     if (await devolver()) {
-      state.reasignadoSinAcuerdo = false;
-      nota = 'Se intentó devolver la tarea a su bandeja. Si no aparece, contacte al administrador ' + ids + '.';
+      marcarReasignado(false);
+      nota ='Se intentó devolver la tarea a su bandeja. Si no aparece, contacte al administrador ' + ids + '.';
     } else {
       nota = 'Es posible que la tarea haya quedado asignada al usuario de integración ' + ids + '; contacte al administrador.';
     }
@@ -690,25 +919,41 @@ DEVUELTO_OK
     state.final = finalDe(r.data) || state.final;
   }
 
-  /* Resultado ambiguo de /start: el servidor puede haber creado el acuerdo aunque la respuesta no llegue (502/503/504 de un proxy
+  /* Resultado ambiguo de /start: el servidor puede haber creado el acuerdo aunque la respuesta no llegue (500/502/503/504 de un proxy
      o del OTCS, sin `code` en el cuerpo; el error de red se detecta aparte en iniciarTrasReasignar). */
-  const respuestaAmbigua = (r) => !r.ok && [502, 503, 504].includes(r.status) && !r.data.code;
+  const respuestaAmbigua = (r) => !r.ok && [500, 502, 503, 504].includes(r.status) && !r.data.code;
 
-  /* Segundo /auth + /start (ya reasignada la tarea). Si el fallo es ambiguo (sin red, o 502/503/504 sin code) lo repite UNA vez antes
-     de decidir: el servidor es idempotente por flujo y devuelve el acuerdo existente (existing: true), de modo que no se devuelve la
-     tarea cuando el primer intento si llego. START_IN_PROGRESS u otro error en la repeticion los trata enviar() como siempre. */
+  /* /start que envia con la tarea ya reasignada. Si el fallo es ambiguo (sin red, o respuesta de respuestaAmbigua) lo repite hasta 2 veces
+     (esperas de ESPERAS_REINTENTO_MS) antes de decidir: el servidor es idempotente por flujo y devuelve el acuerdo existente
+     (existing: true), de modo que no se devuelve la tarea cuando un intento anterior si llego. Cada intento espera a que termine un
+     START_IN_PROGRESS (iniciarEsperando). Si todos quedan ambiguos devuelve la ultima respuesta (o relanza el ultimo error de red) y
+     enviar() devuelve la tarea. Otros errores (con code) no se reintentan: los trata enviar() como siempre. */
   async function iniciarTrasReasignar() {
-    let r;
-    try {
-      r = await iniciar();
-    } catch (err) {
-      if (!err.sinRed) throw err;
-      return iniciar();
+    for (let i = 0; ; i++) {
+      let r = null;
+      let errAmbiguo = null;
+      try {
+        r = await iniciarEsperando();
+      } catch (err) {
+        // Sin red, o /auth con 5xx (obtenerFirma marca err.ambiguo)
+        if (!err.sinRed && !err.ambiguo) throw err;
+        errAmbiguo = err;
+      }
+      if (!errAmbiguo && !respuestaAmbigua(r)) return r;
+      if (i >= ESPERAS_REINTENTO_MS.length) {
+        if (errAmbiguo) throw errAmbiguo;
+        return r;
+      }
+      mostrarDetalle(DETALLE_REINTENTO);
+      await esperar(ESPERAS_REINTENTO_MS[i]);
+      quitarDetalle(DETALLE_REINTENTO);
     }
-    return respuestaAmbigua(r) ? iniciar() : r;
   }
 
-  /* Envio del acuerdo. Si el servidor exige reasignar antes (sub-flujo), reasigna y repite /start una sola vez.
+  /* Envio del acuerdo. Si el servidor exige reasignar antes (sub-flujo), reasigna y repite /start (iniciarTrasReasignar).
+     Si la pagina se recargo con la tarea ya reasignada y sin acuerdo (restaurarReasignado), el primer /start ya es ese envio posterior:
+     espera/reintenta igual y, si aun responde REASSIGN_REQUIRED, sigue el camino normal de reasignar.
+     "envio" no se pinta hecho hasta que haya acuerdo.
      Orden: acuerdo, luego reasignacion, luego el SendOn (lo hace el servidor). En el sub-flujo el servidor valida antes
      lo que puede (sesión de Adobe, PDF, AttachID, solicitud abierta en otro flujo y solicitud de un envio anterior sin concluir):
      si falla, responde el error y NO pide reasignar.
@@ -719,14 +964,19 @@ DEVUELTO_OK
      se intenta devolverla antes de mostrar el error. Lo mismo vale en un Reintentar posterior (el estado se conserva). */
   async function enviar() {
     try {
-      let r = await iniciar();
+      state.vioEnCurso = false;
+      let r = state.reasignadoSinAcuerdo ? await iniciarTrasReasignar() : await iniciarEsperando();
       if (reasignaRequerido(r) && r.data.handoff) {
         state.handoff = r.data.handoff;
         pasoActivo('asignar');
+        pintarPaso('envio', 'pendiente');
         // Antes de reasignar: si el resultado de reasignar() es ambiguo (la tarea puede haber cambiado de usuario), el error
         // igual intenta devolverla (devolver a uno mismo no hace nada)
-        state.reasignadoSinAcuerdo = true;
+        marcarReasignado(true);
         await reasignar();
+        // Tarea reasignada: el 2.o /start es el envio; si falla, el error debe pintar el paso "envio"
+        pasoActivo('envio');
+        pintarPaso('asignar', 'hecho');
         r = await iniciarTrasReasignar();
         if (reasignaRequerido(r)) throw new Error(MSG_ASIGNAR);
       }
@@ -735,7 +985,7 @@ DEVUELTO_OK
       state.existente = r.data.existing === true;
       state.handoff = r.data.handoff || null;
       state.final = finalDe(r.data);
-      if (state.acuerdoId) state.reasignadoSinAcuerdo = false;
+      if (state.acuerdoId) marcarReasignado(false);
     } catch (err) {
       await devolverSiCorresponde(err);
       throw err;
@@ -744,7 +994,24 @@ DEVUELTO_OK
 
   function validarDatos() {
     const fallo = (msg) => Object.assign(new Error(msg), { sinReintento: true });
-    if (!esDigitos(NODE_ID)) throw fallo('El ID del documento (DocID) no es válido.');
+    if (!esDigitos(NODE_ID)) {
+      // En el flujo puro no hay boton: el DocID no lo calcula el Set Attributes del sub-flujo
+      if (!esSubflujo) throw fallo('El ID del documento (DocID) no es válido.');
+      // Sub-flujo: el usuario puede adjuntar el documento y pedir que se recalcule el DocID (ramo recalcular).
+      // Tras recalcular y seguir sin DocID valido, el texto avisa que todavia no hay documento
+      const contrato = NODE_ID === SIN_CONTRATO;
+      const aun = state.recalculado;
+      const err = fallo(contrato
+        ? (aun ? 'Todavía no hay un único contrato u otrosí en los adjuntos del flujo.' : 'No hay un único contrato u otrosí en los adjuntos del flujo.')
+        : (aun ? 'Todavía no hay un documento en los adjuntos del flujo.' : 'El ID del documento (DocID) no es válido.'));
+      err.recalculable = true;
+      err.etiqueta = contrato ? 'Contrato adjuntado' : 'Documento adjuntado';
+      err.detalle = contrato
+        ? 'Adjunte el contrato u otrosí (solo uno) y pulse «Contrato adjuntado».' +
+          (aun ? ' Revise que el nombre incluya "contrato" u "otrosí" y que no haya otro igual.' : '')
+        : 'Adjunte el documento al flujo y pulse «Documento adjuntado».';
+      throw err;
+    }
     if (!esDigitos(ATTACH_ID)) throw fallo('El ID de la carpeta de anexos (AttachID) no es válido.');
     if (!EMAIL_1) throw fallo('El correo del Firmante 1 no es válido.');
   }
@@ -774,16 +1041,24 @@ DEVUELTO_OK
   }
 
   document.getElementById('btn-reintentar').addEventListener('click', ejecutar);
+  document.getElementById('btn-recalcular').addEventListener('click', recalcular);
   document.getElementById('btn-volver').addEventListener('click', () => {
     window.location.href = RETURN_URL;
   });
   window.addEventListener('load', () => {
     pintarDatos();
+    // La marca se consume en esta carga: un F5 posterior ya no la ve
+    try {
+      state.recalculado = sessionStorage.getItem(CLAVE_RECALCULADO) !== null;
+      sessionStorage.removeItem(CLAVE_RECALCULADO);
+    } catch (_) { /* sin almacenamiento: queda el texto normal */ }
+    restaurarReasignado();
     ejecutar();
   });
 })();
 </script>
 </body>
 </html>
+[LL_WEBREPORT_ENDIF /]
 [LL_WEBREPORT_ENDIF /]
 [LL_WEBREPORT_ENDIF /]

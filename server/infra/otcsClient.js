@@ -54,7 +54,17 @@ function createOtcsClient({
     return rsp.data; // Buffer com o PDF
   });
 
-  const deliveryMarker = (agreementId) => agreementId ? `Adobe Sign: ${agreementId}` : '';
+  const MARKER_PREFIX = 'Adobe Sign: ';
+  const deliveryMarker = (agreementId) => agreementId ? `${MARKER_PREFIX}${agreementId}` : '';
+  // Versão gravada por esta integração (para outro acordo, no mesmo DocID, em um ciclo anterior)
+  const hasOurMarker = (v) => typeof v?.description === 'string' && v.description.startsWith(MARKER_PREFIX);
+
+  // Versão mais recente: maior version_number (inteiro, na spec do OTCS); sem ele, o último item da lista
+  const latestVersion = (list) => {
+    const numbered = list.filter((v) => Number.isFinite(v?.version_number));
+    if (!numbered.length) return list[list.length - 1] ?? null;
+    return numbered.reduce((best, v) => (v.version_number > best.version_number ? v : best));
+  };
 
   // O marcador remoto fecha a janela entre o OTCS aplicar a escrita e o SQLite confirmar pdfDelivered.
   // Lista todas as versões (v1, sem paginação), pois outra versão pode ter sido adicionada durante o retry.
@@ -66,6 +76,12 @@ function createOtcsClient({
       if (!Array.isArray(versions.data?.data)) throw new Error('Respuesta inválida al consultar las versiones del documento');
       const delivered = versions.data.data.find((v) => v.description === marker);
       if (delivered) return delivered;
+      // PDF assinado já enviado à mão (operador ou integrador antigo, sem o marcador): se a versão mais recente tem o mesmo
+      // tamanho, é o mesmo arquivo e não se grava outra. Sem file_size numérico segue para o POST, como antes.
+      // Versão com o marcador de OUTRO acordo (entrega nossa de um ciclo anterior no mesmo DocID) não é envio manual:
+      // o tamanho igual não prova que seja o PDF deste acordo, então segue para o POST
+      const latest = latestVersion(versions.data.data);
+      if (latest && !hasOurMarker(latest) && Number.isFinite(latest.file_size) && latest.file_size === buffer.length) return latest;
     }
     const fd = new FormData();
     fd.append('file', buffer, { filename: fileName, contentType: 'application/pdf' });

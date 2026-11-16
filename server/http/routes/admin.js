@@ -5,8 +5,36 @@ const express = require('express');
 const { describeError } = require('../../infra/util');
 const { AdoptError } = require('../../services/reconciliationService');
 const { ServiceError } = require('../../services/signatureService');
+const { KINDS } = require('../../domain/eventPolicy');
+const { STATES } = require('../../domain/agreementState');
 
 const OAUTH_STATE_TTL_MS = 10 * 60 * 1000;
+
+// Visões operacionais de GET /admin/agreements?view= (campos do registro: finalKind, sendonDone, attempts, state)
+const AGREEMENT_VIEWS = {
+  // Resultado final OK do Adobe, mas a disposição ainda não foi enviada ao fluxo
+  signed_not_concluded: (rec) => rec.finalKind === KINDS.FINAL_OK && !rec.sendonDone,
+  // Em reenvio automático (com tentativas), ainda não concluído e fora de needs_attention
+  retrying: (rec) => (rec.attempts || 0) > 0 && rec.state !== STATES.NEEDS_ATTENTION && !rec.sendonDone,
+  // Precisa de intervenção: needs_attention (o tipo está em attentionKind)
+  terminal: (rec) => rec.state === STATES.NEEDS_ATTENTION
+};
+
+// Resumo de todos os acordos: contagem de cada visão e dos needs_attention por tipo (sem attentionKind: 'unspecified')
+function summarizeAgreements(records) {
+  const byAttentionKind = {};
+  const summary = { signedNotConcluded: 0, retrying: 0, terminal: { total: 0, byAttentionKind } };
+  for (const rec of records) {
+    if (AGREEMENT_VIEWS.signed_not_concluded(rec)) summary.signedNotConcluded++;
+    if (AGREEMENT_VIEWS.retrying(rec)) summary.retrying++;
+    if (AGREEMENT_VIEWS.terminal(rec)) {
+      summary.terminal.total++;
+      const kind = rec.attentionKind || 'unspecified';
+      byAttentionKind[kind] = (byAttentionKind[kind] || 0) + 1;
+    }
+  }
+  return summary;
+}
 
 function adminRoutes({
   config, logger, repo, reconciliation, tokenStore, basicAuth, cancellationService = null, now = () => Date.now()
@@ -54,13 +82,22 @@ function adminRoutes({
     }
   });
 
-  // Estado de todos os acordos (?state=needs_attention filtra; ?events=N inclui os últimos N eventos)
+  /*
+    Estado de todos os acordos (?state=needs_attention filtra; ?view=<visão> filtra por signed_not_concluded, retrying ou terminal;
+    ?events=N inclui os últimos N eventos). `summary` conta as visões sobre TODOS os acordos, inclusive com os filtros.
+  */
   router.get('/admin/agreements', basicAuth, (req, res) => {
     const state = req.query.state ? String(req.query.state) : null;
+    const view = req.query.view ? String(req.query.view) : null;
+    if (view && !Object.hasOwn(AGREEMENT_VIEWS, view)) {
+      return res.status(400).json({ error: 'Unknown view.', views: Object.keys(AGREEMENT_VIEWS) });
+    }
     const nEvents = Math.min(parseInt(req.query.events, 10) || 0, 50);
-    const agreements = repo.list(state ? { state } : undefined).map((rec) =>
-      (nEvents ? { ...rec, events: repo.listEvents(rec.id, nEvents) } : rec));
-    res.json({ counts: repo.countByState(), total: agreements.length, agreements });
+    const all = repo.list(); // uma leitura: o resumo e a lista filtrada saem dos mesmos registros
+    const agreements = all
+      .filter((rec) => (!state || rec.state === state) && (!view || AGREEMENT_VIEWS[view](rec)))
+      .map((rec) => (nEvents ? { ...rec, events: repo.listEvents(rec.id, nEvents) } : rec));
+    res.json({ counts: repo.countByState(), total: agreements.length, summary: summarizeAgreements(all), agreements });
   });
 
   /*

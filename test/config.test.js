@@ -10,7 +10,6 @@ const cfg = (env) => computeConfig(env, { projectRoot: ROOT });
 test('storage: DATA_DIR explícito vence sempre', () => {
   for (const env of [
     { DATA_DIR: '/data' },
-    { DATA_DIR: '/data', RENDER: 'true' },
     { DATA_DIR: '/data', NODE_ENV: 'production', KUBERNETES_SERVICE_HOST: '10.0.0.1', REQUIRE_PERSISTENT_STORAGE: 'true' }
   ]) {
     const c = cfg(env);
@@ -83,8 +82,34 @@ test('storage: OpenShift sem DATA_DIR + REQUIRE_PERSISTENT_STORAGE=true falha na
 });
 
 test('storage: REQUIRE_PERSISTENT_STORAGE=true também recusa /tmp efêmero', () => {
-  const c = cfg({ RENDER: 'true', REQUIRE_PERSISTENT_STORAGE: 'true' });
+  const c = cfg({ NODE_ENV: 'production', REQUIRE_PERSISTENT_STORAGE: 'true' });
   assert.equal(c.storage.fatal, true);
+});
+
+test('flag RENDER: ignora DATA_DIR/REQUIRE_PERSISTENT_STORAGE do OpenShift e usa RENDER_DATA_DIR ou /tmp', () => {
+  const os = { DATA_DIR: '/data', REQUIRE_PERSISTENT_STORAGE: 'true', KUBERNETES_SERVICE_HOST: '10.0.0.1' };
+  const r = cfg({ ...os, RENDER: 'true' });
+  assert.equal(r.platform.target, 'render');
+  assert.equal(r.dataDir, TMP_DATA_DIR);
+  assert.equal(r.storage.problem, null);
+  assert.equal(r.storage.fatal, false);
+  const d = cfg({ ...os, RENDER: 'true', RENDER_DATA_DIR: '/var/data' });
+  assert.equal(d.dataDir, path.resolve('/var/data'));
+  assert.equal(d.storage.source, 'RENDER_DATA_DIR');
+  assert.equal(d.storage.ephemeral, false);
+  const o = cfg({ ...os, RENDER: 'false' });
+  assert.equal(o.platform.target, 'openshift');
+  assert.equal(o.dataDir, path.resolve('/data'));
+  assert.equal(cfg({}).platform.target, 'openshift');
+});
+
+test('keepalive: RENDER_EXTERNAL_URL como alvo e intervalo limitado a 14 min', () => {
+  const c = cfg({ RENDER: 'true', RENDER_EXTERNAL_URL: 'https://x.onrender.com/', KEEPALIVE_INTERVAL_MS: '3600000' });
+  assert.equal(shouldKeepalive(c), true);
+  assert.equal(c.keepaliveUrl, 'https://x.onrender.com');
+  assert.equal(c.keepaliveMs, 14 * 60 * 1000);
+  assert.equal(cfg({ RENDER: 'true', PUBLIC_URL: 'https://a', RENDER_EXTERNAL_URL: 'https://b' }).keepaliveUrl, 'https://a');
+  assert.equal(shouldKeepalive(cfg({ RENDER: 'false', PUBLIC_URL: 'https://a' })), false);
 });
 
 test('storage: efêmero sem erro só gera warn', () => {

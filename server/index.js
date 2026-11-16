@@ -53,19 +53,20 @@ function start() {
       `Server started successfully\n` +
       `  → Local:  http://localhost:${config.port}\n` +
       `  → Public: ${config.publicUrl}\n` +
-      `  → Data:   ${config.dataDir}\n\n`
+      `  → Data:   ${config.dataDir}\n` +
+      `  → Target: ${config.platform.target}${shouldKeepalive(config) ? ` (keepalive cada ${Math.round(config.keepaliveMs / 1000)} s)` : ''}\n\n`
     );
   });
   poller.start();
 
   /*
     Keepalive / self-ping (Render): evita que o serviço hiberne.
-    Só no Render (RENDER=true); KEEPALIVE_INTERVAL_MS=0 desativa.
+    Só com a flag RENDER=true; KEEPALIVE_INTERVAL_MS=0 desativa.
   */
   let keepalive = null;
   if (shouldKeepalive(config)) {
     keepalive = setInterval(() => {
-      axios.get(`${config.publicUrl}/health`, { timeout: 15000 })
+      axios.get(`${config.keepaliveUrl}/health`, { timeout: 15000 })
         .then(() => console.log('[KEEPALIVE] Internal ping OK'))
         .catch((err) => console.log(`[KEEPALIVE] Internal ping failed: ${err.message}`));
     }, config.keepaliveMs);

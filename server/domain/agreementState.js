@@ -49,7 +49,8 @@ function finalPatch(rec, kind, { nowIso, adobeStatus } = {}) {
     finalAt: rec.finalKind === kind && rec.finalAt ? rec.finalAt : nowIso,
     attentionReason: null,
     attentionKind: null,
-    ...(rec.state === STATES.NEEDS_ATTENTION ? { attempts: 0, nextAttemptAt: null } : {}),
+    // Novo evento/resultado final tira de needs_attention: rodada nova (tentativas e reaberturas automáticas zeradas)
+    ...(rec.state === STATES.NEEDS_ATTENTION ? { attempts: 0, nextAttemptAt: null, reopenCount: 0 } : {}),
     state: kind === KINDS.FINAL_OK && rec.pdfDelivered ? STATES.PDF_DELIVERED : plan.openState
   };
   if (adobeStatus) patch.adobeStatus = adobeStatus;
@@ -74,7 +75,9 @@ const attentionPatch = (reason, kind = ATTENTION_KINDS.PERMANENT) => ({
 
 // Reabre um needs_attention (reconcile manual / reabertura automática): volta ao estado "aberto" e zera as tentativas.
 // Sem resultado final (falha na etapa start) volta a pending.
-function reopenPatch(rec) {
+// auto=true (reopenStale): conta uma reabertura automática (reopenCount), que ATTENTION_MAX_REOPENS limita para um erro
+// permanente disfarçado de transitório (ACL 403, attachId inválido) não ciclar para sempre. Manual: zera o contador.
+function reopenPatch(rec, { auto = false } = {}) {
   const plan = planFor(rec.finalKind);
   return {
     state: !plan
@@ -83,7 +86,8 @@ function reopenPatch(rec) {
     attentionReason: null,
     attentionKind: null,
     attempts: 0,
-    nextAttemptAt: null
+    nextAttemptAt: null,
+    reopenCount: auto ? (rec.reopenCount || 0) + 1 : 0
   };
 }
 
@@ -160,13 +164,59 @@ const isPermanentHttpError = (err) => {
   return status >= 400 && status <= 499 && ![401, 408, 429].includes(status);
 };
 
+// IMF-fixdate (RFC 9110), ex.: "Wed, 21 Oct 2026 07:28:00 GMT". Estrito de propósito: o Date.parse do V8 aceita lixo
+// ("foo 1" vira uma data) e um Retry-After inválido tem de ser ignorado.
+const HTTP_DATE_RE = /^[A-Za-z]{3}, \d{1,2} [A-Za-z]{3} \d{4} \d{2}:\d{2}:\d{2} (GMT|UTC)$/;
+
+// Valor de um header sem diferenciar caixa (axios entrega AxiosHeaders, com get(), ou um objeto simples)
+function headerValue(headers, name) {
+  if (!headers || typeof headers !== 'object') return undefined;
+  if (typeof headers.get === 'function') {
+    try {
+      const v = headers.get(name);
+      if (v !== undefined && v !== null) return v;
+    } catch { /* cai na busca pelas chaves */ }
+  }
+  for (const key of Object.keys(headers)) if (key.toLowerCase() === name) return headers[key];
+  return undefined;
+}
+
+/*
+  Retry-After de uma resposta 429 ou 503 (delta-seconds ou HTTP-date) em ms a partir de `nowMs`; null se o erro é de outro
+  status, o header não existe, é inválido, ou já passou (<= 0). O limite superior fica por conta de failurePatch (backoff.maxMs).
+*/
+function retryAfterMs(err, nowMs = Date.now()) {
+  if (![429, 503].includes(err?.response?.status)) return null;
+  let raw = headerValue(err.response.headers, 'retry-after');
+  if (Array.isArray(raw)) raw = raw[0];
+  raw = String(raw ?? '').trim();
+  if (!raw) return null;
+  if (/^\d+$/.test(raw)) {
+    const seconds = Number(raw);
+    return seconds > 0 ? seconds * 1000 : null;
+  }
+  if (!HTTP_DATE_RE.test(raw)) return null;
+  const at = Date.parse(raw);
+  if (!Number.isFinite(at)) return null;
+  const ms = at - nowMs;
+  return ms > 0 ? ms : null;
+}
+
+const DEFAULT_BACKOFF_MAX_MS = 60 * 60 * 1000;
+
 /*
   `attention` vem preenchido (motivo) quando não vale mais retentar: erro permanente ou
   `backoff.maxAttempts` atingido (0/ausente = sem limite).
+  retryAfterMs (ver retryAfterMs): o atraso é max(backoff normal, Retry-After), limitado a backoff.maxMs.
+  maxReopens (ATTENTION_MAX_REOPENS; 0/ausente = sem limite): se o acordo já esgotou as reaberturas automáticas, o motivo da
+  atenção avisa que não será mais reaberto sozinho.
 */
-function failurePatch(rec, stage, message, nowMs, backoff, { permanent = false } = {}) {
+function failurePatch(rec, stage, message, nowMs, backoff, { permanent = false, retryAfterMs: retryAfter = null, maxReopens = 0 } = {}) {
   const attempts = (rec.attempts || 0) + 1;
-  const delayMs = backoffDelay(attempts, backoff);
+  let delayMs = backoffDelay(attempts, backoff);
+  if (retryAfter > 0) {
+    delayMs = Math.max(delayMs, Math.min(retryAfter, backoff?.maxMs || DEFAULT_BACKOFF_MAX_MS));
+  }
   const max = backoff?.maxAttempts || 0;
   let attention = null;
   let attentionKind = null;
@@ -176,6 +226,10 @@ function failurePatch(rec, stage, message, nowMs, backoff, { permanent = false }
   } else if (max > 0 && attempts >= max) {
     attention = `reintentos agotados en ${stage} (${attempts}/${max}): ${message}`;
     attentionKind = ATTENTION_KINDS.RETRIES_EXHAUSTED;
+    const reopens = rec.reopenCount || 0;
+    if (maxReopens > 0 && reopens >= maxReopens) {
+      attention += ` — no se reabrirá automáticamente (${reopens} reaperturas); requiere intervención manual`;
+    }
   }
   return {
     delayMs,
@@ -262,6 +316,6 @@ function shouldPoll(rec, nowMs, maxAgeDays = 0) {
 
 module.exports = {
   STATES, ATTENTION_KINDS, FINAL_PLANS, planFor, dispositionFor, finalPatch, attentionPatch, reopenPatch,
-  pdfDeliveredPatch, completedPatch, cancelRequestedPatch, startDonePatch, backoffDelay, isPermanentHttpError, failurePatch,
+  pdfDeliveredPatch, completedPatch, cancelRequestedPatch, startDonePatch, backoffDelay, isPermanentHttpError, retryAfterMs, failurePatch,
   isStartPending, hasPendingWork, isDue, isRetryable, shouldPoll, isOpenAgreement, finalNotice
 };

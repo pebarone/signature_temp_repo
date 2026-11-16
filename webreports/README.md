@@ -126,10 +126,17 @@ roda quando a página o pede. A ordem nas páginas de envio é:
    asignada al usuario de integración (flujo X, subflujo Y, tarea Z); contacte al administrador." quando o pedido falhou ou veio sem
    a marca. Durante o pedido o texto de estado é "Devolviendo la tarea...".
    O flag `reasignadoSinAcuerdo` é ligado **antes** de `reasignar()` (se o resultado dela for ambíguo, a tarefa pode ter mudado de
-   usuário; devolver a quem já a tem não faz nada). Se o segundo `/start` falhar de forma **ambígua** (erro de rede, ou HTTP
-   502/503/504 sem `code` no corpo), a página repete `/auth` + `/start` **uma vez** antes de decidir: se der certo, o acordo
-   existia (`existing: true`) e segue o caminho de sucesso, sem devolver; `START_IN_PROGRESS` não devolve; qualquer outro resultado
-   devolve como antes.
+   usuário; devolver a quem já a tem não faz nada). Se o segundo `/start` falhar de forma **ambígua** (erro de rede, `/auth` com
+   5xx, ou HTTP 500/502/503/504 sem `code` no corpo), a página repete `/auth` + `/start` **até duas vezes** (esperas de 5 s e 15 s)
+   antes de decidir: se der certo, segue o caminho de sucesso (`existing: true`, ou o acordo que o Adobe criou sem resposta, que o
+   servidor reaproveita pelo `externalId`), sem devolver; qualquer outro resultado devolve como antes.
+   **`START_IN_PROGRESS`** (outra requisição, por exemplo a de antes de uma recarga, ainda está criando o acordo): a página mostra
+   "Hay un envío en curso para este flujo. Esperando a que termine..." e repete `/auth` + `/start` a cada 10 s, por até 5 min.
+   Quando a outra termina, recebe o acordo dela (`existing`) ou cria o acordo (a tarefa já está no usuário de integração). Depois
+   de um `START_IN_PROGRESS`, um erro sem resposta do servidor também não devolve.
+   **Recarga:** o flag fica no `sessionStorage` (`firma-reasignado-<subworkid>`, com os IDs da tarefa; só vale se os IDs forem os
+   do fluxo da página). Ao recarregar com ele, o primeiro `/start` já é o envio posterior à reatribuição (mesmas esperas e
+   repetições). O passo "Enviando a Adobe Sign" só fica verde com o acordo criado.
    Não devolve se já existe acordo (`state.acuerdoId`; no fluxo puro o acordo nasce **antes** da reatribuição) nem quando o erro é
    `START_IN_PROGRESS` (outra requisição está criando o acordo agora). O estado `reasignadoSinAcuerdo` persiste: num Reintentar
    posterior, se o envio falhar de novo com o flag ainda ligado (devolução anterior falhou), tenta devolver outra vez.

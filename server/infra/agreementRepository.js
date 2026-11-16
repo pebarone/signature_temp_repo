@@ -1,7 +1,7 @@
 // infra/agreementRepository.js
 // Repositório de acordos/eventos sobre SQLite (better-sqlite3, síncrono).
 // Interface usada pelos services: get, has, upsert, list, listPending, listPollable, listAttentionToReopen, recordEvent,
-// listEvents, findOpenRecent, findOpenByWorkflow, findLatestByWorkflow, listByWorkflow (cancelamento), consumeNonce (nonces do /start), countByState,
+// listEvents, hasEventFrom, findOpenRecent, findOpenByWorkflow, findLatestByWorkflow, listByWorkflow (cancelamento), consumeNonce (nonces do /start), countByState,
 // transaction.
 
 // [chave JS, coluna SQL, tipo]
@@ -40,6 +40,7 @@ const COLUMNS = [
   ['wfAttrsFingerprint', 'wf_attrs_fingerprint', 'text'],
   ['adopted', 'adopted', 'bool'],
   ['cancelPendingAt', 'cancel_pending_at', 'text'],
+  ['reopenCount', 'reopen_count', 'int'],
   ['cancelRequestedAt', 'cancel_requested_at', 'text'],
   ['cancelSource', 'cancel_source', 'text'],
   ['workflowStopPending', 'workflow_stop_pending', 'bool'],
@@ -99,11 +100,15 @@ function createAgreementRepository(db, { now = () => new Date(), maxEvents = 50 
          OR (start_sendon_done = 0 AND sendon_done = 0 AND COALESCE(workflow_id, '') != '')
        ) ORDER BY created_at, id`
     ),
-    // needs_attention por tentativas esgotadas, com a última falha anterior ao corte (reabertura automática)
+    // needs_attention por tentativas esgotadas, com a última falha anterior ao corte (reabertura automática).
+    // @max > 0: só os que ainda não atingiram o limite de reaberturas automáticas (ATTENTION_MAX_REOPENS); 0 = sem limite
     listAttentionToReopen: db.prepare(
       `SELECT * FROM agreements WHERE state = 'needs_attention' AND attention_kind = 'retries_exhausted'
-         AND sendon_done = 0 AND last_error_at IS NOT NULL AND last_error_at < ? ORDER BY created_at, id`
+         AND sendon_done = 0 AND last_error_at IS NOT NULL AND last_error_at < @cutoff
+         AND (@max <= 0 OR reopen_count < @max) ORDER BY created_at, id`
     ),
+    // Algum evento do acordo vindo desta origem ('webhook', 'poll', 'verify', 'cancel')?
+    hasEventFrom: db.prepare('SELECT 1 FROM agreement_events WHERE agreement_id = ? AND source = ? LIMIT 1'),
     listPollable: db.prepare(
       `SELECT * FROM agreements WHERE final_kind IS NULL AND sendon_done = 0 AND state != 'needs_attention'
        ORDER BY created_at, id`
@@ -151,7 +156,8 @@ function createAgreementRepository(db, { now = () => new Date(), maxEvents = 50 
     id = String(id);
     const existing = get(id);
     const merged = existing || {
-      id, emails: [], state: 'pending', pdfDelivered: false, sendonDone: false, attempts: 0, startSendonDone: true
+      id, emails: [], state: 'pending', pdfDelivered: false, sendonDone: false, attempts: 0, startSendonDone: true,
+      reopenCount: 0
     };
     for (const [k, v] of Object.entries(patch || {})) {
       if (KEYS.has(k) && v !== undefined) merged[k] = v;
@@ -201,13 +207,17 @@ function createAgreementRepository(db, { now = () => new Date(), maxEvents = 50 
     // Com resultado final e trabalho pendente (runQueue) / ainda sem resultado final (polling); sem needs_attention
     listPending: () => stmts.listPending.all().map(rowToRecord),
     listPollable: () => stmts.listPollable.all().map(rowToRecord),
-    listAttentionToReopen: (cutoffIso) => stmts.listAttentionToReopen.all(String(cutoffIso)).map(rowToRecord),
+    listAttentionToReopen: (cutoffIso, maxReopens = 0) =>
+      stmts.listAttentionToReopen.all({ cutoff: String(cutoffIso), max: Number(maxReopens) || 0 }).map(rowToRecord),
 
     /*
       Registra o evento (dedupe por notification_id) e, se não for duplicado, aplica o patch
       de estado na mesma transação. Retorna null se o acordo não existe.
     */
     recordEvent: (id, ev, patch) => recordEventTx(id, ev, patch),
+
+    // Consulta barata (sem carregar os eventos): o acordo recebeu algum evento desta origem?
+    hasEventFrom: (id, source) => !!stmts.hasEventFrom.get(String(id), String(source)),
 
     listEvents(id, limit = maxEvents) {
       return stmts.events.all(String(id), limit).map((r) => ({

@@ -6,7 +6,7 @@ $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
 $Ns = "orquestrador-firmas"
 $Domain = "legible-chipmunk-only.ngrok-free.app"
-$ClusterScript = Join-Path $env:USERPROFILE "Desktop\openshift\scripts\03-start.ps1"
+$ClusterScript = Join-Path $env:USERPROFILE "Desktop\repos\pessoais\openshift\scripts\03-start.ps1"
 
 Write-Host "== 1. cluster =="
 & $ClusterScript

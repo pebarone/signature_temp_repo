@@ -61,6 +61,20 @@ function createAdobeClient({
     return rsp.data;
   }
 
+  /*
+    Acordos do usuário com exatamente este externalId (GET /agreements?externalId=): o /start usa para reaproveitar um acordo
+    criado por uma tentativa anterior cuja resposta se perdeu. A lista NÃO traz o externalId dos itens (só id, status,
+    displayDate, name...): quem usa deve conferir com getAgreement(id). Devolve [] se não houver nenhum.
+  */
+  async function findAgreementsByExternalId(externalId) {
+    const rsp = await http.get(`${rest}/agreements`, {
+      params: { externalId, pageSize: 20 },
+      headers: await authHeaders(),
+      timeout: timeoutMs
+    });
+    return Array.isArray(rsp.data?.userAgreementList) ? rsp.data.userAgreementList : [];
+  }
+
   // Histórico do acordo (distingue recusa de cancelamento quando o status é CANCELLED)
   async function getAgreementEvents(id) {
     const rsp = await http.get(`${rest}/agreements/${encodeURIComponent(id)}/events`, {
@@ -122,7 +136,7 @@ function createAdobeClient({
   const checkAuth = () => ensureToken();
 
   return {
-    createTransientDocument, createAgreement, getAgreement, getAgreementEvents, cancelAgreement, downloadCombinedDocument,
+    createTransientDocument, createAgreement, getAgreement, findAgreementsByExternalId, getAgreementEvents, cancelAgreement, downloadCombinedDocument,
     checkAuth
   };
 }

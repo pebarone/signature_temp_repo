@@ -6,45 +6,58 @@
 // Adobe (ou demorou demais), para o Adobe reenviar o evento: com o 200 ele não reenviaria e o evento se perderia.
 const express = require('express');
 const { parseWebhookPayload } = require('../../domain/eventPolicy');
-const { describeError, oneLine } = require('../../infra/util');
+const { describeError, oneLine, maskEmail } = require('../../infra/util');
 
 // Só caracteres seguros num header (evita injeção de cabeçalho/log); o ClientId do Adobe é alfanumérico
 const CLIENT_ID_RE = /^[A-Za-z0-9._-]{1,200}$/;
-// Espera máxima pela adoção de um acordo desconhecido antes de responder (o Adobe tem timeout próprio no webhook).
+// Espera máxima pela adoção de um acordo desconhecido antes de responder. O Adobe dá 5 s para a resposta e entrega as
+// notificações do webhook uma de cada vez: uma resposta lenta segura a fila inteira. 3 s deixam folga para a rede.
 // Sobrescrevível por config.webhookAdoptionWaitMs (testes).
-const ADOPTION_WAIT_MS = 8000;
+const ADOPTION_WAIT_MS = 3000;
 const ADOPTION_TRANSIENT = 'transient';
+
+const rawClientId = (req) => req.headers['x-adobesign-clientid'] || req.headers['x-adobesign-client-id'];
+// Valor recebido, se tiver formato válido
+const sentClientId = (req) => {
+  const v = rawClientId(req);
+  return typeof v === 'string' && CLIENT_ID_RE.test(v) ? v : null;
+};
+
+// Adobe exige que a resposta ecoe o MESMO valor recebido no X-AdobeSign-ClientId. Sem header (ou inválido),
+// devolvemos o CLIENT_ID configurado
+function echoClientId(config, req, res) {
+  const cid = sentClientId(req) || config.clientId;
+  if (cid) res.setHeader('X-AdobeSign-ClientId', cid);
+}
+
+/*
+  Middleware do eco, montado em app.js ANTES do express.json: um POST com JSON inválido ou acima do limite cai no handler de
+  erros (400/413) sem passar pela rota, e sem este middleware essa resposta sairia sem o header que o Adobe exige.
+*/
+function webhookEchoClientId(config) {
+  return (req, res, next) => {
+    echoClientId(config, req, res);
+    next();
+  };
+}
 
 function webhookRoutes({ config, logger, reconciliation }) {
   const router = express.Router();
 
-  const rawClientId = (req) => req.headers['x-adobesign-clientid'] || req.headers['x-adobesign-client-id'];
-  // Valor recebido, se tiver formato válido
-  const sentClientId = (req) => {
-    const v = rawClientId(req);
-    return typeof v === 'string' && CLIENT_ID_RE.test(v) ? v : null;
-  };
   // Conjunto aceito: CLIENT_ID da integração + WEBHOOK_CLIENT_IDS (o webhook criado pela UI do Adobe envia o ClientId
   // do aplicativo que o criou, que não é o CLIENT_ID OAuth daqui)
   const acceptedIds = () => new Set([config.clientId, ...(config.webhookClientIds || [])].filter(Boolean));
 
-  // Adobe exige que a resposta ecoe o MESMO valor recebido no X-AdobeSign-ClientId. Sem header (ou inválido),
-  // devolvemos o CLIENT_ID configurado
-  const echoClientId = (req, res) => {
-    const cid = sentClientId(req) || config.clientId;
-    if (cid) res.setHeader('X-AdobeSign-ClientId', cid);
-  };
-
   // HEAD: validação do webhook (nunca devolve corpo)
   router.head('/webhook', (req, res) => {
-    echoClientId(req, res);
+    echoClientId(config, req, res);
     res.setHeader('Content-Type', 'application/json');
     res.status(200).end();
   });
 
   // GET: challenge/handshake
   router.get('/webhook', (req, res) => {
-    echoClientId(req, res);
+    echoClientId(config, req, res);
     if (req.query.challenge) {
       res.setHeader('Content-Type', 'text/plain');
       return res.status(200).send(`${req.query.challenge}`);
@@ -54,7 +67,7 @@ function webhookRoutes({ config, logger, reconciliation }) {
 
   // POST: eventos (assinatura concluída, rejeitada, etc.)
   router.post('/webhook', async (req, res) => {
-    echoClientId(req, res);
+    echoClientId(config, req, res);
 
     // Autenticidade (best effort: o ClientId não é segredo). Com WEBHOOK_REQUIRE_CLIENT_ID=true header
     // ausente ou fora do conjunto aceito é recusado antes de persistir; sem nenhum ID configurado não há com o que comparar
@@ -80,7 +93,7 @@ function webhookRoutes({ config, logger, reconciliation }) {
       `Webhook received\n` +
       `  → Event: ${oneLine(parsed.eventName)}\n` +
       `  → Agreement ID: ${oneLine(parsed.agreementId)}\n` +
-      `  → Participant: ${oneLine(parsed.participant || 'unknown')}\n` +
+      `  → Participant: ${oneLine(parsed.participant ? maskEmail(parsed.participant) : 'unknown')}\n` +
       `  → Date: ${oneLine(parsed.eventDate || new Date().toISOString())}\n` +
       `  → Notification: ${oneLine(parsed.notificationId || '-')}`
     );
@@ -129,4 +142,4 @@ function webhookRoutes({ config, logger, reconciliation }) {
   return router;
 }
 
-module.exports = { webhookRoutes };
+module.exports = { webhookRoutes, webhookEchoClientId, ADOPTION_WAIT_MS };

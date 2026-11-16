@@ -11,6 +11,8 @@ const { canonicalStart, signStart } = require('../server/http/middleware/hmac');
 const { parseWebhookPayload } = require('../server/domain/eventPolicy');
 const { finalNotice } = require('../server/domain/agreementState');
 const { buildExternalId } = require('../server/domain/externalId');
+const { createAdobeClient } = require('../server/infra/adobeClient');
+const { createTokenStore } = require('../server/infra/tokenStore');
 const {
   buildWorld, startBody, startBodyV1, seedStartFlow, basicHeader, makeClock, waitFor, httpError, tmpDir, webhookPayload,
   INTEGRATION_USER_ID, HUMAN_USER_ID
@@ -375,7 +377,9 @@ test('/start verificado: dados divergentes do OTCS => 409 genérico (detalhe só
     assert.deepEqual(await r.json(), msg);
   }
   assert.ok(world.logger.has('warn', /nodeId payload=9999 otcs=1001/));
-  assert.ok(world.logger.has('warn', /emails payload=\[evil@x\.com,two@example\.com\]/));
+  // e-mails no log mascarados (ev***@x.com), o do payload e o do OTCS
+  assert.ok(world.logger.has('warn', /emails payload=\[ev\*\*\*@x\.com,tw\*\*\*@example\.com\] otcs=\[on\*\*\*@example\.com,tw\*\*\*@example\.com\]/));
+  assert.ok(world.logger.lines.warn.every((l) => !/evil@x\.com|one@example\.com|two@example\.com/.test(l)), 'sem e-mail inteiro no log');
   assert.equal(world.adobe.created.length, 0);
   await world.close();
 });
@@ -782,7 +786,8 @@ test('/start pelo caminho dos atributos: erros do OTCS (404 => 409, 5xx => 503);
 const HTML_DOC = Buffer.from('<!DOCTYPE html>\n<html><body>CONTEUDO-SECRETO</body></html>');
 const DOCX_DOC = Buffer.concat([Buffer.from([0x50, 0x4b, 0x03, 0x04, 0x14, 0x00]), Buffer.from('word/document.xml CONTEUDO-SECRETO')]);
 const NOT_PDF_BODY = { error: 'El documento a firmar no es un PDF válido.', code: 'NOT_PDF' };
-const adobeCalls = (world) => world.adobe.calls.filter(([name]) => name.startsWith('adobe.'));
+// Escritas/leituras do Adobe, menos a busca de acordo órfão (só leitura, roda antes do PDF e não cria nada)
+const adobeCalls = (world) => world.adobe.calls.filter(([name]) => name.startsWith('adobe.') && name !== 'adobe.findByExternalId');
 const allLogs = (world) => [...world.logger.lines.info, ...world.logger.lines.warn, ...world.logger.lines.error];
 
 test('/start verificado: nó HTML no lugar do PDF => 422 NOT_PDF, nada no Adobe, sem vazar o conteúdo; com o PDF o reenvio funciona', async () => {
@@ -1237,6 +1242,73 @@ test('/start em sub-workflow: Adobe sem sessão => 401 LOGIN_REQUIRED e a tarefa
   await world.close();
 });
 
+// Erro de rede do axios (sem resposta HTTP), como o refresh do token do Adobe o devolve quando a conexão cai
+const adobeNetError = (code = 'ECONNRESET') => Object.assign(new Error(`read ${code}`), { code });
+
+test('/start: refresh do token do Adobe com falha TRANSITÓRIA (rede, timeout, 5xx, 429) => 503 sem acordo; sessão perdida (invalid_grant, sem refresh token) => 401', async (t) => {
+  const world = await buildWorld({ listen: true });
+  t.after(() => world.close());
+  let store;
+  // o token de verdade: tokenStore com o endpoint de refresh falso (checkAuth = ensureToken, como no adobeClient)
+  const storeWith = (post, refreshToken = 'seed-refresh') => createTokenStore({
+    config: { ...world.config, adobeRefreshToken: refreshToken, legacy: { ...world.config.legacy, tokensFiles: [] } },
+    logger: world.logger,
+    http: { post }
+  });
+  world.adobe.checkAuth = () => store.ensureToken();
+
+  const transient = [
+    adobeNetError('ECONNRESET'), adobeNetError('ECONNABORTED'), httpError(503, 'adobe token down'),
+    httpError(500, 'adobe token error'), httpError(429, 'too many requests')
+  ];
+  for (const err of transient) {
+    store = storeWith(async () => { throw err; });
+    const r = await post(world, '/start', startBody(world));
+    assert.equal(r.status, 503, err.message);
+    assert.deepEqual(await r.json(), { error: 'Adobe Sign no disponible; intente nuevamente.' });
+    assert.equal(world.repo.list().length, 0, err.message);
+    assert.equal(world.adobe.created.length, 0, err.message);
+    assert.deepEqual(world.otcs.downloads, [], 'não baixou o PDF');
+  }
+  assert.ok(world.logger.has('warn', /Adobe Sign no respondió al renovar la sesión \(read ECONNRESET/));
+
+  // sessão recusada pelo Adobe (invalid_grant => 400/401 do endpoint de token) => LOGIN_REQUIRED
+  for (const err of [httpError(400, 'invalid_grant'), httpError(401, 'invalid_client')]) {
+    store = storeWith(async () => { throw err; });
+    const r = await post(world, '/start', startBody(world));
+    assert.equal(r.status, 401, err.message);
+    assert.deepEqual(await r.json(), { error: 'LOGIN_REQUIRED' });
+    assert.equal(world.repo.list().length, 0, err.message);
+  }
+
+  // sem refresh token nenhum (REFRESH_TOKEN_MISSING) => LOGIN_REQUIRED, sem chamar o Adobe
+  store = storeWith(async () => { throw new Error('não deveria chamar o Adobe'); }, '');
+  let r = await post(world, '/start', startBody(world));
+  assert.equal(r.status, 401);
+  assert.deepEqual(await r.json(), { error: 'LOGIN_REQUIRED' });
+
+  // Adobe de volta: o refresh segue e o envio funciona (a falha anterior não ficou presa no token)
+  store = storeWith(async () => ({ data: { access_token: 'fresh', expires_in: 3600 } }));
+  r = await post(world, '/start', startBody(world));
+  assert.equal(r.status, 200, await r.clone().text());
+});
+
+test('/start em sub-workflow: falha TRANSITÓRIA do Adobe => 503 e a tarefa NÃO é reatribuída', async (t) => {
+  const world = await verifyWorld();
+  t.after(() => world.close());
+  seedStartFlow(world, { assignee: HUMAN_USER_ID });
+  world.adobe.checkAuth = async () => { throw adobeNetError('ETIMEDOUT'); };
+
+  const r = await authThenStart(world);
+  assert.equal(r.status, 503);
+  assert.deepEqual(await r.json(), { error: 'Adobe Sign no disponible; intente nuevamente.' });
+  assert.deepEqual(world.otcs.downloads, [], 'sem sessão não baixa o PDF');
+  assert.equal(world.adobe.created.length, 0);
+  assert.equal(world.repo.list().length, 0);
+  assert.deepEqual(world.otcs.task(3003, 2, 3004).assignees, [HUMAN_USER_ID], 'a tarefa continua com o usuário');
+  assert.ok(world.logger.has('warn', /no respondió al renovar la sesión; no se pide la reasignación: read ETIMEDOUT/));
+});
+
 test('/start em sub-workflow: acordo aberto do mesmo documento em outro fluxo => 409 DUPLICATE_OPEN antes de pedir a reatribuição', async () => {
   const world = await verifyWorld();
   seedStartFlow(world, { assignee: HUMAN_USER_ID });
@@ -1453,6 +1525,395 @@ test('START_VERIFY_WORKFLOW=false preserva o comportamento anterior (sem consult
   await world.close();
 });
 
+/* ---------- idempotência contra o Adobe (resposta do createAgreement perdida) ---------- */
+
+// externalId que o /start calcula para o fluxo padrão de seedStartFlow (3003/3004, nó 1001, pasta 2002)
+const flowExternalId = (world) =>
+  buildExternalId({ workflowId: '3003', subworkflowId: '3004', nodeId: '1001', attachId: '2002' }, world.config.signatureSecret);
+
+// Acordo que o Adobe criou numa tentativa anterior cuja resposta se perdeu (o repo não o conhece)
+function seedOrphan(world, id = 'AG-ORPH', over = {}) {
+  world.adobe.agreements[id] = {
+    id,
+    name: 'Documento contrato.pdf',
+    status: 'OUT_FOR_SIGNATURE',
+    createdDate: '2026-06-22T11:59:00.000Z',
+    expirationTime: '2026-07-22T11:59:00.000Z',
+    externalId: { id: flowExternalId(world) },
+    participantSetsInfo: [
+      { role: 'SIGNER', order: 1, memberInfos: [{ email: 'one@example.com' }] },
+      { role: 'SIGNER', order: 1, memberInfos: [{ email: 'two@example.com' }] }
+    ],
+    ...over
+  };
+  return world.adobe.agreements[id];
+}
+
+const findCalls = (world) => world.calls.filter(([c]) => c === 'adobe.findByExternalId');
+
+test('adobe: findAgreementsByExternalId faz GET /agreements com externalId e pageSize e devolve userAgreementList', async () => {
+  const seen = [];
+  const http = {
+    get: async (url, opts) => { seen.push({ url, opts }); return { data: { userAgreementList: [{ id: 'AG-1' }], page: {} } }; }
+  };
+  const client = createAdobeClient({ apiBase: 'https://adobe.invalid', ensureToken: async () => 'tok', http, logger: {} });
+  assert.deepEqual(await client.findAgreementsByExternalId('otcs|wf=1'), [{ id: 'AG-1' }]);
+  assert.equal(seen[0].url, 'https://adobe.invalid/api/rest/v6/agreements');
+  assert.deepEqual(seen[0].opts.params, { externalId: 'otcs|wf=1', pageSize: 20 });
+  assert.equal(seen[0].opts.headers.Authorization, 'Bearer tok');
+  assert.ok(seen[0].opts.timeout > 0);
+
+  // corpo sem a lista (ou lista vazia) => []
+  http.get = async () => ({ data: { page: {} } });
+  assert.deepEqual(await client.findAgreementsByExternalId('x'), []);
+  http.get = async () => ({ data: undefined });
+  assert.deepEqual(await client.findAgreementsByExternalId('x'), []);
+});
+
+test('/start: acordo órfão em andamento (mesmo externalId e e-mails) é registrado em vez de criar outro', async () => {
+  const world = await verifyWorld();
+  seedStartFlow(world);
+  seedOrphan(world);
+
+  const r = await authThenStart(world);
+  assert.equal(r.status, 200, await r.clone().text());
+  const body = await r.json();
+  assert.equal(body.id, 'AG-ORPH');
+  assert.equal(body.existing, undefined, 'é uma criação normal para a página');
+  assert.ok(body.handoff);
+
+  assert.equal(world.adobe.created.length, 0);
+  assert.equal(world.calls.some(([c]) => c === 'adobe.transient' || c === 'adobe.createAgreement'), false);
+  assert.deepEqual(world.otcs.downloads, [], 'não baixou o PDF');
+  assert.deepEqual(findCalls(world), [['adobe.findByExternalId', flowExternalId(world)]]);
+
+  const rec = world.repo.get('AG-ORPH');
+  assert.equal(rec.state, 'pending');
+  assert.equal(rec.workflowId, '3003');
+  assert.equal(rec.subworkflowId, '3004');
+  assert.equal(rec.nodeId, '1001');
+  assert.equal(rec.attachId, '2002');
+  assert.equal(rec.fileName, 'contrato.pdf');
+  assert.equal(rec.taskId, 2);
+  assert.deepEqual(rec.emails, ['one@example.com', 'two@example.com']);
+  assert.equal(rec.adopted, true);
+  assert.equal(rec.expiresAt, '2026-07-22T11:59:00.000Z');
+  assert.equal(rec.createdAt, '2026-06-22T11:59:00.000Z');
+  assert.ok(world.logger.has('warn', /AG-ORPH.*ya existía en Adobe.*se registra en lugar de crear otro/));
+
+  // a etapa start roda como numa criação normal (SendOn da tarefa de início)
+  await waitFor(() => world.repo.get('AG-ORPH').startSendonDone);
+  assert.equal(world.repo.list().length, 1);
+  await world.close();
+});
+
+test('/start: acordo órfão ainda sem processar (DOCUMENTS_NOT_YET_PROCESSED) também é reaproveitado, com e-mails em outra caixa/ordem', async () => {
+  const world = await verifyWorld();
+  seedStartFlow(world);
+  seedOrphan(world, 'AG-ORPH', {
+    status: 'DOCUMENTS_NOT_YET_PROCESSED',
+    expirationTime: undefined,
+    createdDate: undefined,
+    participantSetsInfo: [
+      { role: 'SIGNER', order: 1, memberInfos: [{ email: 'TWO@Example.com' }, { email: 'One@example.com' }] }
+    ]
+  });
+  const r = await authThenStart(world);
+  assert.equal(r.status, 200, await r.clone().text());
+  assert.equal((await r.json()).id, 'AG-ORPH');
+  assert.equal(world.adobe.created.length, 0);
+  const rec = world.repo.get('AG-ORPH');
+  assert.equal(rec.expiresAt, null, 'sem expirationTime parseável');
+  assert.equal(rec.createdAt, world.clock.now().toISOString(), 'sem createdDate parseável: agora');
+  await waitFor(() => world.repo.get('AG-ORPH').startSendonDone);
+  await world.close();
+});
+
+test('/start: acordo órfão final (SIGNED, CANCELLED, EXPIRED) ou de status desconhecido nunca é reaproveitado', async () => {
+  for (const status of ['SIGNED', 'CANCELLED', 'EXPIRED', 'ABORTED', 'STATUS_NOVO']) {
+    const world = await verifyWorld();
+    seedStartFlow(world);
+    seedOrphan(world, 'AG-ORPH', { status });
+    const r = await authThenStart(world);
+    assert.equal(r.status, 200, `${status}: ${await r.clone().text()}`);
+    assert.equal((await r.json()).id, 'AG-1', status);
+    assert.equal(world.adobe.created.length, 1, status);
+    assert.equal(world.repo.has('AG-ORPH'), false, status);
+    assert.ok(world.logger.has('info', new RegExp(`AG-ORPH.*${status}.*no se reutiliza`)), status);
+    await waitFor(() => world.repo.get('AG-1').startSendonDone);
+    await world.close();
+  }
+});
+
+test('/start: mesmo externalId com outros e-mails => cria outro acordo e deixa rastro no log', async () => {
+  const world = await verifyWorld();
+  seedStartFlow(world);
+  seedOrphan(world, 'AG-ORPH', {
+    participantSetsInfo: [{ role: 'SIGNER', order: 1, memberInfos: [{ email: 'one@example.com' }, { email: 'other@example.com' }] }]
+  });
+  const r = await authThenStart(world);
+  assert.equal(r.status, 200, await r.clone().text());
+  assert.equal((await r.json()).id, 'AG-1');
+  assert.equal(world.adobe.created.length, 1);
+  assert.equal(world.repo.has('AG-ORPH'), false);
+  assert.ok(world.logger.has('warn', /AG-ORPH.*otros destinatarios.*no se reutiliza/));
+  await waitFor(() => world.repo.get('AG-1').startSendonDone);
+  await world.close();
+});
+
+test('/start: o GET do candidato traz outro externalId (filtro ignorado pelo Adobe) => cria outro acordo', async () => {
+  const world = await verifyWorld();
+  seedStartFlow(world);
+  seedOrphan(world, 'AG-OTHER-FLOW', { externalId: { id: `${flowExternalId(world)}x` } });
+  seedOrphan(world, 'AG-NO-EXT', { externalId: undefined });
+  // o fake devolve a lista fixa (como se o filtro fosse ignorado e viessem acordos de qualquer fluxo)
+  world.adobe.findOverride = [
+    { id: 'AG-OTHER-FLOW', status: 'OUT_FOR_SIGNATURE', displayDate: '2026-06-22T11:59:00.000Z' },
+    { id: 'AG-NO-EXT', status: 'OUT_FOR_SIGNATURE', displayDate: '2026-06-22T11:58:00.000Z' }
+  ];
+  const r = await authThenStart(world);
+  assert.equal(r.status, 200, await r.clone().text());
+  assert.equal((await r.json()).id, 'AG-1');
+  assert.equal(world.adobe.created.length, 1);
+  assert.equal(world.repo.has('AG-OTHER-FLOW'), false);
+  assert.equal(world.repo.has('AG-NO-EXT'), false);
+  await waitFor(() => world.repo.get('AG-1').startSendonDone);
+  await world.close();
+});
+
+test('/start: só os 3 candidatos mais recentes (displayDate) são lidos, do mais novo para o mais antigo', async () => {
+  const world = await verifyWorld();
+  seedStartFlow(world);
+  const ids = ['AG-A', 'AG-B', 'AG-C', 'AG-D'];
+  // todos finais e mais velhos que o novo; o mais antigo (AG-A) nem chega a ser lido
+  ids.forEach((id, i) => seedOrphan(world, id, { status: 'SIGNED', createdDate: `2026-06-22T11:5${i}:00.000Z` }));
+  world.adobe.findOverride = ids.map((id, i) => ({ id, status: 'SIGNED', displayDate: `2026-06-22T11:5${i}:00.000Z` }));
+  const r = await authThenStart(world);
+  assert.equal(r.status, 200, await r.clone().text());
+  const read = world.calls.filter(([c]) => c === 'adobe.getAgreement').map(([, id]) => id).filter((id) => ids.includes(id));
+  assert.deepEqual(read, ['AG-D', 'AG-C', 'AG-B']);
+  await waitFor(() => world.repo.get('AG-1').startSendonDone);
+  await world.close();
+});
+
+// Erro de rede/timeout do axios: sem `response`
+const networkError = (message = 'timeout of 60000ms exceeded') => Object.assign(new Error(message), { code: 'ECONNABORTED' });
+
+test('/start: falha TRANSITÓRIA da busca (lista: timeout, rede, 5xx, 429) => 503 sem criar nada, e o reenvio seguinte funciona', async () => {
+  const world = await verifyWorld();
+  seedStartFlow(world);
+  for (const err of [networkError(), networkError('socket hang up'), httpError(500, 'adobe list down'), httpError(503), httpError(429), httpError(401)]) {
+    world.adobe.findError = err;
+    const r = await authThenStart(world);
+    assert.equal(r.status, 503, err.message);
+    // sem `code`: a página trata como ambíguo e repete o /start
+    assert.deepEqual(await r.json(), { error: 'Adobe Sign no disponible; intente nuevamente.' });
+    assert.equal(world.adobe.created.length, 0, err.message);
+    assert.equal(world.calls.some(([c]) => c === 'adobe.transient' || c === 'adobe.createAgreement'), false);
+    assert.deepEqual(world.otcs.downloads, [], 'não baixou o PDF');
+    assert.equal(world.repo.list().length, 0);
+  }
+  assert.ok(world.logger.has('warn', /no se pudo buscar en Adobe un acuerdo previo de este flujo.*adobe list down.*no se crea ningún acuerdo/));
+  assert.equal(world.logger.lines.error.some((l) => /\[START ERROR\]/.test(l)), false, 'não virou o 500 genérico');
+
+  // as chaves em andamento foram liberadas: o /start seguinte (Adobe de volta) cria normalmente
+  world.adobe.findError = null;
+  const r = await authThenStart(world);
+  assert.equal(r.status, 200, await r.clone().text());
+  assert.equal((await r.json()).id, 'AG-1');
+  assert.equal(world.adobe.created.length, 1);
+  await waitFor(() => world.repo.get('AG-1').startSendonDone);
+  await world.close();
+});
+
+test('/start: falha PERMANENTE da busca (lista 403/400/404, ou erro local sem rede/HTTP) é só aviso e o acordo é criado normalmente (fail-open)', async () => {
+  for (const status of [403, 400, 404, 'local']) {
+    const world = await verifyWorld();
+    seedStartFlow(world);
+    // 'local': bug do nosso lado (TypeError sem response/code) não pode travar todos os envios com 503
+    world.adobe.findError = status === 'local' ? new TypeError('missing scope (x is not a function)') : httpError(status, 'missing scope');
+    const r = await authThenStart(world);
+    assert.equal(r.status, 200, `${status}: ${await r.clone().text()}`);
+    assert.equal((await r.json()).id, 'AG-1');
+    assert.equal(world.adobe.created.length, 1);
+    assert.ok(world.logger.has('warn', /no se pudo buscar en Adobe un acuerdo previo de este flujo.*missing scope.*se continúa sin acuerdo previo/));
+    await waitFor(() => world.repo.get('AG-1').startSendonDone);
+    await world.close();
+  }
+});
+
+test('/start: GET do candidato — transitório (503, timeout) => 503 sem criar; 404 ou 403 => candidato pulado e cria normalmente', async () => {
+  const world = await verifyWorld();
+  seedStartFlow(world);
+  seedOrphan(world);
+  const realGet = world.adobe.getAgreement;
+  let getError = null;
+  world.adobe.getAgreement = async (id) => {
+    if (id === 'AG-ORPH' && getError) throw getError;
+    return realGet(id);
+  };
+
+  for (const err of [httpError(503, 'adobe get down'), networkError()]) {
+    getError = err;
+    const r = await authThenStart(world);
+    assert.equal(r.status, 503, err.message);
+    assert.deepEqual(await r.json(), { error: 'Adobe Sign no disponible; intente nuevamente.' });
+    assert.equal(world.adobe.created.length, 0);
+    assert.equal(world.repo.list().length, 0);
+  }
+  assert.ok(world.logger.has('warn', /no se pudo leer en Adobe el acuerdo previo AG-ORPH.*adobe get down.*no se crea ningún acuerdo/));
+
+  // 404 (sumiu entre a lista e o GET) ou 403: pula o candidato e cria
+  getError = httpError(404, 'agreement not found');
+  const r = await authThenStart(world);
+  assert.equal(r.status, 200, await r.clone().text());
+  assert.equal((await r.json()).id, 'AG-1');
+  assert.equal(world.adobe.created.length, 1);
+  assert.ok(world.logger.has('warn', /acuerdo previo AG-ORPH.*se continúa sin acuerdo previo/));
+  await waitFor(() => world.repo.get('AG-1').startSendonDone);
+  await world.close();
+});
+
+test('/start: o webhook já adotou o acordo órfão antes do reenvio => existing com esse id, sem busca nem criação', async () => {
+  const world = await verifyWorld();
+  seedStartFlow(world);
+  seedOrphan(world);
+
+  // webhook de um acordo desconhecido com externalId assinado: adoção automática
+  const res = world.reconciliation.handleEvent(parseWebhookPayload(webhookPayload('AGREEMENT_ACTION_REQUESTED', 'AG-ORPH')));
+  assert.equal(res.known, false);
+  await res.adopted;
+  await res.adoption;
+  assert.equal(world.repo.get('AG-ORPH').adopted, true);
+  world.calls.length = 0;
+
+  const r = await authThenStart(world);
+  assert.equal(r.status, 200, await r.clone().text());
+  const body = await r.json();
+  assert.equal(body.id, 'AG-ORPH');
+  assert.equal(body.existing, true);
+  assert.deepEqual(findCalls(world), [], 'nem chegou à busca no Adobe');
+  assert.equal(world.adobe.created.length, 0);
+  assert.equal(world.calls.some(([c]) => c === 'adobe.transient' || c === 'adobe.createAgreement'), false);
+  assert.equal(world.repo.list().length, 1);
+  await world.close();
+});
+
+test('/start: corrida — o acordo órfão entra no repo (adoção) enquanto a busca o lê => um só registro, sem criação, resposta existing', async () => {
+  const world = await verifyWorld();
+  seedStartFlow(world);
+  seedOrphan(world);
+  const realGet = world.adobe.getAgreement;
+  world.adobe.getAgreement = async (id) => {
+    const ag = await realGet(id);
+    if (id === 'AG-ORPH' && !world.repo.has(id)) {
+      world.repo.upsert(id, {
+        nodeId: '1001', attachId: '2002', fileName: 'contrato.pdf', workflowId: '3003', subworkflowId: '3004', taskId: 2,
+        emails: ['one@example.com', 'two@example.com'], state: 'pending', adopted: true, startSendonDone: false
+      });
+    }
+    return ag;
+  };
+
+  const r = await authThenStart(world);
+  assert.equal(r.status, 200, await r.clone().text());
+  const body = await r.json();
+  assert.equal(body.id, 'AG-ORPH');
+  assert.equal(body.existing, true);
+  assert.equal(world.adobe.created.length, 0);
+  assert.equal(world.calls.some(([c]) => c === 'adobe.transient' || c === 'adobe.createAgreement'), false);
+  assert.equal(world.repo.list().length, 1);
+  assert.equal(world.repo.get('AG-ORPH').adopted, true);
+  assert.ok(world.logger.has('info', /ya existe la solicitud de firma AG-ORPH/));
+  assert.ok(body.handoff, 'SendOn de início ainda pendente: o handoff volta');
+  await world.close();
+});
+
+test('/start: corrida em que a adoção já fez o SendOn de início durante o pedido => existing sem handoff (nada a reatribuir)', async () => {
+  const world = await verifyWorld();
+  seedStartFlow(world);
+  seedOrphan(world);
+  const realGet = world.adobe.getAgreement;
+  world.adobe.getAgreement = async (id) => {
+    const ag = await realGet(id);
+    if (id === 'AG-ORPH' && !world.repo.has(id)) {
+      world.repo.upsert(id, {
+        nodeId: '1001', attachId: '2002', fileName: 'contrato.pdf', workflowId: '3003', subworkflowId: '3004', taskId: 2,
+        emails: ['one@example.com', 'two@example.com'], state: 'pending', adopted: true,
+        startSendonDone: true, startSendonAt: world.clock.now().toISOString()
+      });
+    }
+    return ag;
+  };
+
+  const r = await authThenStart(world);
+  assert.equal(r.status, 200, await r.clone().text());
+  const body = await r.json();
+  assert.equal(body.id, 'AG-ORPH');
+  assert.equal(body.existing, true);
+  assert.equal('handoff' in body, false);
+  assert.equal(world.adobe.created.length, 0);
+  await world.close();
+});
+
+test('/start: acordo que o repo já conhece é ignorado pela busca', async () => {
+  const world = await verifyWorld();
+  seedStartFlow(world);
+  seedOrphan(world, 'AG-KNOWN');
+  // do ciclo anterior deste mesmo fluxo, já registrado e concluído (nada a ver com um acordo órfão)
+  world.repo.upsert('AG-KNOWN', {
+    nodeId: '1001', attachId: '2002', fileName: 'contrato.pdf', workflowId: '3003', subworkflowId: '3004', taskId: 2,
+    emails: ['one@example.com', 'two@example.com'], state: 'completed', sendonDone: true, startSendonDone: true
+  });
+  const r = await authThenStart(world);
+  assert.equal(r.status, 200, await r.clone().text());
+  assert.equal((await r.json()).id, 'AG-1');
+  assert.equal(world.adobe.created.length, 1);
+  assert.equal(findCalls(world).length, 1, 'a busca rodou');
+  assert.equal(world.calls.some(([c, id]) => c === 'adobe.getAgreement' && id === 'AG-KNOWN'), false, 'o conhecido nem foi lido');
+  await waitFor(() => world.repo.get('AG-1').startSendonDone);
+  await world.close();
+});
+
+test('/start legado (sem validação do workflow): não procura acordo órfão', async () => {
+  const world = await buildWorld({ listen: true });
+  assert.equal(world.config.startVerifyWorkflow, false);
+  seedOrphan(world);
+  const r = await post(world, '/start', startBody(world));
+  assert.equal(r.status, 200, await r.clone().text());
+  assert.equal(world.adobe.created.length, 1);
+  assert.deepEqual(findCalls(world), []);
+  await world.close();
+});
+
+test('/start: resposta do createAgreement perdida (timeout) => 500 e o reenvio reaproveita o acordo, sem duplicar', async () => {
+  const world = await verifyWorld();
+  seedStartFlow(world);
+  world.adobe.createLostResponses = 1;
+
+  let r = await authThenStart(world);
+  assert.equal(r.status, 500);
+  assert.equal(world.repo.list().length, 0, 'nada registrado');
+  assert.equal(world.adobe.created.length, 1, 'mas o Adobe criou o acordo');
+  assert.ok(world.logger.has('error', /\[START ERROR\].*timeout/));
+
+  r = await authThenStart(world);
+  assert.equal(r.status, 200, await r.clone().text());
+  assert.equal((await r.json()).id, 'AG-1', 'o mesmo acordo');
+  assert.equal(world.adobe.created.length, 1, 'exatamente um acordo no Adobe');
+  assert.equal(world.calls.filter(([c]) => c === 'adobe.createAgreement').length, 1);
+  assert.equal(world.repo.list().length, 1);
+  assert.equal(world.repo.get('AG-1').state, 'pending');
+  await waitFor(() => world.repo.get('AG-1').startSendonDone);
+
+  // e um terceiro envio vira o existing de sempre
+  r = await authThenStart(world);
+  assert.equal(r.status, 200);
+  assert.equal((await r.json()).existing, true);
+  assert.equal(world.adobe.created.length, 1);
+  await world.close();
+});
+
 /* ---------- banco: nonces e migração v3 ---------- */
 
 test('repo.consumeNonce: uso único, purga dos expirados a cada inserção', () => {
@@ -1472,7 +1933,7 @@ test('repo.consumeNonce: uso único, purga dos expirados a cada inserção', () 
 });
 
 test('db: banco no schema v2 recebe a migração v3 (start_nonces) preservando os dados', () => {
-  assert.equal(MIGRATIONS.length, 7); // v4: cancelamento de fluxos (test/cancellation.test.js); v5: caducidad (test/workflow.test.js); v6: expires_at; v7: cancel_pending_at
+  assert.equal(MIGRATIONS.length, 8); // v4: cancelamento de fluxos (test/cancellation.test.js); v5: caducidad (test/workflow.test.js); v6: expires_at; v7: cancel_pending_at; v8: reopen_count (test/resilience.test.js)
   const file = path.join(tmpDir(), 'v2.db');
   const raw = new Database(file);
   raw.exec(MIGRATIONS[0]);

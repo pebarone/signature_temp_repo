@@ -70,6 +70,102 @@ test('otcs.addVersion: resposta perdida após a escrita não duplica versão, in
   assert.equal(writes, 1);
 });
 
+// Versões do nó (GET /versions) e a resposta do POST, para os casos de PDF já enviado sem o marcador da integração
+const versionsStub = (versions) => otcsStub((method) => (method === 'get' ? { data: { data: versions } } : { data: { version_number: 9 } }));
+
+test('otcs.addVersion: a versão mais recente com o mesmo tamanho (PDF enviado à mão, sem marcador) não gera outra versão', async () => {
+  const { client, seen } = versionsStub([
+    { version_number: 1, file_size: 100, description: '' },
+    { version_number: 2, file_size: PDF.length, description: '' }
+  ]);
+  const result = await client.addVersion(1001, PDF, 'contrato.pdf', { agreementId: 'AG-1' });
+  assert.equal(result.version_number, 2, 'devolve a versão que já está no nó');
+  assert.equal(seen.filter((c) => c.method === 'post').length, 0);
+});
+
+test('otcs.addVersion: a versão mais recente com o mesmo tamanho mas com o marcador de OUTRO acordo => grava a nova versão', async () => {
+  const { client, seen } = versionsStub([
+    { version_number: 1, file_size: 100, description: '' },
+    { version_number: 2, file_size: PDF.length, description: 'Adobe Sign: OUTRO' }
+  ]);
+  const result = await client.addVersion(1001, PDF, 'contrato.pdf', { agreementId: 'AG-1' });
+  assert.equal(result.version_number, 9, 'resposta do POST, não a versão do outro acordo');
+  const posts = seen.filter((c) => c.method === 'post');
+  assert.equal(posts.length, 1);
+  assert.match(posts[0].body.getBuffer().toString(), /name="description"\r\n\r\nAdobe Sign: AG-1/);
+});
+
+test('otcs.uploadToFolder: documento existente cuja versão mais recente tem o mesmo tamanho e o marcador de OUTRO acordo => grava a nova versão', async () => {
+  const { client, seen } = otcsStub((method, url) => {
+    if (url.includes('/nodes?')) return { data: { data: [{ id: 9001, type: 144, name: 'contrato.pdf', description: 'Adobe Sign: OUTRO' }] } };
+    if (method === 'get') {
+      return { data: { data: [{ version_number: 1, file_size: 100, description: '' }, { version_number: 2, file_size: PDF.length, description: 'Adobe Sign: OUTRO' }] } };
+    }
+    return { data: { id: 2, version_number: 3 } };
+  });
+  const result = await client.uploadToFolder(2002, PDF, 'contrato.pdf', { agreementId: 'AG-1' });
+  assert.equal(result.id, 9001);
+  assert.equal(result.version_number, 3);
+  assert.equal(seen.filter((c) => c.method === 'post').length, 1);
+});
+
+test('otcs.uploadToFolder: documento existente cuja versão mais recente tem o mesmo tamanho e nenhum marcador (envio manual) => não grava', async () => {
+  const { client, seen } = otcsStub((method, url) => {
+    if (url.includes('/nodes?')) return { data: { data: [{ id: 9001, type: 144, name: 'contrato.pdf' }] } };
+    if (method === 'get') return { data: { data: [{ version_number: 2, file_size: PDF.length, description: '' }] } };
+    return { data: { id: 2, version_number: 3 } };
+  });
+  const result = await client.uploadToFolder(2002, PDF, 'contrato.pdf', { agreementId: 'AG-1' });
+  assert.equal(result.id, 9001);
+  assert.equal(result.version_number, 2);
+  assert.equal(seen.filter((c) => c.method === 'post').length, 0);
+});
+
+test('otcs.addVersion: tamanho diferente da versão mais recente => grava a nova versão', async () => {
+  const { client, seen } = versionsStub([
+    { version_number: 1, file_size: PDF.length, description: '' },
+    { version_number: 2, file_size: PDF.length + 1, description: '' }
+  ]);
+  const result = await client.addVersion(1001, PDF, 'contrato.pdf', { agreementId: 'AG-1' });
+  assert.equal(result.version_number, 9);
+  assert.equal(seen.filter((c) => c.method === 'post').length, 1);
+});
+
+test('otcs.addVersion: file_size ausente, não numérico ou nulo na versão mais recente => grava (comportamento de sempre)', async () => {
+  for (const latest of [
+    { version_number: 2, description: '' },
+    { version_number: 2, file_size: String(PDF.length), description: '' },
+    { version_number: 2, file_size: null, description: '' }
+  ]) {
+    const { client, seen } = versionsStub([{ version_number: 1, file_size: PDF.length, description: '' }, latest]);
+    await client.addVersion(1001, PDF, 'contrato.pdf', { agreementId: 'AG-1' });
+    assert.equal(seen.filter((c) => c.method === 'post').length, 1, JSON.stringify(latest));
+  }
+});
+
+test('otcs.addVersion: só vale a versão MAIS RECENTE (maior version_number); uma antiga com o mesmo tamanho não basta', async () => {
+  // a lista pode vir fora de ordem: a mais recente é a 3, com outro tamanho
+  for (const versions of [
+    [{ version_number: 3, file_size: PDF.length + 7, description: '' }, { version_number: 2, file_size: PDF.length, description: '' }],
+    [{ version_number: 2, file_size: PDF.length, description: '' }, { version_number: 3, file_size: PDF.length + 7, description: '' }]
+  ]) {
+    const { client, seen } = versionsStub(versions);
+    await client.addVersion(1001, PDF, 'contrato.pdf', { agreementId: 'AG-1' });
+    assert.equal(seen.filter((c) => c.method === 'post').length, 1, JSON.stringify(versions));
+  }
+});
+
+test('otcs.addVersion: sem version_number, a última da lista é a mais recente', async () => {
+  const same = versionsStub([{ file_size: 100, description: '' }, { file_size: PDF.length, description: '' }]);
+  const result = await same.client.addVersion(1001, PDF, 'contrato.pdf', { agreementId: 'AG-1' });
+  assert.equal(result.file_size, PDF.length);
+  assert.equal(same.seen.filter((c) => c.method === 'post').length, 0);
+
+  const other = versionsStub([{ file_size: PDF.length, description: '' }, { file_size: 100, description: '' }]);
+  await other.client.addVersion(1001, PDF, 'contrato.pdf', { agreementId: 'AG-1' });
+  assert.equal(other.seen.filter((c) => c.method === 'post').length, 1);
+});
+
 test('otcs.nodeExists: 2xx => true; 403 (sem permissão) => true; 400/404 => false; outros erros sobem (transitórios)', async () => {
   const httpErr = (status) => Object.assign(new Error(`HTTP ${status}`), { response: { status } });
   const answer = (status) => otcsStub(() => { if (status >= 400) throw httpErr(status); return { data: {} }; }).client;
@@ -284,7 +380,7 @@ test('adobe.createAgreement: envia externalId { id } só quando informado', asyn
 /* ---------- banco: migração v1 -> v2 ---------- */
 
 test('db: arquivo criado no schema v1 recebe as migrações seguintes (v2, v3) preservando os dados', () => {
-  assert.equal(MIGRATIONS.length, 7); // v4: cancelamento de fluxos (test/cancellation.test.js); v5: caducidad (test/workflow.test.js); v6: expires_at; v7: cancel_pending_at
+  assert.equal(MIGRATIONS.length, 8); // v4: cancelamento de fluxos (test/cancellation.test.js); v5: caducidad (test/workflow.test.js); v6: expires_at; v7: cancel_pending_at; v8: reopen_count (test/resilience.test.js)
   const file = path.join(tmpDir(), 'v1.db');
 
   // banco "antigo": só a migração 1

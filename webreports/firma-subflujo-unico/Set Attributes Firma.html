@@ -1,0 +1,94 @@
+[/* Title: Blank Reportview */]
+[// Passo WebReports do sub-fluxo de firma único (Contratación e Documental). &WORKID = pai, &SUBWORKID = sub-fluxo. /]
+[// O documento não é movido: DocID aponta para o nó nos anexos do pai e o PDF assinado entra como nova versão dele. /]
+[// A mesma regra está no ramo recalcular da página de envio (650835, webreports/firma-flujo-puro/Requisicion de Firma.html): mudar nos dois. /]
+
+WFINFO ->>> [LL_REPTAG_&SUBWORKID show /]<br> <br><br>
+
+[LL_REPTAG_&WORKID SETWFATTR:'WFID' /]
+[LL_REPTAG_&WORKID SETVAR:ID /]
+
+
+[//* recupera usuários e salva os emails nos atributos para enviar
+[LL_REPTAG_&WORKID WFATTR:'Empleado':DISPLAY setvar:userEmpleado /]
+[LL_REPTAG_&WORKID WFATTR:'Firmante 2':DISPLAY setvar:userFirmante2 /]
+
+[LL_REPTAG_!userEmpleado USERINFO:MAILADDRESS setvar:mailEmpleado /]
+[LL_REPTAG_!userFirmante2 USERINFO:MAILADDRESS setvar:mailFirmante2 /]
+
+
+[LL_REPTAG_!mailEmpleado SETWFATTR:'Email Firmante 1' /]
+[LL_REPTAG_!mailFirmante2 SETWFATTR:'Email Firmante 2' /]
+
+
+[// pega os documentos anexados ao workflow
+[LL_REPTAG_&WORKID WFINFO:ATTACHFOLDER NODEINFO:CHILDREN SETVAR:AttachmentArray /]
+[LL_REPTAG_&WORKID WFINFO:ATTACHFOLDER NODEINFO:ID SETVAR:parentID /]
+[LL_REPTAG_!parentID SETWFATTR:"AttachID" /]
+
+[// tipo pelo título do pai (&WORKID): com "documental" leva o documento anexado; sem, só o contrato/otrosí /]
+[// PATFIND devolve TRUE ou FALSE e ignora maiúsculas; qualquer outra saída cai na regra do contrato /]
+[LL_REPTAG_&WORKID WFINFO:TITLE PATFIND:"documental" SETVAR:esDocumental /]
+
+[LL_WEBREPORT_IF "[LL_REPTAG_!esDocumental /]" == "TRUE" /]
+
+     [// Documental: leva o documento anexado, como antes (com vários, fica o último) /]
+     [// faz a interação com cada um dos documentos anexados
+     [LL_WEBREPORT_FOR DATA:[LL_REPTAG_!AttachmentArray /] VAR:"value" /]
+     [// pega id e nome de cada documento anexado
+        [LL_REPTAG_&WORKID WFINFO:ATTACHFOLDER NODEINFO:CHILDREN RECARRAY:[LL_REPTAG_!value_index /]:DataID SETVAR:DOCID /]<BR>
+        [LL_REPTAG_&WORKID WFINFO:ATTACHFOLDER NODEINFO:CHILDREN RECARRAY:[LL_REPTAG_!value_index /]:Name SETVAR:DOCNAME /]<br>
+
+
+        [LL_REPTAG_!DOCID SETWFATTR:"DocID" /]
+        [LL_REPTAG_!DOCNAME SETWFATTR:"Nombre del Documento" /]
+
+
+    [LL_WEBREPORT_ENDFOR /]
+
+[LL_WEBREPORT_ELSE /]
+
+    [// Contratación e demais: DocID = o único anexo com "contrato", "otrosi" ou "otrosí" no nome. /]
+    [// Nenhum ou mais de um: DocID recebe texto e a página de envio para antes de chamar o servidor. /]
+    [LL_REPTAG_"NINGUNO" SETVAR:docContrato /]
+    [LL_REPTAG_"NO" SETVAR:masDeUno /]
+
+    [LL_WEBREPORT_FOR DATA:[LL_REPTAG_!AttachmentArray /] VAR:"value" /]
+        [LL_REPTAG_&WORKID WFINFO:ATTACHFOLDER NODEINFO:CHILDREN RECARRAY:[LL_REPTAG_!value_index /]:Name SETVAR:nombreAnexo /]
+        [LL_REPTAG_&WORKID WFINFO:ATTACHFOLDER NODEINFO:CHILDREN RECARRAY:[LL_REPTAG_!value_index /]:SubType SETVAR:tipoAnexo /]
+
+        [// só documentos (SubType 144), como o SQL antigo; a classe iíÍ cobre otrosi, otrosí e OTROSÍ /]
+        [LL_REPTAG_"FALSE" SETVAR:esContrato /]
+        [LL_WEBREPORT_IF "[LL_REPTAG_!tipoAnexo /]" == "144" /]
+            [LL_REPTAG_!nombreAnexo PATFIND:"contrato" SETVAR:esContrato /]
+            [LL_WEBREPORT_IF "[LL_REPTAG_!esContrato /]" != "TRUE" /]
+                [LL_REPTAG_!nombreAnexo PATFIND:"otros[iíÍ]" SETVAR:esContrato /]
+            [LL_WEBREPORT_ENDIF /]
+        [LL_WEBREPORT_ENDIF /]
+
+        [LL_WEBREPORT_IF "[LL_REPTAG_!esContrato /]" == "TRUE" /]
+            [LL_WEBREPORT_IF "[LL_REPTAG_!docContrato /]" == "NINGUNO" /]
+                [LL_REPTAG_&WORKID WFINFO:ATTACHFOLDER NODEINFO:CHILDREN RECARRAY:[LL_REPTAG_!value_index /]:DataID SETVAR:docContrato /]
+                [LL_REPTAG_!nombreAnexo SETVAR:nombreContrato /]
+            [LL_WEBREPORT_ELSE /]
+                [LL_REPTAG_"SI" SETVAR:masDeUno /]
+            [LL_WEBREPORT_ENDIF /]
+        [LL_WEBREPORT_ENDIF /]
+    [LL_WEBREPORT_ENDFOR /]
+
+    [LL_REPTAG_"SIN_CONTRATO_UNICO" SETVAR:DOCID /]
+    [LL_REPTAG_"Ninguno o mas de un contrato u otrosi en los adjuntos" SETVAR:DOCNAME /]
+    [LL_WEBREPORT_IF "[LL_REPTAG_!masDeUno /]" == "NO" /]
+        [LL_WEBREPORT_IF "[LL_REPTAG_!docContrato /]" != "NINGUNO" /]
+            [LL_REPTAG_!docContrato SETVAR:DOCID /]
+            [LL_REPTAG_!nombreContrato SETVAR:DOCNAME /]
+        [LL_WEBREPORT_ENDIF /]
+    [LL_WEBREPORT_ENDIF /]
+
+    [LL_REPTAG_!DOCID SETWFATTR:"DocID" /]
+    [LL_REPTAG_!DOCNAME SETWFATTR:"Nombre del Documento" /]
+
+[LL_WEBREPORT_ENDIF /]
+
+[LL_WEBREPORT_STARTROW /]
+[LL_WEBREPORT_ENDROW /]

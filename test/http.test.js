@@ -5,6 +5,7 @@ const path = require('path');
 const { createLogger } = require('../server/infra/logger');
 const { sign, signStart } = require('../server/http/middleware/hmac');
 const { buildExternalId } = require('../server/domain/externalId');
+const { ADOPTION_WAIT_MS } = require('../server/http/routes/webhook');
 const {
   buildWorld, seedAgreement, webhookPayload, waitFor, startBody, startBodyV1, seedStartFlow, basicHeader, makeClock, tmpDir,
   httpError
@@ -245,6 +246,59 @@ test('webhook POST: JSON inválido => 400; falha ao persistir => 500 (Adobe reen
   world.repo.recordEvent = original;
   assert.equal(world.calls.length, 0);
   await world.close();
+});
+
+test('webhook POST: JSON inválido e corpo acima de 10 MB respondem com o eco do X-AdobeSign-ClientId (400 / 413)', async (t) => {
+  const world = await buildWorld({ listen: true });
+  t.after(() => world.close());
+  seedAgreement(world);
+  const headers = { 'content-type': 'application/json' };
+  // erro do body-parser: sai pelo handler genérico, mas já com o header ecoado (o middleware roda antes do parser)
+  let r = await fetch(`${world.baseUrl}/webhook`, { method: 'POST', headers: { ...headers, 'X-AdobeSign-ClientId': 'abc123' }, body: '{bad' });
+  assert.equal(r.status, 400);
+  assert.equal(r.headers.get('x-adobesign-clientid'), 'abc123');
+  r = await fetch(`${world.baseUrl}/webhook`, { method: 'POST', headers, body: '{bad' });
+  assert.equal(r.status, 400);
+  assert.equal(r.headers.get('x-adobesign-clientid'), 'test-client-id', 'sem header: o CLIENT_ID configurado');
+
+  r = await fetch(`${world.baseUrl}/webhook`, {
+    method: 'POST', headers: { ...headers, 'X-AdobeSign-ClientId': 'abc123' }, body: JSON.stringify({ blob: 'x'.repeat(10 * 1024 * 1024) })
+  });
+  assert.equal(r.status, 413);
+  assert.equal(r.headers.get('x-adobesign-clientid'), 'abc123');
+  assert.equal(world.repo.listEvents('AG-1').length, 0);
+  assert.equal(world.calls.length, 0);
+});
+
+test('WEBHOOK_REQUIRE_CLIENT_ID=true: a recusa 401 também ecoa o X-AdobeSign-ClientId (recebido ou o configurado)', async (t) => {
+  const world = await buildWorld({ listen: true, env: { WEBHOOK_REQUIRE_CLIENT_ID: 'true' } });
+  t.after(() => world.close());
+  seedAgreement(world);
+  const payload = (n) => webhookPayload('AGREEMENT_CREATED', 'AG-1', { notificationId: n });
+  let r = await post(world, '/webhook', payload('e-1'), { 'X-AdobeSign-ClientId': 'forged' });
+  assert.equal(r.status, 401);
+  assert.equal(r.headers.get('x-adobesign-clientid'), 'forged');
+  r = await post(world, '/webhook', payload('e-2'));
+  assert.equal(r.status, 401);
+  assert.equal(r.headers.get('x-adobesign-clientid'), 'test-client-id');
+  assert.equal(world.repo.listEvents('AG-1').length, 0);
+});
+
+test('logs: e-mail do participante do webhook e destinatários do /start saem mascarados, nunca inteiros', async (t) => {
+  const world = await buildWorld({ listen: true });
+  t.after(() => world.close());
+  const r1 = await post(world, '/start', startBody(world, { userEmail1: 'joao.souza@example.com', userEmail2: '' }));
+  assert.equal(r1.status, 200, await r1.clone().text());
+  assert.ok(world.logger.has('info', /Recipients: jo\*\*\*@example\.com$/m));
+
+  const r2 = await post(world, '/webhook', webhookPayload('AGREEMENT_CREATED', 'AG-1', {
+    notificationId: 'mask-1', extra: { participantUserEmail: 'maria.silva@example.com' }
+  }));
+  assert.equal(r2.status, 200);
+  assert.ok(world.logger.has('info', /Participant: ma\*\*\*@example\.com/));
+
+  const all = [...world.logger.lines.info, ...world.logger.lines.warn, ...world.logger.lines.error];
+  assert.ok(all.every((l) => !l.includes('joao.souza@example.com') && !l.includes('maria.silva@example.com')), 'nenhum e-mail inteiro no log');
 });
 
 /* ---------- /start ---------- */
@@ -531,6 +585,49 @@ test('admin: GET /admin/agreements exige Basic Auth e lista o estado', async () 
   await world.close();
 });
 
+test('admin: GET /admin/agreements traz o resumo operacional (summary) e filtra por ?view=; visão desconhecida => 400', async (t) => {
+  const world = await buildWorld({ listen: true });
+  t.after(() => world.close());
+  // assinado, sem a disposição enviada (o flujo ainda não avançou)
+  world.repo.upsert('AG-SIGNED', { state: 'signed', finalKind: 'final_ok', sendonDone: false, attempts: 0 });
+  // em reenvio automático (tentativas > 0), ainda aberto
+  world.repo.upsert('AG-RETRY', { state: 'pending', attempts: 2, lastError: 'timeout' });
+  // terminais: needs_attention por tipo
+  world.repo.upsert('AG-PERM', { state: 'needs_attention', attentionKind: 'permanent', attempts: 0 });
+  world.repo.upsert('AG-EXH', { state: 'needs_attention', attentionKind: 'retries_exhausted', attempts: 5 });
+  // concluído: não entra em nenhuma visão
+  world.repo.upsert('AG-DONE', { state: 'completed', finalKind: 'final_ok', sendonDone: true, attempts: 0 });
+
+  let r = await fetch(`${world.baseUrl}/admin/agreements`, { headers: ADMIN });
+  assert.equal(r.status, 200);
+  let body = await r.json();
+  assert.equal(body.total, 5);
+  assert.deepEqual(body.counts, { signed: 1, pending: 1, needs_attention: 2, completed: 1 });
+  assert.deepEqual(body.summary, {
+    signedNotConcluded: 1,
+    retrying: 1,
+    terminal: { total: 2, byAttentionKind: { permanent: 1, retries_exhausted: 1 } }
+  });
+
+  const ids = async (query) => {
+    const res = await fetch(`${world.baseUrl}/admin/agreements?${query}`, { headers: ADMIN });
+    assert.equal(res.status, 200, query);
+    const b = await res.json();
+    assert.deepEqual(b.summary, body.summary, 'o resumo não muda com o filtro');
+    return b.agreements.map((a) => a.id).sort();
+  };
+  assert.deepEqual(await ids('view=signed_not_concluded'), ['AG-SIGNED']);
+  assert.deepEqual(await ids('view=retrying'), ['AG-RETRY']);
+  assert.deepEqual(await ids('view=terminal'), ['AG-EXH', 'AG-PERM']);
+  assert.deepEqual(await ids('view=retrying&state=pending'), ['AG-RETRY'], 'view combina com state');
+  assert.deepEqual(await ids('view=retrying&state=completed'), [], 'view combina com state');
+
+  r = await fetch(`${world.baseUrl}/admin/agreements?view=bogus`, { headers: ADMIN });
+  assert.equal(r.status, 400);
+  r = await fetch(`${world.baseUrl}/admin/agreements?view=constructor`, { headers: ADMIN });
+  assert.equal(r.status, 400);
+});
+
 test('admin: sem LOG_USER/LOG_PASS configurados tudo é negado', async () => {
   const world = await buildWorld({ listen: true, env: { LOG_USER: '', LOG_PASS: '' } });
   const r = await fetch(`${world.baseUrl}/admin/agreements`, { headers: { authorization: basicHeader('', '') } });
@@ -769,6 +866,32 @@ test('webhook POST (B6): adoção que demora além do limite => 503; ela termina
   assert.equal(world.repo.listEvents('AG-X').length, 1);
   assert.equal(world.otcs.dispositionCalls().length, 1, 'processado uma vez só');
   await world.close();
+});
+
+test('webhook POST (B6): sem sobrescrever o limite, a adoção lenta responde 503 em até ~3 s (o Adobe dá 5 s e entrega uma notificação por vez)', async () => {
+  assert.ok(ADOPTION_WAIT_MS <= 3000, `padrão ${ADOPTION_WAIT_MS} ms acima de 3 s`);
+  // sem override e com override inválido (0 volta ao padrão, nunca vira 0 ms)
+  for (const v of [undefined, 0]) {
+    const world = await buildWorld({ listen: true });
+    world.config.webhookAdoptionWaitMs = v;
+    seedUnknownSigned(world);
+    const original = world.adobe.getAgreement;
+    let release;
+    const gate = new Promise((resolve) => { release = resolve; });
+    world.adobe.getAgreement = async (id) => { await gate; return original(id); }; // o Adobe não responde a tempo
+    const started = Date.now();
+    const r = await post(world, '/webhook', webhookPayload('AGREEMENT_WORKFLOW_COMPLETED', 'AG-X', { notificationId: `n-def-${v}` }));
+    const elapsed = Date.now() - started;
+    assert.equal(r.status, 503, String(v));
+    assert.ok(elapsed >= ADOPTION_WAIT_MS - 100, `respondeu antes do limite (${elapsed} ms)`);
+    assert.ok(elapsed < 4500, `segurou a resposta por ${elapsed} ms (o Adobe dá 5 s)`);
+    assert.equal(world.repo.has('AG-X'), false);
+    world.adobe.getAgreement = original;
+    release(); // a adoção termina em segundo plano
+    await waitFor(() => world.repo.get('AG-X')?.state === 'completed');
+    assert.equal(world.otcs.dispositionCalls().length, 1);
+    await world.close();
+  }
 });
 
 test('webhook POST (B6): adoção recusada (4xx do Adobe, não é nosso) segue respondendo 200; acordo conhecido responde 200 sem esperar o Adobe', async () => {

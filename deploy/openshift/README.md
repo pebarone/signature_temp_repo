@@ -40,6 +40,17 @@ O SQLite do orquestrador é o estado crítico: sem ele, o sistema não sabe a qu
 
 - **Obrigatório:** volume de **bloco**, `ReadWriteOnce` (RWO), com filesystem local (ext4 ou xfs). Exemplos: EBS, disco gerenciado do Azure, vSphere, GCP Persistent Disk, Ceph RBD.
 - **Obrigatório:** **uma réplica** e estratégia **`Recreate`** (já definidas no `deployment.yaml`). O SQLite em modo WAL usa locks POSIX de arquivo e memória compartilhada (`-shm`) entre processos do **mesmo host**. Dois processos, ou um volume de rede, corrompem o banco ou travam.
+  A réplica única também é exigida pelo código. Várias travas e caches ficam na memória do processo:
+  - fila por acordo, que serializa o pipeline e garante um só PDF e um só Firmado;
+  - limite global de paralelismo;
+  - chave em andamento do `/start` e do cancelamento;
+  - adoção em andamento;
+  - single-flight do token do Adobe e do ticket do OTCS;
+  - `state` do OAuth do `/admin/login`.
+
+  Com duas réplicas, os dois pollers processariam o mesmo acordo, os dois pods renovariam o refresh token (e um invalidaria
+  o do outro) e o callback do OAuth poderia cair no pod errado. O que já é atômico no banco cobre só parte disso: nonce do
+  `/start` e `notification_id` do webhook.
 - **Evitar:** NFS, SMB/Azure Files, CephFS, AWS EFS e qualquer classe `ReadWriteMany`. A lista completa está na seção 1.3.
 
 ---

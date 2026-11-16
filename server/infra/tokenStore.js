@@ -72,7 +72,10 @@ function createTokenStore({ config, logger, http = require('axios'), now = () =>
         }),
         { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, timeout }
       );
-      setToken(rsp.data.access_token, rsp.data.expires_in, rsp.data.refresh_token);
+      // Falha de gravação não derruba a chamada (o token segue válido em memória); só avisa que se perde no restart
+      if (!setToken(rsp.data.access_token, rsp.data.expires_in, rsp.data.refresh_token)) {
+        logger?.error('Token renovado pero no se pudo guardar en tokens.json: se usa en memoria y se pierde al reiniciar (ver el error anterior)');
+      }
       return tok.access_token;
     } catch (err) {
       logger?.error(`Refresh failed: ${describeError(err)}`);
