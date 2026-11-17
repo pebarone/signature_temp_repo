@@ -65,12 +65,18 @@ function start() {
   */
   let keepalive = null;
   if (shouldKeepalive(config)) {
-    keepalive = setInterval(() => {
+    // console.log direto (stdout): aparece no painel de logs do Render, fora dos arquivos de log
+    const ping = () => {
+      const t0 = Date.now();
       axios.get(`${config.keepaliveUrl}/health`, { timeout: 15000 })
-        .then(() => console.log('[KEEPALIVE] Internal ping OK'))
-        .catch((err) => console.log(`[KEEPALIVE] Internal ping failed: ${err.message}`));
-    }, config.keepaliveMs);
-    keepalive.unref();
+        .then((r) => console.log(`[KEEPALIVE] ${new Date().toISOString()} ping ${config.keepaliveUrl}/health -> ${r.status} (${Date.now() - t0} ms)`))
+        .catch((err) => console.log(`[KEEPALIVE] ${new Date().toISOString()} ping ${config.keepaliveUrl}/health FALLÓ: ${err.message}`));
+    };
+    console.log(`[KEEPALIVE] Activo: ping a ${config.keepaliveUrl}/health cada ${Math.round(config.keepaliveMs / 60000)} min`);
+    setTimeout(ping, 30 * 1000).unref();
+    keepalive = setInterval(ping, config.keepaliveMs);
+  } else if (config.platform.isRender) {
+    console.log(`[KEEPALIVE] DESACTIVADO: ${config.keepaliveUrl ? 'KEEPALIVE_INTERVAL_MS=0' : 'falta PUBLIC_URL (y RENDER_EXTERNAL_URL)'}`);
   }
 
   let closing = false;
